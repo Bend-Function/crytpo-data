@@ -46,7 +46,7 @@ markets:
 date_gated_features:
   - id: perpetual_full_order_book
     markets: [perpetual]
-    available_from: null
+    available_from: "2026-08-11"
     requires_live_probe: true
   - id: spot_full_order_book
     markets: [spot]

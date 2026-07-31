@@ -77,7 +77,12 @@ def _load_yaml_record(source: str, text: str) -> ExchangeCapability:
         raise CapabilityError(f"capability YAML {source} must contain a mapping")
 
     schema_version = document.get("schema_version")
-    if type(schema_version) is int and schema_version != REGISTRY_SCHEMA_VERSION:
+    if type(schema_version) is not int:
+        raise CapabilityError(
+            f"registry schema version in {source} must be integer "
+            f"{REGISTRY_SCHEMA_VERSION}"
+        )
+    if schema_version != REGISTRY_SCHEMA_VERSION:
         raise CapabilityError(
             f"unsupported registry schema version {schema_version} in {source}"
         )
