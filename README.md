@@ -15,3 +15,16 @@ explicit opt-in and never authenticate or place orders:
 ```bash
 RUN_LIVE_API_TESTS=1 python -m pytest --force-enable-socket tests/smoke -q
 ```
+
+Validate the layered configuration without contacting an exchange or creating
+data directories:
+
+```bash
+collector config check config.yaml
+collector config check config.yaml --json
+```
+
+The committed default uses one direct egress and requires no credentials.
+Reference configurations for SOCKS traffic distribution and Aliyun OSS, S3,
+or a pre-mounted WebDAV filesystem are under `config/examples/`. Secret values
+must be supplied through `env:` or absolute `file:` references.
