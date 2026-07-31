@@ -1,0 +1,43 @@
+archive:
+  targets:
+    - id: oss-primary
+      type: aliyun_oss
+      required: true
+      bucket: market-data
+      endpoint: https://oss-ap-southeast-1.aliyuncs.com
+      region: ap-southeast-1
+      credentials:
+        access_key_id: env:OSS_ACCESS_KEY_ID
+        access_key_secret: env:OSS_ACCESS_KEY_SECRET
+      compression:
+        enabled: true
+        mode: auto
+        codec: zstd
+        level: 3
+        min_size: 1MiB
+
+    - id: s3-secondary
+      type: s3
+      required: false
+      bucket: market-data-backup
+      region: ap-southeast-2
+      credentials:
+        access_key_id: env:S3_ACCESS_KEY_ID
+        secret_access_key: env:S3_SECRET_ACCESS_KEY
+      compression:
+        enabled: true
+        mode: auto
+        codec: zstd
+        level: 3
+        min_size: 1MiB
+
+    - id: webdav-mounted
+      type: filesystem
+      required: false
+      root: /mnt/webdav/crypto-market-data
+      mount_guard:
+        path: /mnt/webdav/.collector-mount-id
+        expected: env:WEBDAV_MOUNT_ID
+      compression:
+        enabled: false
+        mode: off

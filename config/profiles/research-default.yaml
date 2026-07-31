@@ -1,0 +1,14 @@
+selection:
+  quote_assets: [USDT]
+  top_n: 20
+  refresh_interval: 5m
+  exit_grace: 30m
+  new_listings:
+    enabled: true
+    capture_duration: 72h
+    initial_lookback: 72h
+
+books:
+  deep_snapshot:
+    requested_interval: 30s
+    depth: max_supported

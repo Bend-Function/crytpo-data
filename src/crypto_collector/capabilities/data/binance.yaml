@@ -1,0 +1,44 @@
+schema_version: 1
+exchange: binance
+anonymous_only: true
+markets:
+  - market: spot
+    rest_base_urls:
+      - https://data-api.binance.vision
+      - https://api.binance.com
+    websocket_base_urls:
+      - wss://data-stream.binance.vision:443
+      - wss://stream.binance.com:9443
+    live_book:
+      channel: diff_depth
+      supported_depths: [full]
+      recommended_depth: full
+      update_interval_ms: 100
+      bootstrap: rest_snapshot
+      max_rest_depth: 5000
+    connection_limits:
+      connection_attempts:
+        limit: 300
+        window_seconds: 300
+        scope: ip
+      client_messages_per_second: 5
+      subscriptions_per_connection: 1024
+      connection_lifetime_seconds: 86400
+  - market: perpetual
+    rest_base_urls:
+      - https://fapi.binance.com
+    websocket_base_urls:
+      - wss://fstream.binance.com/public
+      - wss://fstream.binance.com/market
+    live_book:
+      channel: diff_depth
+      supported_depths: [full]
+      recommended_depth: full
+      update_interval_ms: 100
+      bootstrap: rest_snapshot
+      max_rest_depth: 1000
+    connection_limits:
+      client_messages_per_second: 10
+      subscriptions_per_connection: 1024
+      connection_lifetime_seconds: 86400
+date_gated_features: []

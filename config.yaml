@@ -1,0 +1,73 @@
+profile: research-default
+data_root: ./data
+state_root: ./state
+
+runtime:
+  admin_timeout: 10s
+  reload_prepare_timeout: 15s
+  shutdown_deadline: 30s
+  worker_restart:
+    base_backoff: 1s
+    max_backoff: 60s
+    max_attempts: 10
+    window: 10m
+    healthy_reset: 10m
+
+selection:
+  quote_assets: [USDT]
+  fixed_pairs: [BTC/USDT, ETH/USDT]
+  top_n: 20
+  refresh_interval: 5m
+  exit_grace: 30m
+  capacity_policy: degrade_low_priority_with_warning
+  new_listings:
+    enabled: true
+    capture_duration: 72h
+    initial_lookback: 72h
+
+books:
+  live:
+    enabled: true
+  deep_snapshot:
+    enabled: true
+    requested_interval: 30s
+    depth: max_supported
+    overload_policy: stretch_with_warning
+
+capabilities:
+  date_gated_default_required: false
+
+writer:
+  flush_interval: 500ms
+  durability_slo: 1s
+  durability_critical: 5s
+  max_sync_concurrency: 8
+  rotate_interval: 1h
+  max_compressed_size: 1GiB
+
+ingress:
+  shard_max_records: 10000
+  shard_max_bytes: 64MiB
+  worker_max_bytes: 512MiB
+  high_water_ratio: 0.80
+  control_reserve_records: 1024
+  control_reserve_bytes: 8MiB
+
+disk:
+  warning_free_ratio: 0.15
+  critical_free_ratio: 0.05
+  recovery_free_ratio: 0.20
+  auto_resume: false
+
+materializer:
+  enabled: true
+  delay: 5m
+  intervals: [30s, 1m, 5m, 15m, 1h]
+  revision_horizon: 24h
+
+archive:
+  targets: []
+
+local_cleanup:
+  enabled: false
+  grace: 24h

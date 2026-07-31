@@ -1,0 +1,13 @@
+selection:
+  top_n: 5
+  refresh_interval: 10m
+  exit_grace: 1h
+  new_listings:
+    capture_duration: 24h
+
+books:
+  deep_snapshot:
+    requested_interval: 5m
+
+materializer:
+  intervals: [1m, 5m, 15m, 1h]

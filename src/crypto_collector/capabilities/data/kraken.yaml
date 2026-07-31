@@ -1,0 +1,41 @@
+schema_version: 1
+exchange: kraken
+anonymous_only: true
+markets:
+  - market: spot
+    rest_base_urls:
+      - https://api.kraken.com/0
+    websocket_base_urls:
+      - wss://ws.kraken.com/v2
+    live_book:
+      channel: book
+      supported_depths: [10, 25, 100, 500, 1000]
+      recommended_depth: 100
+      update_interval_ms: event_driven
+      bootstrap: none
+      max_rest_depth: 1000
+    connection_limits:
+      connection_attempts:
+        limit: 150
+        window_seconds: 600
+        scope: ip
+  - market: perpetual
+    rest_base_urls:
+      - https://futures.kraken.com/derivatives/api/v3
+      - https://futures.kraken.com/api/charts/v1
+    websocket_base_urls:
+      - wss://futures.kraken.com/ws/v1
+    live_book:
+      channel: book
+      supported_depths: [full]
+      recommended_depth: full
+      update_interval_ms: event_driven
+      bootstrap: none
+      max_rest_depth: full
+    connection_limits:
+      concurrent_connections: 100
+      subscription_requests:
+        limit: 100
+        window_seconds: 1
+        scope: client
+date_gated_features: []

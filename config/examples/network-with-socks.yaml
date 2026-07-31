@@ -1,0 +1,27 @@
+egress_pool:
+  - id: direct-primary
+    type: direct
+    quota_group: direct-primary
+    max_http_concurrency: 8
+    max_ws_connections: 20
+
+  - id: socks-primary
+    type: socks5h
+    quota_group: proxy-nat-primary
+    url: env:SOCKS_PRIMARY_URL
+    max_http_concurrency: 4
+    max_ws_connections: 10
+
+assignment:
+  strategy: rendezvous_hash
+
+retry:
+  rest_max_attempts: 5
+  base_backoff: 250ms
+  max_backoff: 30s
+  ws_reconnect_max_backoff: 60s
+
+scheduler:
+  deep_snapshot_max_interval: 15m
+  recovery_step_ratio: 0.20
+  healthy_refreshes_before_step_down: 3

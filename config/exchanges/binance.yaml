@@ -1,0 +1,6 @@
+enabled: true
+markets:
+  spot:
+    enabled: true
+  perpetual:
+    enabled: true

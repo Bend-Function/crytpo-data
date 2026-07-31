@@ -323,8 +323,9 @@ exchanges:
   kraken:
     markets:
       perpetual:
-        quote_assets: [USD, USDT]
-        fixed_pairs: [PF_XBTUSD]
+        selection:
+          quote_assets: [USD, USDT]
+          fixed_pairs: [PF_XBTUSD]
 ```
 
 ### 8.4 热加载

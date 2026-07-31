@@ -1,0 +1,55 @@
+schema_version: 1
+exchange: okx
+anonymous_only: true
+markets:
+  - market: spot
+    rest_base_urls:
+      - https://openapi.okx.com
+    websocket_base_urls:
+      - wss://ws.okx.com:8443/ws/v5/public
+      - wss://ws.okx.com:8443/ws/v5/business
+    live_book:
+      channel: books
+      supported_depths: [400]
+      recommended_depth: 400
+      update_interval_ms: 100
+      bootstrap: none
+      max_rest_depth: 5000
+    connection_limits:
+      connection_attempts:
+        limit: 3
+        window_seconds: 1
+        scope: ip
+      subscription_requests:
+        limit: 480
+        window_seconds: 3600
+        scope: connection
+      subscription_payload_bytes: 65536
+  - market: perpetual
+    rest_base_urls:
+      - https://openapi.okx.com
+    websocket_base_urls:
+      - wss://ws.okx.com:8443/ws/v5/public
+      - wss://ws.okx.com:8443/ws/v5/business
+    live_book:
+      channel: books
+      supported_depths: [400]
+      recommended_depth: 400
+      update_interval_ms: 100
+      bootstrap: none
+      max_rest_depth: 5000
+    connection_limits:
+      connection_attempts:
+        limit: 3
+        window_seconds: 1
+        scope: ip
+      subscription_requests:
+        limit: 480
+        window_seconds: 3600
+        scope: connection
+      subscription_payload_bytes: 65536
+date_gated_features:
+  - id: books_rpi
+    markets: [spot, perpetual]
+    available_from: "2026-07-28"
+    requires_live_probe: true

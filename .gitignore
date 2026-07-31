@@ -3,7 +3,7 @@
 .pytest_cache/
 __pycache__/
 *.py[cod]
-data/
+/data/
 dist/
 .coverage
 *.egg-info/

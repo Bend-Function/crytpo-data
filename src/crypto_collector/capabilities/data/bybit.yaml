@@ -1,0 +1,54 @@
+schema_version: 1
+exchange: bybit
+anonymous_only: true
+markets:
+  - market: spot
+    rest_base_urls:
+      - https://api.bybit.com
+      - https://api.bytick.com
+    websocket_base_urls:
+      - wss://stream.bybit.com/v5/public/spot
+    live_book:
+      channel: orderbook
+      supported_depths: [1, 50, 200, 1000]
+      recommended_depth: 200
+      update_interval_ms: 100
+      bootstrap: none
+      max_rest_depth: 1000
+    connection_limits:
+      connection_attempts:
+        limit: 500
+        window_seconds: 300
+        scope: domain
+      concurrent_connections: 1000
+      subscription_payload_characters: 21000
+      subscription_args_per_request: 10
+  - market: perpetual
+    rest_base_urls:
+      - https://api.bybit.com
+      - https://api.bytick.com
+    websocket_base_urls:
+      - wss://stream.bybit.com/v5/public/linear
+    live_book:
+      channel: orderbook
+      supported_depths: [1, 50, 200, 1000]
+      recommended_depth: 200
+      update_interval_ms: 100
+      bootstrap: none
+      max_rest_depth: 1000
+    connection_limits:
+      connection_attempts:
+        limit: 500
+        window_seconds: 300
+        scope: domain
+      concurrent_connections: 1000
+      subscription_payload_characters: 21000
+date_gated_features:
+  - id: perpetual_full_order_book
+    markets: [perpetual]
+    available_from: null
+    requires_live_probe: true
+  - id: spot_full_order_book
+    markets: [spot]
+    available_from: "2026-07-16"
+    requires_live_probe: true
