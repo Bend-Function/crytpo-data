@@ -7,15 +7,14 @@ RUN_LIVE_API_TESTS=1.
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
 import json
 import os
+from decimal import Decimal
 from typing import Any
 
 import httpx
 import pytest
 import websockets
-
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_LIVE_API_TESTS") != "1",
@@ -84,9 +83,7 @@ def test_usds_m_perpetual_rest_mark_price_is_public_and_live() -> None:
 
 def test_spot_websocket_trade_stream_emits_data() -> None:
     payload = asyncio.run(
-        _receive_one_json(
-            "wss://data-stream.binance.vision:443/ws/btcusdt@trade"
-        )
+        _receive_one_json("wss://data-stream.binance.vision:443/ws/btcusdt@trade")
     )
 
     assert payload["e"] == "trade"
@@ -100,9 +97,7 @@ def test_spot_websocket_trade_stream_emits_data() -> None:
 
 def test_usds_m_perpetual_websocket_aggregate_trade_stream_emits_data() -> None:
     payload = asyncio.run(
-        _receive_one_json(
-            "wss://fstream.binance.com/market/ws/btcusdt@aggTrade"
-        )
+        _receive_one_json("wss://fstream.binance.com/market/ws/btcusdt@aggTrade")
     )
 
     assert payload["e"] == "aggTrade"

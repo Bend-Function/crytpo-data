@@ -16,7 +16,6 @@ import httpx
 import pytest
 from websockets.asyncio.client import connect
 
-
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_API_TESTS") != "1",
     reason="set RUN_LIVE_API_TESTS=1 to call Kraken's public APIs",
@@ -159,7 +158,9 @@ async def _receive_futures_ticker() -> None:
                 message = json.loads(raw_message)
 
                 if message.get("event") == "error":
-                    pytest.fail(f"Kraken Futures rejected public subscription: {message}")
+                    pytest.fail(
+                        f"Kraken Futures rejected public subscription: {message}"
+                    )
                 if message.get("event") == "subscribed":
                     saw_ack = True
                     continue

@@ -11,11 +11,8 @@ import httpx
 import pytest
 import websockets
 
-
 REST_BASE_URL = os.getenv("OKX_REST_BASE_URL", "https://openapi.okx.com").rstrip("/")
-WS_PUBLIC_URL = os.getenv(
-    "OKX_WS_PUBLIC_URL", "wss://ws.okx.com:8443/ws/v5/public"
-)
+WS_PUBLIC_URL = os.getenv("OKX_WS_PUBLIC_URL", "wss://ws.okx.com:8443/ws/v5/public")
 INSTRUMENTS = (("SPOT", "BTC-USDT"), ("SWAP", "BTC-USDT-SWAP"))
 
 pytestmark = pytest.mark.skipif(

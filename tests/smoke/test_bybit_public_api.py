@@ -10,7 +10,6 @@ import httpx
 import pytest
 import websockets
 
-
 RUN_LIVE = os.getenv("RUN_LIVE_API_TESTS") == "1"
 REST_URL = "https://api.bybit.com/v5/market/orderbook"
 SPOT_WS_URL = "wss://stream.bybit.com/v5/public/spot"

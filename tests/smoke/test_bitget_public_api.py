@@ -15,7 +15,6 @@ import httpx
 import pytest
 from websockets.asyncio.client import connect
 
-
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_LIVE_API_TESTS") != "1",
     reason="set RUN_LIVE_API_TESTS=1 to call Bitget's public API",
@@ -37,8 +36,7 @@ def test_v3_instruments_endpoint_is_public_for_btcusdt(category: str) -> None:
     payload = response.json()
     assert payload["code"] == "00000", payload
     assert any(
-        instrument["symbol"] == "BTCUSDT"
-        and instrument["category"] == category
+        instrument["symbol"] == "BTCUSDT" and instrument["category"] == category
         for instrument in payload["data"]
     ), payload
 

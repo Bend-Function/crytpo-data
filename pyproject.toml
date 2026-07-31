@@ -51,3 +51,11 @@ markers = [
 ]
 asyncio_mode = "auto"
 addopts = "--disable-socket --allow-unix-socket"
+
+[tool.ruff]
+extend-exclude = ["docs"]
+
+[tool.mypy]
+mypy_path = "src"
+explicit_package_bases = true
+exclude = ["^docs/"]
