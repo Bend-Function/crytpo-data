@@ -424,22 +424,39 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement endpoint token buckets and bounded retry decisions**
 
-Token refill uses injected monotonic time and never exceeds capacity. Apply server rate headers through exchange-specific observers without allowing a malformed header to increase configured hard capacity. Retry only anonymous GET, WebSocket connect, and subscribe. A REST job defaults to at most five attempts and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. One injected `Clock` supplies both domains: retry-job deadlines and sleeps use `monotonic_ns()`, while HTTP-date parsing and persisted restriction deadlines use `time_ns()`. `Retry-After` accepts integer seconds and HTTP-date; explicit exchange ban codes persist state. Schema/parse failures consume a channel error budget but do not loop network retries. WS generations may reconnect indefinitely with a 60s backoff cap, but cannot bypass active egress/quota-group circuits.
+`BudgetRegistry` keys every endpoint bucket by the exact non-empty `(exchange, quota_group, endpoint)` triple. A bucket accepts only exact built-in `int` or finite `Decimal` capacity, refill, and cost values; booleans, floats, subclasses, zero/negative limits, and non-finite values are rejected. It starts full, refills from the injected monotonic clock, never moves its refill baseline backward after a clock anomaly, and keeps exact decimal accounting independent of the ambient Decimal context. Configured capacity and refill rate are immutable hard ceilings, and a cost above hard capacity is a configuration error rather than a temporary miss. A throttle may only reduce the current refill rate toward a validated floor; `set_refill_multiplier()` applies the absolute persisted multiplier and permits controlled recovery without exceeding the hard rate. Exchange-specific response observers remain responsible for interpreting venue headers as an available-token value; the shared `observe_available()` boundary accepts only a conservative decimal grammar and clamps local tokens downward, so malformed, stale, or larger observations can never increase tokens or either hard ceiling.
+
+`RetryPolicy` is the bounded REST-job decision primitive. Retry only anonymous GET, WebSocket connect, and subscribe at their owning call sites; schema/parse failures consume a channel error budget and never enter this policy. A REST job defaults to at most five attempts, a 250ms base, and a 30-second cap, and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. Full jitter is inclusive in `[0, min(cap, base * 2**attempt)]` and handles arbitrarily large attempt counters without constructing an unbounded integer. The policy reads only monotonic inputs for ordinary backoff. It reads the injected wall clock only when converting an HTTP-date `Retry-After`; integer delay-seconds and HTTP-date are accepted, while malformed values are ignored rather than expanding a delay. `RetryDecision.delay_ns` retains the computed delay even when `retry` is false because the attempt limit or job deadline was reached, and `cause` preserves the original HTTP/exchange signal separately from that scheduling `reason`.
+
+`apply_quota_retry_effect()` runs independently of whether the current job will retry. BAN writes the group-wide durable ban deadline using `now_unix_ns + decision.delay_ns` and persists `decision.cause`, so exhausting one job cannot erase a 418 or explicit payload ban. THROTTLE reduces only the selected endpoint bucket; a plain 429 does not manufacture the explicit group-wide ban/cooldown and successful-probe requirement reserved for a venue ban signal. Pure 5xx/backoff does not mutate quota state, and pure connection failure remains the per-egress transport-health path from Task 2. WS generations may reconnect indefinitely with a 60s backoff cap, but Plan 04 must still gate every generation on the admitted quota-group and egress circuits.
 
 ```python
 now_monotonic_ns = clock.monotonic_ns()
 now_unix_ns = clock.time_ns()
-delay_ns = max(parsed_retry_after_ns, full_jitter_ns(attempt, base_ns, cap_ns, rng))
-# RetryPolicy compares now_monotonic_ns + delay_ns with the job's monotonic deadline.
+classification = classify_http(
+    response.status_code,
+    response.headers.get("Retry-After"),
+)
+decision = policy.decide(
+    attempt=attempt,
+    now_ns=now_monotonic_ns,
+    deadline_ns=job.deadline_ns,
+    classification=classification,
+)
+apply_quota_retry_effect(
+    decision,
+    exchange=exchange,
+    quota_group=quota_group,
+    now_unix_ns=now_unix_ns,
+    state_store=state_store,
+    budget=budget,
+    throttle_multiplier=Decimal("0.5"),
+    minimum_refill_per_second=minimum_rate,
+)
 if decision.action is RetryAction.BAN:
-    state_store.record_ban(
-        exchange=exchange,
-        quota_group=quota_group,
-        until_unix_ns=now_unix_ns + delay_ns,
-        reason=decision.reason,
+    assert state_store.load_quota(exchange, quota_group).ban_until_unix_ns >= (
+        now_unix_ns + decision.delay_ns
     )
-elif decision.action is RetryAction.THROTTLE:
-    budget.shrink(multiplier=0.5, floor=minimum_rate)
 ```
 
 - [ ] **Step 4: Run deterministic budget/retry tests**
