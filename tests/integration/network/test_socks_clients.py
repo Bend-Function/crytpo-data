@@ -8,12 +8,22 @@ import pytest_asyncio
 from crypto_collector.config import SecretRef, SecretSnapshot
 from crypto_collector.network.clients import build_clients
 from crypto_collector.network.models import Egress
-from tests.support.socks5_server import LoopbackApps, LoopbackSocks5Server
+from tests.support.socks5_server import (
+    LoopbackApps,
+    LoopbackSocks5Server,
+    TlsContexts,
+    create_test_tls_contexts,
+)
+
+
+@pytest.fixture
+def tls_contexts(tmp_path) -> TlsContexts:
+    return create_test_tls_contexts(tmp_path)
 
 
 @pytest_asyncio.fixture
-async def loopback_apps() -> AsyncIterator[LoopbackApps]:
-    apps = await LoopbackApps.start()
+async def loopback_apps(tls_contexts: TlsContexts) -> AsyncIterator[LoopbackApps]:
+    apps = await LoopbackApps.start(server_ssl=tls_contexts.server)
     try:
         yield apps
     finally:
@@ -33,6 +43,14 @@ async def loopback_socks5(
             ("venue.invalid", loopback_apps.websocket_port): (
                 "127.0.0.1",
                 loopback_apps.websocket_port,
+            ),
+            ("venue.invalid", loopback_apps.https_port): (
+                "127.0.0.1",
+                loopback_apps.https_port,
+            ),
+            ("venue.invalid", loopback_apps.secure_websocket_port): (
+                "127.0.0.1",
+                loopback_apps.secure_websocket_port,
             ),
             ("127.0.0.1", loopback_apps.http_port): (
                 "127.0.0.1",
@@ -133,3 +151,36 @@ async def test_socks5_resolves_target_name_locally(
 
     assert response.status_code == 200
     assert loopback_socks5.requested_domains == []
+
+
+@pytest.mark.network
+@pytest.mark.asyncio
+async def test_socks5h_tunnels_verified_https_and_websocket_tls(
+    loopback_socks5: LoopbackSocks5Server,
+    loopback_apps: LoopbackApps,
+    tls_contexts: TlsContexts,
+) -> None:
+    reference = SecretRef.parse("env:SOCKS_URL")
+    secrets = SecretSnapshot.from_test_values(
+        {reference: loopback_socks5.url(credentials=("u", "secret"))}
+    )
+    egress = Egress.model_validate(
+        {"id": "socks-1", "type": "socks5h", "url": reference}
+    )
+
+    async with build_clients(
+        egress,
+        secrets=secrets,
+        ssl_context=tls_contexts.client,
+    ) as clients:
+        response = await clients.http.get(loopback_apps.proxied_https_url)
+        assert response.status_code == 200
+        async with clients.websocket.connect(
+            loopback_apps.proxied_secure_websocket_url
+        ) as websocket:
+            assert await websocket.recv() == "ready"
+
+    assert loopback_socks5.requested_domains == [
+        "venue.invalid",
+        "venue.invalid",
+    ]

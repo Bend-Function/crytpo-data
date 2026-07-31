@@ -3,9 +3,16 @@ from __future__ import annotations
 import asyncio
 import hmac
 import ipaddress
+import ssl
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Final
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 _SOCKS_VERSION: Final = 5
@@ -37,11 +44,81 @@ async def _relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
 
 @dataclass(slots=True)
+class TlsContexts:
+    server: ssl.SSLContext
+    client: ssl.SSLContext
+
+
+def create_test_tls_contexts(directory: Path) -> TlsContexts:
+    now = datetime.now(tz=UTC)
+    ca_key = rsa.generate_private_key(public_exponent=65_537, key_size=2_048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Collector Test CA")])
+    ca_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    server_key = rsa.generate_private_key(public_exponent=65_537, key_size=2_048)
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "venue.invalid")])
+    server_certificate = (
+        x509.CertificateBuilder()
+        .subject_name(server_name)
+        .issuer_name(ca_name)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [
+                    x509.DNSName("venue.invalid"),
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                ]
+            ),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    ca_path = directory / "ca.pem"
+    certificate_path = directory / "server.pem"
+    key_path = directory / "server-key.pem"
+    ca_path.write_bytes(ca_certificate.public_bytes(serialization.Encoding.PEM))
+    certificate_path.write_bytes(
+        server_certificate.public_bytes(serialization.Encoding.PEM)
+    )
+    key_path.write_bytes(
+        server_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    )
+
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(certificate_path, key_path)
+    client_context = ssl.create_default_context(cafile=str(ca_path))
+    return TlsContexts(server=server_context, client=client_context)
+
+
+@dataclass(slots=True)
 class LoopbackApps:
     http_server: asyncio.Server
+    https_server: asyncio.Server
     websocket_server: Server
+    secure_websocket_server: Server
     http_port: int
+    https_port: int
     websocket_port: int
+    secure_websocket_port: int
 
     @property
     def http_url(self) -> str:
@@ -59,8 +136,16 @@ class LoopbackApps:
     def proxied_websocket_url(self) -> str:
         return f"ws://venue.invalid:{self.websocket_port}/ws"
 
+    @property
+    def proxied_https_url(self) -> str:
+        return f"https://venue.invalid:{self.https_port}/catalog"
+
+    @property
+    def proxied_secure_websocket_url(self) -> str:
+        return f"wss://venue.invalid:{self.secure_websocket_port}/ws"
+
     @classmethod
-    async def start(cls) -> LoopbackApps:
+    async def start(cls, *, server_ssl: ssl.SSLContext) -> LoopbackApps:
         async def handle_http(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
@@ -82,21 +167,43 @@ class LoopbackApps:
 
         http_server = await asyncio.start_server(handle_http, "127.0.0.1", 0)
         http_socket = http_server.sockets[0]
+        https_server = await asyncio.start_server(
+            handle_http,
+            "127.0.0.1",
+            0,
+            ssl=server_ssl,
+        )
+        https_socket = https_server.sockets[0]
         websocket_server = await serve(handle_websocket, "127.0.0.1", 0)
         websocket_socket = websocket_server.sockets[0]
+        secure_websocket_server = await serve(
+            handle_websocket,
+            "127.0.0.1",
+            0,
+            ssl=server_ssl,
+        )
+        secure_websocket_socket = secure_websocket_server.sockets[0]
         return cls(
             http_server=http_server,
+            https_server=https_server,
             websocket_server=websocket_server,
+            secure_websocket_server=secure_websocket_server,
             http_port=int(http_socket.getsockname()[1]),
+            https_port=int(https_socket.getsockname()[1]),
             websocket_port=int(websocket_socket.getsockname()[1]),
+            secure_websocket_port=int(secure_websocket_socket.getsockname()[1]),
         )
 
     async def close(self) -> None:
         self.http_server.close()
+        self.https_server.close()
         self.websocket_server.close()
+        self.secure_websocket_server.close()
         await asyncio.gather(
             self.http_server.wait_closed(),
+            self.https_server.wait_closed(),
             self.websocket_server.wait_closed(),
+            self.secure_websocket_server.wait_closed(),
         )
 
 

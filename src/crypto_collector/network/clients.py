@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import ssl
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -48,8 +49,18 @@ def _validated_proxy_url(egress: Egress, plaintext: str) -> str:
 
 
 class _LocalDnsSocksTransport(httpx.AsyncBaseTransport):
-    def __init__(self, *, proxy: str, limits: httpx.Limits) -> None:
-        self._transport = httpx.AsyncHTTPTransport(proxy=proxy, limits=limits)
+    def __init__(
+        self,
+        *,
+        proxy: str,
+        limits: httpx.Limits,
+        verify: bool | ssl.SSLContext,
+    ) -> None:
+        self._transport = httpx.AsyncHTTPTransport(
+            proxy=proxy,
+            limits=limits,
+            verify=verify,
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
@@ -98,11 +109,17 @@ def build_websocket_connect_spec(
 
 
 class WebSocketClientFactory:
-    __slots__ = ("_egress", "_secrets")
+    __slots__ = ("_egress", "_secrets", "_ssl_context")
 
-    def __init__(self, egress: Egress, secrets: SecretSnapshot) -> None:
+    def __init__(
+        self,
+        egress: Egress,
+        secrets: SecretSnapshot,
+        ssl_context: ssl.SSLContext | None,
+    ) -> None:
         self._egress = egress
         self._secrets = secrets
+        self._ssl_context = ssl_context
 
     def connect(self, uri: str) -> WebSocketConnection:
         spec = build_websocket_connect_spec(
@@ -115,12 +132,16 @@ class WebSocketClientFactory:
             if spec.proxy is None
             else _validated_proxy_url(self._egress, spec.proxy.reveal())
         )
+        tls_options: dict[str, Any] = {}
+        if self._ssl_context is not None and spec.uri.casefold().startswith("wss://"):
+            tls_options["ssl"] = self._ssl_context
         return websockets.connect(
             spec.uri,
             proxy=proxy,
             open_timeout=spec.open_timeout,
             close_timeout=spec.close_timeout,
             max_queue=spec.max_queue,
+            **tls_options,
         )
 
     def __repr__(self) -> str:
@@ -160,7 +181,12 @@ class NetworkClients:
         return f"NetworkClients(egress_id={self._egress_id!r})"
 
 
-def build_clients(egress: Egress, *, secrets: SecretSnapshot) -> NetworkClients:
+def build_clients(
+    egress: Egress,
+    *,
+    secrets: SecretSnapshot,
+    ssl_context: ssl.SSLContext | None = None,
+) -> NetworkClients:
     spec = build_http_client_spec(egress, secrets=secrets)
     proxy = (
         None
@@ -172,8 +198,9 @@ def build_clients(egress: Egress, *, secrets: SecretSnapshot) -> NetworkClients:
         max_connections=spec.max_connections,
         max_keepalive_connections=spec.max_keepalive_connections,
     )
+    verify: bool | ssl.SSLContext = True if ssl_context is None else ssl_context
     transport = (
-        _LocalDnsSocksTransport(proxy=proxy, limits=limits)
+        _LocalDnsSocksTransport(proxy=proxy, limits=limits, verify=verify)
         if egress.type == "socks5" and proxy is not None
         else None
     )
@@ -183,10 +210,11 @@ def build_clients(egress: Egress, *, secrets: SecretSnapshot) -> NetworkClients:
         trust_env=spec.trust_env,
         timeout=timeout,
         limits=limits,
+        verify=verify,
         follow_redirects=False,
     )
     return NetworkClients(
         http=http,
-        websocket=WebSocketClientFactory(egress, secrets),
+        websocket=WebSocketClientFactory(egress, secrets, ssl_context),
         egress_id=egress.id,
     )
