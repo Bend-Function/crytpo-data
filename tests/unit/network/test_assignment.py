@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from hashlib import sha256
 
 import pytest
 
@@ -33,6 +34,22 @@ def test_rendezvous_assignment_is_order_independent() -> None:
     second = choose_egress(key, list(reversed(candidates)))
 
     assert first.id == second.id
+
+
+def test_rendezvous_assignment_matches_sha256_golden_mapping() -> None:
+    candidates = [egress("direct-a"), egress("proxy-b"), egress("proxy-c")]
+    expected = {
+        "binance/spot/BTCUSDT/book_live": "proxy-b",
+        "okx/perpetual/BTC-USDT-SWAP/books": "proxy-c",
+        "kraken/spot/BTC/USDT/trade": "proxy-b",
+        "bybit/perpetual/ETHUSDT/ticker": "proxy-c",
+    }
+
+    assert {key: choose_egress(key, candidates).id for key in expected} == expected
+    assert (
+        sha256(b"binance/spot/BTCUSDT/book_live\0proxy-b").hexdigest()
+        == "ac0fb322177b80e6d7717eaae543e36bc0e35679b0b9cdc2ba732a8f035b2eed"
+    )
 
 
 def test_assignment_key_preserves_instrument_keys_with_path_separators() -> None:
@@ -166,6 +183,41 @@ def test_assignment_rejects_demand_above_total_healthy_capacity() -> None:
         )
 
 
+def test_assignment_uses_next_ranked_egress_when_first_choice_is_full() -> None:
+    candidates = [
+        egress("a", max_ws_connections=1),
+        egress("b", max_ws_connections=1),
+    ]
+    assert choose_egress("binance/spot/B/trade", candidates).id == "b"
+    assert choose_egress("binance/spot/C/trade", candidates).id == "b"
+
+    assignments = assign_instruments(
+        ["C", "B"],
+        exchange="binance",
+        market="spot",
+        channel="trade",
+        egresses=candidates,
+        subscriptions_per_connection=1,
+    )
+
+    assert tuple((item.instrument_key, item.egress_id) for item in assignments) == (
+        ("B", "b"),
+        ("C", "a"),
+    )
+
+
+def test_assignment_rejects_duplicate_instrument_keys() -> None:
+    with pytest.raises(ValueError, match="instrument keys must be unique"):
+        assign_instruments(
+            ["BTCUSDT", "BTCUSDT"],
+            exchange="binance",
+            market="spot",
+            channel="trade",
+            egresses=[egress("a")],
+            subscriptions_per_connection=2,
+        )
+
+
 def test_assignment_rejects_boolean_subscription_capacity() -> None:
     with pytest.raises(ValueError, match="subscriptions_per_connection"):
         assign_instruments(
@@ -215,6 +267,21 @@ def test_sharding_rejects_assignment_from_old_egress_quota_group() -> None:
         pack_egress_shards(
             [assignment],
             egresses=[current],
+            subscriptions_per_connection=2,
+        )
+
+
+def test_sharding_rejects_manual_assignments_above_connection_capacity() -> None:
+    candidate = egress("a", max_ws_connections=1)
+    assignments = [
+        StickyAssignment.create(f"okx/spot/{instrument}/books", candidate)
+        for instrument in ("BTC-USDT", "ETH-USDT", "SOL-USDT")
+    ]
+
+    with pytest.raises(NoAvailableEgressError, match="shard capacity"):
+        pack_egress_shards(
+            assignments,
+            egresses=[candidate],
             subscriptions_per_connection=2,
         )
 

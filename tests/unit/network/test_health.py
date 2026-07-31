@@ -1,19 +1,161 @@
 from __future__ import annotations
 
+import gc
+import multiprocessing
 import sqlite3
 import time
+from dataclasses import replace
 from decimal import Decimal
+from typing import cast
+from weakref import ref
 
 import pytest
 
+import crypto_collector.network.state_store as state_store_module
+from crypto_collector.network.health import (
+    QuotaProbeAdmission,
+    TransportProbeAdmission,
+    _AdmissionMint,
+)
 from crypto_collector.network.models import Egress
 from crypto_collector.network.state_store import EgressStateStore, StaleProbeError
+
+
+class _EqualString(str):
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    __hash__ = str.__hash__
+
+
+class _FakeMint:
+    def matches(self, _claims: tuple[object, ...]) -> bool:
+        return True
+
+    def belongs_to(self, _store_identity: object) -> bool:
+        return True
+
+
+class _EqualTuple(tuple[object, ...]):
+    def __eq__(self, other: object) -> bool:
+        del other
+        return True
+
+    __hash__ = tuple.__hash__
+
+
+class _ForgedQuotaProbeAdmission(QuotaProbeAdmission):
+    def __post_init__(self) -> None:
+        pass
+
+    def _belongs_to(self, _store_identity: object) -> bool:
+        return True
+
+
+class _ForgedTransportProbeAdmission(TransportProbeAdmission):
+    def __post_init__(self) -> None:
+        pass
+
+    def _belongs_to(self, _store_identity: object) -> bool:
+        return True
 
 
 def egress(egress_id: str, *, quota_group: str) -> Egress:
     return Egress.model_validate(
         {"id": egress_id, "type": "direct", "quota_group": quota_group}
     )
+
+
+class _WalBarrierConnection:
+    def __init__(self, connection, barrier) -> None:
+        self._connection = connection
+        self._barrier = barrier
+        self._waited_for_wal = False
+
+    def execute(self, sql, parameters=()):
+        if (
+            sql.strip().upper() == "PRAGMA JOURNAL_MODE = WAL"
+            and not self._waited_for_wal
+        ):
+            self._waited_for_wal = True
+            self._barrier.wait(timeout=30)
+        return self._connection.execute(sql, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _concurrent_open_worker(
+    root: str,
+    rounds: int,
+    barrier,
+    results,
+) -> None:
+    failures: list[tuple[int, str, str]] = []
+    real_connect = sqlite3.connect
+
+    def barrier_connect(database, *args, **kwargs):
+        return _WalBarrierConnection(
+            real_connect(database, *args, **kwargs),
+            barrier,
+        )
+
+    state_store_module.sqlite3.connect = barrier_connect
+    try:
+        for round_number in range(rounds):
+            store = None
+            try:
+                store = EgressStateStore.open(
+                    f"{root}/concurrent-{round_number}.sqlite"
+                )
+            except BaseException as error:  # noqa: BLE001 - returned to parent
+                failures.append((round_number, type(error).__name__, str(error)))
+            finally:
+                if store is not None:
+                    store.close()
+    finally:
+        state_store_module.sqlite3.connect = real_connect
+        results.put(failures)
+
+
+_QUOTA_TABLE_DDL = """CREATE TABLE quota_state (
+  exchange TEXT NOT NULL,
+  quota_group TEXT NOT NULL,
+  ban_until_ns INTEGER NOT NULL,
+  cooldown_until_ns INTEGER NOT NULL,
+  current_rate_multiplier TEXT NOT NULL,
+  last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
+  PRIMARY KEY (exchange, quota_group)
+)"""
+_EGRESS_TABLE_DDL = """CREATE TABLE egress_state (
+  exchange TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  consecutive_transport_failures INTEGER NOT NULL,
+  transport_cooldown_until_ns INTEGER NOT NULL,
+  last_success_ns INTEGER,
+  last_latency_ns INTEGER,
+  last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
+  PRIMARY KEY (exchange, egress_id)
+)"""
+
+
+def _create_version_one_database(
+    path,
+    *,
+    quota_ddl: str = _QUOTA_TABLE_DDL,
+    egress_ddl: str = _EGRESS_TABLE_DDL,
+    extra_ddl: str = "",
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            f"{quota_ddl};\n{egress_ddl};\n{extra_ddl}\nPRAGMA user_version = 1;"
+        )
+    finally:
+        connection.close()
 
 
 def test_ban_survives_worker_restart(tmp_path) -> None:
@@ -35,6 +177,212 @@ def test_ban_survives_worker_restart(tmp_path) -> None:
         assert reopened.journal_mode == "wal"
     finally:
         reopened.close()
+
+
+def test_concurrent_first_open_is_retry_safe_across_processes(tmp_path) -> None:
+    context = multiprocessing.get_context("spawn")
+    process_count = 8
+    rounds = 8
+    barrier = context.Barrier(process_count)
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_concurrent_open_worker,
+            args=(str(tmp_path), rounds, barrier, results),
+        )
+        for _ in range(process_count)
+    ]
+
+    try:
+        for worker in workers:
+            worker.start()
+        join_deadline = time.monotonic() + 60
+        for worker in workers:
+            worker.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
+        exit_codes = [worker.exitcode for worker in workers]
+        assert exit_codes == [0] * process_count
+        failures = [results.get(timeout=5) for _worker in workers]
+        assert failures == [[] for _worker in workers]
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join(timeout=5)
+        results.close()
+        results.join_thread()
+
+    for round_number in range(rounds):
+        with EgressStateStore.open(
+            tmp_path / f"concurrent-{round_number}.sqlite"
+        ) as store:
+            assert store.journal_mode == "wal"
+            assert (
+                int(store._connection.execute("PRAGMA user_version").fetchone()[0]) == 1
+            )
+            tables = {
+                str(row[0])
+                for row in store._connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                )
+            }
+            assert tables == {"quota_state", "egress_state"}
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [sqlite3.SQLITE_BUSY_RECOVERY, sqlite3.SQLITE_LOCKED_SHAREDCACHE],
+    ids=["busy-extended", "locked-extended"],
+)
+def test_schema_initialization_retries_sqlite_lock_contention(
+    monkeypatch, error_code: int
+) -> None:
+    attempts = 0
+
+    def initialize(_connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = error_code
+            raise error
+
+    class Connection:
+        in_transaction = False
+
+    monkeypatch.setattr(state_store_module, "_initialize_schema", initialize)
+    monkeypatch.setattr(state_store_module.time, "sleep", lambda _delay: None)
+
+    state_store_module._initialize_schema_with_retry(
+        cast(sqlite3.Connection, Connection())
+    )
+
+    assert attempts == 2
+
+
+def test_schema_initialization_does_not_retry_other_sqlite_errors(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    def initialize(_connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        error = sqlite3.OperationalError("disk input/output error")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        raise error
+
+    class Connection:
+        in_transaction = False
+
+    monkeypatch.setattr(state_store_module, "_initialize_schema", initialize)
+
+    with pytest.raises(sqlite3.OperationalError, match="input/output"):
+        state_store_module._initialize_schema_with_retry(
+            cast(sqlite3.Connection, Connection())
+        )
+
+    assert attempts == 1
+
+
+def test_schema_initialization_lock_retry_has_one_total_deadline(monkeypatch) -> None:
+    attempts = 0
+    monotonic_values = iter([0.0, 0.0, 4.9, 5.1])
+
+    def initialize(_connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        error = sqlite3.OperationalError("database is locked")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    class Connection:
+        in_transaction = False
+
+    monkeypatch.setattr(state_store_module, "_initialize_schema", initialize)
+    monkeypatch.setattr(
+        state_store_module.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(state_store_module.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        state_store_module._initialize_schema_with_retry(
+            cast(sqlite3.Connection, Connection())
+        )
+
+    assert attempts == 2
+
+
+def test_schema_initialization_does_not_start_attempt_after_deadline(
+    monkeypatch,
+) -> None:
+    attempts = 0
+    monotonic_values = iter([0.0, 0.0, 5.1])
+
+    def initialize(_connection) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError("database is locked")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+
+    class Connection:
+        in_transaction = False
+
+    monkeypatch.setattr(state_store_module, "_initialize_schema", initialize)
+    monkeypatch.setattr(
+        state_store_module.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(state_store_module.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        state_store_module._initialize_schema_with_retry(
+            cast(sqlite3.Connection, Connection())
+        )
+
+    assert attempts == 1
+
+
+def test_open_closes_connection_when_schema_initialization_exhausts(
+    tmp_path, monkeypatch
+) -> None:
+    class Connection:
+        closed = False
+
+        def execute(self, _sql):
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = Connection()
+    contention = sqlite3.OperationalError("database is locked")
+    contention.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    def fail_initialization(_connection) -> None:
+        raise contention
+
+    monkeypatch.setattr(
+        state_store_module.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: connection,
+    )
+    monkeypatch.setattr(
+        state_store_module,
+        "_initialize_schema_with_retry",
+        fail_initialization,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        EgressStateStore.open(tmp_path / "state.sqlite")
+
+    assert connection.closed
 
 
 def test_expired_restriction_requires_explicit_successful_probe(tmp_path) -> None:
@@ -319,7 +667,19 @@ def test_quota_multiplier_must_be_in_open_zero_closed_one(tmp_path, value) -> No
         store.close()
 
 
-@pytest.mark.parametrize("value", [1, True])
+class _MisleadingDecimal(Decimal):
+    def is_finite(self) -> bool:
+        return True
+
+    def __le__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __str__(self) -> str:
+        return "NaN"
+
+
+@pytest.mark.parametrize("value", [1, True, _MisleadingDecimal("2")])
 def test_quota_multiplier_requires_decimal_input(tmp_path, value) -> None:
     store = EgressStateStore.open(tmp_path / "state.sqlite")
     try:
@@ -496,6 +856,106 @@ def test_open_rejects_primary_key_collation_drift(tmp_path) -> None:
         RuntimeError, match="quota_state schema does not match version 1"
     ):
         EgressStateStore.open(path)
+
+
+@pytest.mark.parametrize(
+    "quota_ddl",
+    [
+        pytest.param(
+            _QUOTA_TABLE_DDL.replace(
+                "current_rate_multiplier TEXT NOT NULL",
+                "current_rate_multiplier TEXT COLLATE NOCASE NOT NULL",
+            ),
+            id="non-key-collation",
+        ),
+        pytest.param(
+            _QUOTA_TABLE_DDL.replace(
+                "restriction_revision INTEGER NOT NULL",
+                "restriction_revision INTEGER NOT NULL CHECK (restriction_revision >= 0)",
+            ),
+            id="check-constraint",
+        ),
+        pytest.param(
+            f"{_QUOTA_TABLE_DDL} STRICT",
+            id="strict-table",
+            marks=pytest.mark.skipif(
+                sqlite3.sqlite_version_info < (3, 37),
+                reason="STRICT tables require SQLite 3.37 or newer",
+            ),
+        ),
+        pytest.param(
+            f"{_QUOTA_TABLE_DDL} WITHOUT ROWID",
+            id="without-rowid",
+        ),
+    ],
+)
+def test_open_rejects_noncanonical_table_ddl(tmp_path, quota_ddl: str) -> None:
+    path = tmp_path / "state.sqlite"
+    _create_version_one_database(path, quota_ddl=quota_ddl)
+
+    with pytest.raises(RuntimeError, match="schema objects do not match version 1"):
+        EgressStateStore.open(path)
+
+
+def test_open_rejects_unexpected_trigger_on_owned_table(tmp_path) -> None:
+    path = tmp_path / "state.sqlite"
+    _create_version_one_database(
+        path,
+        extra_ddl="""
+        CREATE TRIGGER rewrite_quota_revision
+        AFTER UPDATE ON quota_state
+        BEGIN
+          UPDATE quota_state
+             SET restriction_revision = 0
+           WHERE exchange = NEW.exchange
+             AND quota_group = NEW.quota_group;
+        END;
+        """,
+    )
+
+    with pytest.raises(RuntimeError, match="schema objects do not match version 1"):
+        EgressStateStore.open(path)
+
+
+@pytest.mark.parametrize(
+    "extra_ddl",
+    [
+        "CREATE TABLE unrelated_state (value TEXT);",
+        "CREATE TABLE sqliteEvil (value TEXT);",
+        "CREATE VIEW quota_state_view AS SELECT * FROM quota_state;",
+    ],
+    ids=["table", "sqlite-prefix-lookalike", "view"],
+)
+def test_open_rejects_unexpected_application_schema_object(
+    tmp_path, extra_ddl: str
+) -> None:
+    path = tmp_path / "state.sqlite"
+    _create_version_one_database(path, extra_ddl=extra_ddl)
+
+    with pytest.raises(RuntimeError, match="schema objects do not match version 1"):
+        EgressStateStore.open(path)
+
+
+def test_open_allows_sqlite_internal_analyze_statistics(tmp_path) -> None:
+    path = tmp_path / "state.sqlite"
+    with EgressStateStore.open(path):
+        pass
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("ANALYZE")
+        connection.commit()
+        internal_tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        assert "sqlite_stat1" in internal_tables
+    finally:
+        connection.close()
+
+    with EgressStateStore.open(path) as reopened:
+        assert reopened.journal_mode == "wal"
 
 
 def test_failed_version_zero_initialization_rolls_back_new_tables(tmp_path) -> None:
@@ -752,6 +1212,450 @@ def test_probe_admission_cannot_be_replayed_through_another_store(tmp_path) -> N
     finally:
         admitting_store.close()
         other_store.close()
+
+
+def test_probe_admission_registry_releases_unreferenced_tokens(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=0, reason="manual"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=0,
+            now_monotonic_ns=1,
+        )
+        probe = admitted.quota_probe(exchange="okx", quota_group="nat")
+        assert probe is not None
+        probe_reference = ref(probe)
+        registry = store._EgressStateStore__issued_probe_admissions  # type: ignore[attr-defined]
+        assert len(registry) == 1
+
+        del probe, admitted
+        gc.collect()
+
+        assert probe_reference() is None
+        assert registry == {}
+    finally:
+        store.close()
+
+
+def test_quota_probe_cannot_be_forged_from_readable_store_identity(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=999, reason="429"
+        )
+        forged = QuotaProbeAdmission._minted(
+            exchange="okx",
+            quota_group="nat",
+            restriction_revision=1,
+            probe_after_monotonic_ns=0,
+            store_identity=store._admission_identity,
+        )
+
+        with pytest.raises(ValueError, match="issued by admit_health"):
+            store.record_quota_probe_success(
+                admission=forged,
+                observed_monotonic_ns=0,
+            )
+
+        state = store.load_quota("okx", "nat")
+        assert state.ban_until_unix_ns == 999
+        assert state.restriction_revision == 1
+    finally:
+        store.close()
+
+
+def test_transport_probe_cannot_be_forged_from_readable_store_identity(
+    tmp_path,
+) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="okx",
+            egress_id="a",
+            reason="connect_error",
+            cooldown_until_unix_ns=999,
+        )
+        forged = TransportProbeAdmission._minted(
+            exchange="okx",
+            egress_id="a",
+            restriction_revision=1,
+            probe_after_monotonic_ns=0,
+            store_identity=store._admission_identity,
+        )
+
+        with pytest.raises(ValueError, match="issued by admit_health"):
+            store.record_transport_probe_success(
+                admission=forged,
+                observed_monotonic_ns=0,
+                observed_unix_ns=1,
+                latency_ns=1,
+            )
+
+        state = store.load_egress("okx", "a")
+        assert state.cooldown_until_unix_ns == 999
+        assert state.restriction_revision == 1
+    finally:
+        store.close()
+
+
+def test_registered_probe_cannot_change_claims_with_reflective_mutation(
+    tmp_path,
+) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        for quota_group in ("original", "target"):
+            store.record_ban(
+                exchange="okx",
+                quota_group=quota_group,
+                until_unix_ns=0,
+                reason="429",
+            )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="original")],
+            now_unix_ns=0,
+            now_monotonic_ns=0,
+        )
+        probe = admitted.quota_probe(exchange="okx", quota_group="original")
+        assert probe is not None
+        object.__setattr__(probe, "quota_group", "target")
+        object.__setattr__(
+            probe,
+            "_mint",
+            _AdmissionMint(store._admission_identity, probe._claims()),
+        )
+
+        with pytest.raises(ValueError, match="issued by admit_health"):
+            store.record_quota_probe_success(
+                admission=probe,
+                observed_monotonic_ns=0,
+            )
+
+        target = store.load_quota("okx", "target")
+        assert target.last_reason == "429"
+        assert target.restriction_revision == 1
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"quota_group": "other"},
+        {"restriction_revision": 2},
+        {"probe_after_monotonic_ns": 0},
+    ],
+    ids=["key", "revision", "deadline"],
+)
+def test_quota_probe_admission_rejects_replaced_claims(tmp_path, changes) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.quota_probe(exchange="okx", quota_group="nat")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(probe, **changes)
+    finally:
+        store.close()
+
+
+def test_quota_probe_admission_rejects_equal_string_subclass_claim(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.quota_probe(exchange="okx", quota_group="nat")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="strings"):
+            replace(probe, exchange=_EqualString("binance"))
+    finally:
+        store.close()
+
+
+def test_quota_probe_admission_rejects_duck_typed_mint(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.quota_probe(exchange="okx", quota_group="nat")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="mint"):
+            replace(probe, _mint=_FakeMint())  # type: ignore[arg-type]
+    finally:
+        store.close()
+
+
+def test_quota_probe_success_rejects_admission_subclass(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="binance",
+            quota_group="nat",
+            until_unix_ns=0,
+            reason="429",
+        )
+        forged = _ForgedQuotaProbeAdmission(
+            exchange="binance",
+            quota_group="nat",
+            restriction_revision=1,
+            probe_after_monotonic_ns=0,
+            _mint=object(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(TypeError, match="QuotaProbeAdmission"):
+            store.record_quota_probe_success(
+                admission=forged,
+                observed_monotonic_ns=0,
+            )
+
+        assert store.load_quota("binance", "nat").last_reason == "429"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"egress_id": "other"},
+        {"restriction_revision": 2},
+        {"probe_after_monotonic_ns": 0},
+    ],
+    ids=["key", "revision", "deadline"],
+)
+def test_transport_probe_admission_rejects_replaced_claims(tmp_path, changes) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="okx",
+            egress_id="a",
+            reason="connect_error",
+            cooldown_until_unix_ns=100,
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.transport_probe(exchange="okx", egress_id="a")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(probe, **changes)
+    finally:
+        store.close()
+
+
+def test_transport_probe_admission_rejects_equal_string_subclass_claim(
+    tmp_path,
+) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="okx",
+            egress_id="a",
+            reason="connect_error",
+            cooldown_until_unix_ns=100,
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.transport_probe(exchange="okx", egress_id="a")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="strings"):
+            replace(probe, egress_id=_EqualString("other"))
+    finally:
+        store.close()
+
+
+def test_transport_probe_admission_rejects_duck_typed_mint(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="okx",
+            egress_id="a",
+            reason="connect_error",
+            cooldown_until_unix_ns=100,
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        probe = admitted.transport_probe(exchange="okx", egress_id="a")
+        assert probe is not None
+
+        with pytest.raises(ValueError, match="mint"):
+            replace(probe, _mint=_FakeMint())  # type: ignore[arg-type]
+    finally:
+        store.close()
+
+
+def test_transport_probe_success_rejects_admission_subclass(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="binance",
+            egress_id="a",
+            reason="connect_error",
+        )
+        forged = _ForgedTransportProbeAdmission(
+            exchange="binance",
+            egress_id="a",
+            restriction_revision=1,
+            probe_after_monotonic_ns=0,
+            _mint=object(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(TypeError, match="TransportProbeAdmission"):
+            store.record_transport_probe_success(
+                admission=forged,
+                observed_monotonic_ns=0,
+                observed_unix_ns=1,
+                latency_ns=1,
+            )
+
+        assert store.load_egress("binance", "a").last_reason == "connect_error"
+    finally:
+        store.close()
+
+
+def test_admitted_health_rejects_replaced_deadline_claims(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(
+                admitted,
+                probe_after_monotonic_ns=((("okx", "a"), 0),),
+            )
+    finally:
+        store.close()
+
+
+def test_admitted_health_rejects_cloned_quota_child_token(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        child = admitted.quota_probe_admissions[0]
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(admitted, quota_probe_admissions=(replace(child),))
+    finally:
+        store.close()
+
+
+def test_admitted_health_rejects_cloned_transport_child_token(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_transport_failure(
+            exchange="okx",
+            egress_id="a",
+            reason="connect_error",
+            cooldown_until_unix_ns=100,
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        child = admitted.transport_probe_admissions[0]
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(admitted, transport_probe_admissions=(replace(child),))
+    finally:
+        store.close()
+
+
+def test_admitted_health_rejects_duck_typed_mint(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[],
+            now_unix_ns=1,
+            now_monotonic_ns=1,
+        )
+
+        with pytest.raises(ValueError, match="mint"):
+            replace(admitted, _mint=_FakeMint())  # type: ignore[arg-type]
+    finally:
+        store.close()
+
+
+def test_admitted_health_rejects_equal_tuple_subclass_claims(tmp_path) -> None:
+    store = EgressStateStore.open(tmp_path / "state.sqlite")
+    try:
+        store.record_ban(
+            exchange="okx", quota_group="nat", until_unix_ns=100, reason="429"
+        )
+        admitted = store.admit_health(
+            exchange="okx",
+            egresses=[egress("a", quota_group="nat")],
+            now_unix_ns=99,
+            now_monotonic_ns=1_000,
+        )
+        forged_deadlines = _EqualTuple(((("binance", "b"), 0),))
+
+        with pytest.raises(ValueError, match="minted claims"):
+            replace(
+                admitted,
+                probe_after_monotonic_ns=forged_deadlines,  # type: ignore[arg-type]
+            )
+    finally:
+        store.close()
 
 
 def test_probe_success_uses_admitted_monotonic_deadline_after_wall_clock_rewind(
