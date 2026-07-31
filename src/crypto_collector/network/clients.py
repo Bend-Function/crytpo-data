@@ -4,12 +4,14 @@ import asyncio
 import select
 import socket
 import ssl
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
+from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from ipaddress import ip_address
 from types import TracebackType
-from typing import Any, Generic, Self, TypeVar
-from urllib.parse import SplitResult, unquote_to_bytes, urlsplit
+from typing import Any, Generic, Self, TypeAlias, TypeVar
+from urllib.parse import SplitResult, parse_qsl, unquote_to_bytes, urlsplit
+from urllib.request import Request as UrllibRequest
 
 import httpcore
 import httpx
@@ -34,12 +36,13 @@ from crypto_collector.network.models import (
 )
 from crypto_collector.observability.redaction import (
     SENSITIVE_HEADER_NAMES,
+    SENSITIVE_QUERY_NAMES,
     install_dependency_log_redaction,
 )
 
 _SENSITIVE_REQUEST_HEADERS = frozenset(
     name.encode("ascii") for name in SENSITIVE_HEADER_NAMES
-)
+) | {b"cookie"}
 
 
 def _proxy_for(egress: Egress, secrets: SecretSnapshot) -> SecretValue | None:
@@ -181,9 +184,15 @@ def _websocket_target_is_valid(uri: str) -> bool:
         parsed.scheme.casefold() not in {"ws", "wss"}
         or host is None
         or "%" in host
+        or parsed.netloc.endswith(":")
         or (port is not None and not 1 <= port <= 65_535)
         or "@" in parsed.netloc
         or parsed.fragment
+        or ("?" in uri and not parsed.query)
+        or any(
+            name.casefold() in SENSITIVE_QUERY_NAMES
+            for name, _value in parse_qsl(parsed.query, keep_blank_values=True)
+        )
     ):
         return False
     return _dependency_accepts_websocket_uri(uri)
@@ -241,36 +250,73 @@ async def _capture_core_call(
         return _CapturedCoreCall(error=mapped)
 
 
-def _invalid_sensitive_header_names(
+def _sensitive_header_names(
     headers: list[tuple[bytes, bytes]],
 ) -> set[str]:
-    invalid_names: set[str] = set()
-    for name, value in headers:
-        if name.lower() not in _SENSITIVE_REQUEST_HEADERS:
-            continue
-        if (
-            any(byte < 0x20 or byte == 0x7F for byte in value)
-            or value.startswith(b" ")
-            or value.endswith(b" ")
-        ):
-            invalid_names.add(name.decode("ascii"))
-    return invalid_names
+    return {
+        name.decode("ascii")
+        for name, _value in headers
+        if name.lower() in _SENSITIVE_REQUEST_HEADERS
+    }
 
 
-def _validate_sensitive_headers(request: httpx.Request) -> None:
-    invalid_names = _invalid_sensitive_header_names(request.headers.raw)
-    if not invalid_names:
-        return
-    for name in invalid_names:
-        request.headers[name] = "***"
-    raise httpx.LocalProtocolError(
-        "invalid sensitive request header",
-        request=request,
+def _sanitize_sensitive_query(request: httpx.Request) -> bool:
+    items = request.url.params.multi_items()
+    if not any(name.casefold() in SENSITIVE_QUERY_NAMES for name, _value in items):
+        return False
+    request.url = request.url.copy_with(
+        query=str(
+            httpx.QueryParams(
+                [
+                    (
+                        name,
+                        "***" if name.casefold() in SENSITIVE_QUERY_NAMES else value,
+                    )
+                    for name, value in items
+                ]
+            )
+        ).encode("ascii")
     )
+    return True
+
+
+def _validate_anonymous_request(request: httpx.Request) -> None:
+    sensitive_names = _sensitive_header_names(request.headers.raw)
+    has_sensitive_query = _sanitize_sensitive_query(request)
+    has_userinfo = bool(request.url.userinfo)
+    if has_userinfo:
+        request.url = request.url.copy_with(username=None, password=None)
+    has_fragment = "#" in str(request.url)
+    if has_fragment:
+        request.url = request.url.copy_with(fragment=None)
+    for name in sensitive_names:
+        request.headers[name] = "***"
+    if sensitive_names or has_sensitive_query or has_userinfo:
+        raise httpx.LocalProtocolError(
+            "credentials are not permitted on anonymous market-data requests",
+            request=request,
+        )
+    method = request.method
+    if type(method) is not str or str.__eq__(method, "GET") is not True:
+        request.method = "INVALID"
+        raise httpx.LocalProtocolError(
+            "anonymous market-data requests must use GET",
+            request=request,
+        )
+    if (
+        request.url.scheme.casefold() not in {"http", "https"}
+        or not request.url.host
+        or has_fragment
+    ):
+        raise httpx.LocalProtocolError(
+            "anonymous market-data requests require an absolute HTTP(S) URL "
+            "without a fragment",
+            request=request,
+        )
 
 
 async def _validate_sensitive_request(request: httpx.Request) -> None:
-    _validate_sensitive_headers(request)
+    _validate_anonymous_request(request)
 
 
 def _close_socket(sock: socket.socket) -> None:
@@ -626,7 +672,7 @@ class _SocksTransport(httpx.AsyncBaseTransport):
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        _validate_sensitive_headers(request)
+        _validate_anonymous_request(request)
         core_request = httpcore.Request(
             method=request.method,
             url=httpcore.URL(
@@ -662,11 +708,131 @@ class _ValidatedTransport(httpx.AsyncBaseTransport):
         self._delegate = delegate
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        _validate_sensitive_headers(request)
+        _validate_anonymous_request(request)
         return await self._delegate.handle_async_request(request)
 
     async def aclose(self) -> None:
         await self._delegate.aclose()
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAnonymousGet:
+    request: httpx.Request
+    rejected: bool
+
+
+_QueryPrimitive: TypeAlias = str | int | float | bool | None
+_PublicQueryParams: TypeAlias = (
+    httpx.QueryParams
+    | Mapping[str, _QueryPrimitive | Sequence[_QueryPrimitive]]
+    | list[tuple[str, _QueryPrimitive]]
+    | tuple[tuple[str, _QueryPrimitive], ...]
+)
+_TimeoutTuple: TypeAlias = tuple[
+    float | None,
+    float | None,
+    float | None,
+    float | None,
+]
+_PublicTimeout: TypeAlias = float | _TimeoutTuple | httpx.Timeout | None
+
+
+class _UseConfiguredTimeout:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "USE_CONFIGURED_TIMEOUT"
+
+
+_USE_CONFIGURED_TIMEOUT = _UseConfiguredTimeout()
+
+
+class _RejectAllCookiePolicy(DefaultCookiePolicy):
+    def set_ok(self, cookie: Cookie, request: UrllibRequest) -> bool:
+        del cookie, request
+        return False
+
+    def return_ok(self, cookie: Cookie, request: UrllibRequest) -> bool:
+        del cookie, request
+        return False
+
+
+def _prepare_anonymous_get(
+    client: httpx.AsyncClient,
+    url: str | httpx.URL,
+    *,
+    params: _PublicQueryParams | None,
+    timeout: _PublicTimeout | _UseConfiguredTimeout,
+) -> _PreparedAnonymousGet:
+    try:
+        if isinstance(timeout, _UseConfiguredTimeout):
+            request = client.build_request("GET", url, params=params)
+        else:
+            request = client.build_request(
+                "GET",
+                url,
+                params=params,
+                timeout=timeout,
+            )
+    except Exception:  # noqa: BLE001 - raw invalid input must not escape in a traceback
+        return _PreparedAnonymousGet(
+            request=httpx.Request("GET", "https://invalid.invalid/"),
+            rejected=True,
+        )
+
+    try:
+        _validate_anonymous_request(request)
+    except httpx.LocalProtocolError:
+        return _PreparedAnonymousGet(request=request, rejected=True)
+    return _PreparedAnonymousGet(request=request, rejected=False)
+
+
+class _AnonymousHttpClient:
+    __slots__ = ("__client",)
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        client.cookies = CookieJar(policy=_RejectAllCookiePolicy())
+        self.__client = client
+
+    @property
+    def is_closed(self) -> bool:
+        return self.__client.is_closed
+
+    @property
+    def timeout(self) -> httpx.Timeout:
+        return self.__client.timeout
+
+    @timeout.setter
+    def timeout(self, value: _PublicTimeout) -> None:
+        self.__client.timeout = value
+
+    def get(
+        self,
+        url: str | httpx.URL,
+        *,
+        params: _PublicQueryParams | None = None,
+        timeout: _PublicTimeout | _UseConfiguredTimeout = _USE_CONFIGURED_TIMEOUT,
+    ) -> Coroutine[Any, Any, httpx.Response]:
+        prepared = _prepare_anonymous_get(
+            self.__client,
+            url,
+            params=params,
+            timeout=timeout,
+        )
+        del url, params, timeout
+        if prepared.rejected:
+            raise httpx.LocalProtocolError(
+                "anonymous market-data request rejected",
+                request=prepared.request,
+            ) from None
+        return self.__client.send(
+            prepared.request,
+            auth=None,
+            follow_redirects=False,
+        )
+
+    async def aclose(self) -> None:
+        await self.__client.aclose()
 
 
 def build_http_client_spec(
@@ -858,7 +1024,7 @@ class NetworkClients:
     def __init__(
         self,
         *,
-        http: httpx.AsyncClient,
+        http: _AnonymousHttpClient,
         websocket: WebSocketClientFactory,
         egress_id: str,
     ) -> None:
@@ -921,13 +1087,15 @@ def build_clients(
         )
     )
     transport = _ValidatedTransport(base_transport)
-    http = httpx.AsyncClient(
-        proxy=None,
-        transport=transport,
-        trust_env=spec.trust_env,
-        timeout=timeout,
-        follow_redirects=False,
-        event_hooks={"request": [_validate_sensitive_request]},
+    http = _AnonymousHttpClient(
+        httpx.AsyncClient(
+            proxy=None,
+            transport=transport,
+            trust_env=spec.trust_env,
+            timeout=timeout,
+            follow_redirects=False,
+            event_hooks={"request": [_validate_sensitive_request]},
+        )
     )
     return NetworkClients(
         http=http,

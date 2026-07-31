@@ -15,6 +15,8 @@ from crypto_collector.observability.redaction import (
     [
         "https://user:pass@example.test/path?token=abc",
         "Authorization: Bearer abc",
+        "Cookie: session=abc",
+        "Set-Cookie: session=abc; Path=/",
         "x-oss-security-token: abc",
         "AWS_SECRET_ACCESS_KEY=abc",
     ],
@@ -45,7 +47,31 @@ def test_exception_text_is_redacted_before_logging() -> None:
 
     assert "password" not in redacted
     assert "abc" not in redacted
-    assert "127.0.0.1:1080" in redacted
+    assert "127.0.0.1:1080" not in redacted
+    assert "[REDACTED_PROXY]" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('AWS_SECRET_ACCESS_KEY="alpha beta"', "alpha beta"),
+        ("PROXY_PASSWORD='alpha&beta'", "alpha&beta"),
+        ('SESSION_TOKEN="alpha\\" beta"', 'alpha\\" beta'),
+    ],
+)
+def test_redactor_removes_complete_quoted_assignment(text: str, secret: str) -> None:
+    redacted = redact(text)
+
+    assert secret not in redacted
+    assert redacted.endswith("=***")
+
+
+def test_redactor_decodes_origin_form_query_names_before_classification() -> None:
+    redacted = redact("> GET /ws?to%6ben=encoded-query-canary&limit=10 HTTP/1.1")
+
+    assert "encoded-query-canary" not in redacted
+    assert "to%6ben=***" in redacted
+    assert "limit=10" in redacted
 
 
 def test_redactor_removes_complete_comma_delimited_authorization_value() -> None:
@@ -96,6 +122,7 @@ def test_redactor_does_not_match_auth_repr_across_carriage_return() -> None:
         'headers={"x-amz-security-token": "structured-secret"}',
         "headers=[(b'X-MBX-APIKEY', b'structured-secret')]",
         "headers={'OK-ACCESS-PASSPHRASE': 'structured-secret'}",
+        "headers=[(b'Set-Cookie', b'session=structured-secret; Path=/')]",
     ],
 )
 def test_redactor_removes_structured_sensitive_headers(text: str) -> None:
@@ -116,7 +143,10 @@ def test_dependency_log_filter_redacts_urls_headers_paths_and_exceptions(
     )
     logging.getLogger("httpcore.http11").debug(
         "receive_response_headers.complete headers=%r",
-        [(b"Authorization", b"Bearer header-secret")],
+        [
+            (b"Authorization", b"Bearer header-secret"),
+            (b"Set-Cookie", b"session=cookie-secret; Path=/"),
+        ],
     )
     logging.getLogger("websockets.client").debug("> GET /ws?token=path-secret HTTP/1.1")
     logging.getLogger("httpcore.connection").debug(
@@ -127,5 +157,6 @@ def test_dependency_log_filter_redacts_urls_headers_paths_and_exceptions(
     assert "url-secret" not in caplog.text
     assert "query-secret" not in caplog.text
     assert "header-secret" not in caplog.text
+    assert "cookie-secret" not in caplog.text
     assert "path-secret" not in caplog.text
     assert "bare-exception-secret" not in caplog.text

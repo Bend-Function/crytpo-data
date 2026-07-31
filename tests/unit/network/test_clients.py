@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import socket
 import ssl
 import traceback
@@ -213,6 +214,8 @@ def _exception_graph(error: BaseException) -> Iterator[BaseException]:
 
 
 def _non_test_traceback_locals(error: BaseException) -> str:
+    # The caller necessarily retains its own arguments. The secrecy contract starts
+    # at the collector boundary and covers collector/dependency frames and objects.
     frames: list[str] = []
     for item in _exception_graph(error):
         traceback_with_locals = traceback.TracebackException(
@@ -303,6 +306,9 @@ async def test_proxy_url_accepts_equivalent_trailing_slash() -> None:
         ("wss://exa mple/ws", None),
         ("wss://example\\host/ws", None),
         ("wss://example.test/ws#", None),
+        ("wss://example.test:/ws", None),
+        ("wss://example.test/ws?", None),
+        ("wss://example.test/ws?to%6ben=query-secret", "query-secret"),
         ("wss://example.test/ws\u0080", None),
         ("wss://%0Aexample.test/ws", None),
     ],
@@ -800,7 +806,7 @@ async def test_final_transport_validates_after_late_request_hook() -> None:
         return httpx.Response(200)
 
     async def add_invalid_header(request: httpx.Request) -> None:
-        request.headers["Authorization"] = f"Bearer {canary}\n"
+        request.headers["Authorization"] = f"Bearer {canary}"
 
     transport = clients_module._ValidatedTransport(httpx.MockTransport(delegate))
     async with httpx.AsyncClient(
@@ -828,6 +834,263 @@ async def test_final_transport_validates_after_late_request_hook() -> None:
         if frame.filename.endswith("crypto_collector/network/clients.py")
     )
     assert canary not in collector_frames
+
+
+@pytest.mark.asyncio
+async def test_final_transport_rejects_late_method_change() -> None:
+    delegate_called = False
+
+    async def delegate(_request: httpx.Request) -> httpx.Response:
+        nonlocal delegate_called
+        delegate_called = True
+        return httpx.Response(200)
+
+    async def change_method(request: httpx.Request) -> None:
+        request.method = "POST"
+
+    transport = clients_module._ValidatedTransport(httpx.MockTransport(delegate))
+    async with httpx.AsyncClient(
+        transport=transport,
+        event_hooks={"request": [change_method]},
+    ) as client:
+        with pytest.raises(httpx.LocalProtocolError, match="GET") as captured:
+            await client.get("https://venue.invalid/catalog")
+
+    assert not delegate_called
+    assert captured.value.request.method == "INVALID"
+
+
+@pytest.mark.asyncio
+async def test_final_transport_rejects_late_cookie_without_retaining_it() -> None:
+    canary = "late-cookie-secret"
+    delegate_called = False
+
+    async def delegate(_request: httpx.Request) -> httpx.Response:
+        nonlocal delegate_called
+        delegate_called = True
+        return httpx.Response(200)
+
+    async def add_cookie(request: httpx.Request) -> None:
+        request.headers["Cookie"] = f"session={canary}"
+
+    transport = clients_module._ValidatedTransport(httpx.MockTransport(delegate))
+    async with httpx.AsyncClient(
+        transport=transport,
+        event_hooks={"request": [add_cookie]},
+    ) as client:
+        with pytest.raises(httpx.LocalProtocolError) as captured:
+            await client.get("https://venue.invalid/catalog")
+
+    assert not delegate_called
+    assert captured.value.request.headers["Cookie"] == "***"
+    diagnostics = (
+        repr(captured.value.args)
+        + repr(captured.value.request)
+        + _non_test_traceback_locals(captured.value)
+    )
+    assert canary not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_never_replays_server_cookies() -> None:
+    requests: list[httpx.Request] = []
+
+    async def delegate(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Set-Cookie": "session=server-cookie-secret; Path=/"},
+            request=request,
+        )
+
+    client = clients_module._AnonymousHttpClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(delegate))
+    )
+    try:
+        assert (await client.get("https://venue.invalid/first")).status_code == 200
+        assert (await client.get("https://venue.invalid/second")).status_code == 200
+    finally:
+        await client.aclose()
+
+    assert len(requests) == 2
+    assert "Cookie" not in requests[0].headers
+    assert "Cookie" not in requests[1].headers
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_is_a_narrow_synchronous_coroutine_factory() -> None:
+    clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
+    try:
+        assert tuple(inspect.signature(clients.http.get).parameters) == (
+            "url",
+            "params",
+            "timeout",
+        )
+        assert not inspect.iscoroutinefunction(clients.http.get)
+
+        request = clients.http.get("https://venue.invalid/catalog")
+        assert isinstance(request, Coroutine)
+        request.close()
+    finally:
+        await clients.aclose()
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("headers", {"Authorization": "Bearer forbidden-header-secret"}),
+        ("cookies", {"session": "forbidden-cookie-secret"}),
+        ("auth", ("user", "forbidden-auth-secret")),
+        ("follow_redirects", True),
+        ("extensions", {"trace": "forbidden-extension"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_anonymous_get_has_no_credential_keyword_escape_hatch(
+    keyword: str,
+    value: object,
+) -> None:
+    delegate_called = False
+
+    async def delegate(request: httpx.Request) -> httpx.Response:
+        nonlocal delegate_called
+        delegate_called = True
+        return httpx.Response(200, request=request)
+
+    client = clients_module._AnonymousHttpClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(delegate))
+    )
+    try:
+        with pytest.raises(TypeError):
+            await client.get(
+                "https://venue.invalid/catalog",
+                **{keyword: value},  # type: ignore[arg-type]
+            )
+    finally:
+        await client.aclose()
+
+    assert not delegate_called
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/relative/catalog",
+        "ftp://venue.invalid/catalog",
+        "ws://venue.invalid/catalog",
+        "https://venue.invalid/catalog#",
+        "https://venue.invalid/catalog#fragment",
+    ],
+)
+@pytest.mark.asyncio
+async def test_anonymous_get_rejects_non_http_absolute_targets(url: str) -> None:
+    delegate_called = False
+
+    async def delegate(request: httpx.Request) -> httpx.Response:
+        nonlocal delegate_called
+        delegate_called = True
+        return httpx.Response(200, request=request)
+
+    client = clients_module._AnonymousHttpClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(delegate))
+    )
+    try:
+        with pytest.raises(httpx.LocalProtocolError):
+            await client.get(url)
+    finally:
+        await client.aclose()
+
+    assert not delegate_called
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_strips_rejected_fragment_from_diagnostics() -> None:
+    fragment_canary = "fragment-secret-canary"
+
+    def delegate(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request)
+
+    client = clients_module._AnonymousHttpClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(delegate))
+    )
+    try:
+        with pytest.raises(httpx.LocalProtocolError) as captured:
+            await client.get(f"https://venue.invalid/catalog#{fragment_canary}")
+    finally:
+        await client.aclose()
+
+    assert captured.value.request.url.fragment == ""
+    assert fragment_canary not in str(captured.value)
+    assert fragment_canary not in str(captured.value.request.url)
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_rejects_and_sanitizes_encoded_sensitive_query() -> None:
+    query_canary = "valid-query-secret"
+    clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
+    try:
+        with pytest.raises(httpx.LocalProtocolError) as captured:
+            await clients.http.get(
+                f"https://venue.invalid/catalog?to%6ben={query_canary}&limit=10",
+            )
+    finally:
+        await clients.aclose()
+
+    request = captured.value.request
+    assert request.url.params["token"] == "***"
+    assert request.url.params["limit"] == "10"
+    diagnostics = "\n".join(
+        (
+            repr(item.args)
+            + repr(getattr(item, "request", None))
+            + _non_test_traceback_locals(item)
+        )
+        for item in _exception_graph(captured.value)
+    )
+    assert query_canary not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_rejects_and_sanitizes_structured_sensitive_query() -> None:
+    canary = "structured-query-secret"
+    clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
+    try:
+        with pytest.raises(httpx.LocalProtocolError) as captured:
+            await clients.http.get(
+                "https://venue.invalid/catalog",
+                params={"session_token": canary, "limit": 10},
+            )
+    finally:
+        await clients.aclose()
+
+    assert captured.value.request.url.params["session_token"] == "***"
+    assert captured.value.request.url.params["limit"] == "10"
+    diagnostics = (
+        repr(captured.value.args)
+        + repr(captured.value.request)
+        + _non_test_traceback_locals(captured.value)
+    )
+    assert canary not in diagnostics
+
+
+@pytest.mark.asyncio
+async def test_anonymous_get_rejects_userinfo_without_retaining_it() -> None:
+    canary = "userinfo-secret"
+    clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
+
+    try:
+        with pytest.raises(httpx.LocalProtocolError) as captured:
+            await clients.http.get(f"https://user:{canary}@venue.invalid/catalog")
+    finally:
+        await clients.aclose()
+
+    assert captured.value.request.url.userinfo == b""
+    diagnostics = (
+        repr(captured.value.args)
+        + repr(captured.value.request)
+        + _non_test_traceback_locals(captured.value)
+    )
+    assert canary not in diagnostics
 
 
 @pytest.mark.asyncio

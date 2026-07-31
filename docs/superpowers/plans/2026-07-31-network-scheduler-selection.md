@@ -27,15 +27,17 @@
 ```python
 def test_direct_http_client_ignores_host_proxy_environment(monkeypatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://unexpected.invalid:8080")
-    spec = build_http_client_spec(Egress(id="direct", type="direct"),
-                                  secrets=SecretSnapshot.empty())
+    spec = build_http_client_spec(
+        Egress(id="direct", type="direct"), secrets=SecretSnapshot.empty()
+    )
     assert spec.trust_env is False
     assert spec.proxy is None
 
 
 def test_direct_websocket_disables_auto_proxy_detection() -> None:
     spec = build_websocket_connect_spec(
-        Egress(id="direct", type="direct"), "wss://example.test/ws",
+        Egress(id="direct", type="direct"),
+        "wss://example.test/ws",
         secrets=SecretSnapshot.empty(),
     )
     assert spec.proxy is None
@@ -47,19 +49,24 @@ def test_socks5h_resolves_proxy_reference_only_at_client_creation(monkeypatch) -
     secrets = SecretSnapshot.resolve_all([egress.url])
     spec = build_http_client_spec(egress, secrets=secrets)
     ws_spec = build_websocket_connect_spec(
-        egress, "wss://example.test/ws", secrets=secrets,
+        egress,
+        "wss://example.test/ws",
+        secrets=secrets,
     )
     assert spec.proxy.reveal().startswith("socks5h://")
     assert "password" not in repr(spec)
     assert "password" not in repr(ws_spec)
 
 
-@pytest.mark.parametrize("text", [
-    "https://user:pass@example.test/path?token=abc",
-    "Authorization: Bearer abc",
-    "x-oss-security-token: abc",
-    "AWS_SECRET_ACCESS_KEY=abc",
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://user:pass@example.test/path?token=abc",
+        "Authorization: Bearer abc",
+        "x-oss-security-token: abc",
+        "AWS_SECRET_ACCESS_KEY=abc",
+    ],
+)
 def test_redactor_removes_supported_secret_forms(text: str) -> None:
     assert "abc" not in redact(text)
     assert "pass" not in redact(text)
@@ -67,11 +74,15 @@ def test_redactor_removes_supported_secret_forms(text: str) -> None:
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(loopback_socks5, loopback_apps) -> None:
+async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(
+    loopback_socks5, loopback_apps
+) -> None:
     ref = SecretRef.parse("env:SOCKS_URL")
-    secrets = SecretSnapshot.from_test_values({
-        ref: loopback_socks5.url(scheme="socks5h", credentials=("u", "secret")),
-    })
+    secrets = SecretSnapshot.from_test_values(
+        {
+            ref: loopback_socks5.url(scheme="socks5h", credentials=("u", "secret")),
+        }
+    )
     clients = build_clients(socks_egress(ref), secrets=secrets)
     assert (await clients.http.get("http://venue.invalid/catalog")).status_code == 200
     async with clients.websocket.connect("ws://venue.invalid/ws") as websocket:
@@ -83,7 +94,9 @@ async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(loopback_socks5,
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_direct_clients_ignore_host_proxy_environment(monkeypatch, loopback_apps) -> None:
+async def test_direct_clients_ignore_host_proxy_environment(
+    monkeypatch, loopback_apps
+) -> None:
     monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1")
     clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
     assert (await clients.http.get(loopback_apps.http_url)).status_code == 200
@@ -118,19 +131,26 @@ class WebSocketConnectSpec:
     max_queue: int = 16
 
     def __repr__(self) -> str:
-        return (f"WebSocketConnectSpec(uri={self.uri!r}, "
-                f"proxy={'configured' if self.proxy else None!r}, "
-                f"open_timeout={self.open_timeout!r}, "
-                f"close_timeout={self.close_timeout!r}, max_queue={self.max_queue!r})")
+        return (
+            f"WebSocketConnectSpec(uri={self.uri!r}, "
+            f"proxy={'configured' if self.proxy else None!r}, "
+            f"open_timeout={self.open_timeout!r}, "
+            f"close_timeout={self.close_timeout!r}, max_queue={self.max_queue!r})"
+        )
 
 
-def build_http_client_spec(egress: Egress, *, secrets: SecretSnapshot) -> HttpClientSpec:
+def build_http_client_spec(
+    egress: Egress, *, secrets: SecretSnapshot
+) -> HttpClientSpec:
     proxy = None if egress.type == "direct" else secrets.value_for(egress.url)
     return HttpClientSpec(proxy=proxy, trust_env=False)
 
 
 def build_websocket_connect_spec(
-    egress: Egress, uri: str, *, secrets: SecretSnapshot,
+    egress: Egress,
+    uri: str,
+    *,
+    secrets: SecretSnapshot,
 ) -> WebSocketConnectSpec:
     proxy = None if egress.type == "direct" else secrets.value_for(egress.url)
     return WebSocketConnectSpec(uri=uri, proxy=proxy)
@@ -138,9 +158,13 @@ def build_websocket_connect_spec(
 
 Direct egress uses `SecretSnapshot.empty()` so both builders retain one signature. Builders never resolve a reference and never store plaintext strings in repr-able objects. Client constructors are the only consumers of `SecretValue.reveal()`. They parse the proxy once into a non-repr credential endpoint shared by the HTTP and WebSocket paths; the WebSocket factory retains neither the secret snapshot nor the source URL. The custom HTTPX transport preserves the logical target hostname in pool keys and TLS SNI while delegating only the SOCKS CONNECT operation. HTTP connection limits come from `egress.max_http_concurrency`, with keepalive capped by that same value. Direct and SOCKS delegates both sit behind a final validating transport, so a later request hook cannot bypass sensitive-header validation. Both clients use `trust_env=False`, explicit timeouts/limits, and no ambient proxy or CA discovery.
 
-SOCKS userinfo is validated at construction as paired, non-empty ASCII fields of 1-255 bytes with strictly validated percent escapes, matching the locked `python-socks` implementation and RFC 1929 framing. Invalid configuration clears revealed plaintext before raising a generic error whose cause/context graph and collector traceback locals contain no source URL. Proxy and target WebSocket URLs reject literal whitespace, C0/C1 control characters, backslashes, encoded hostnames, and empty forbidden delimiters. A proxy URL may have an equivalent trailing `/` but no other path, query, or fragment. Target WebSocket URIs reject userinfo before the dependency boundary. The collector owns the proxy TCP socket before the first cancellable connect and closes it on timeout, cancellation, negotiation failure, handshake failure, and socket-option failure. The pinned `python-socks` adapter invokes its socket-owning handshake primitive under the collector's deadline and never changes process-global warning filters across an await. External cancellation keeps its control-flow identity but discards dependency traceback locals; WebSocket open timeout is reclassified outside the cancellation context. Connection, negotiation, and socket-option errors are likewise mapped outside their sensitive dependency exception contexts into the HTTPX/httpcore or WebSocket classifications. HTTP protocol errors raised after response headers are mapped at the response-stream boundary, and sensitive request headers are sanitized and rejected before h11 if they contain illegal control bytes.
+`NetworkClients.http` is a composition facade rather than an `httpx.AsyncClient` subclass. Its complete request surface is `get(url, *, params=None, timeout=<configured>)`; it also exposes only the timeout property, closed state, and `aclose()` needed for lifecycle management. It has no `headers`, `cookies`, `auth`, `follow_redirects`, `extensions`, `request`, `send`, `build_request`, or `stream` escape hatch. `get` is an ordinary function that synchronously builds and validates a normalized request, discards caller-owned URL/parameter objects at the boundary, and returns the real HTTPX `send` coroutine so `asyncio.create_task(clients.http.get(...))` remains valid. Targets must be absolute HTTP(S) URLs with a host and no fragment delimiter, including an empty `#`. URL userinfo and sensitive query names, including percent-encoded names and structured `params`, are sanitized in the diagnostic request and rejected before any I/O. Redirects and authentication remain fixed off. The facade installs a reject-all cookie policy so response `Set-Cookie` values are never persisted or replayed. The final transport repeats validation as defense against a late internal request hook: it restores a rejected non-GET method to a generic diagnostic value and sanitizes/rejects both credential headers and `Cookie` before delegation.
 
-`WebSocketClientFactory.connect(uri)` returns a one-shot awaitable/context manager for both direct and SOCKS egress. It deliberately does not expose the dependency's async-iteration reconnect API: Plan 04 owns connection-generation failure, closure, and reconnect and must obtain a fresh handle for each attempt. Re-entering a used handle is an explicit error. The shared redactor covers URL userinfo, secret query names in absolute and origin-form targets, ordinary and structured sensitive headers, and secret assignments. Client construction installs the idempotent filter on the pinned HTTPX/httpcore/websockets client logger names so dependency DEBUG/INFO output and exception fields pass through that redactor. Verify the foundation's locked HTTPX, httpcore, and `python-socks[asyncio]` dependencies are installed.
+The traceback secrecy guarantee begins at this facade boundary: collector/dependency traceback frames after the call boundary plus every exception and attached request object must contain only sanitized data. It cannot include the originating caller frame or caller-owned objects because Python callers necessarily retain their own arguments. Tests exclude only that unavoidable caller ownership and scan the controlled collector/dependency frames and exception graph.
+
+SOCKS userinfo is validated at construction as paired, non-empty ASCII fields of 1-255 bytes with strictly validated percent escapes, matching the locked `python-socks` implementation and RFC 1929 framing. Invalid configuration clears revealed plaintext before raising a generic error whose cause/context graph and collector traceback locals contain no source URL. Proxy and target WebSocket URLs reject literal whitespace, C0/C1 control characters, backslashes, encoded hostnames, and empty forbidden delimiters. A proxy URL may have an equivalent trailing `/` but no other path, query, or fragment. Target WebSocket URIs reject userinfo before the dependency boundary. The collector owns the proxy TCP socket before the first cancellable connect and closes it on timeout, cancellation, negotiation failure, handshake failure, and socket-option failure. The pinned `python-socks` adapter invokes its socket-owning handshake primitive under the collector's deadline and never changes process-global warning filters across an await. External cancellation keeps its control-flow identity but discards dependency traceback locals; WebSocket open timeout is reclassified outside the cancellation context. Connection, negotiation, and socket-option errors are likewise mapped outside their sensitive dependency exception contexts into the HTTPX/httpcore or WebSocket classifications. HTTP protocol errors raised after response headers are mapped at the response-stream boundary, and all sensitive request headers are sanitized and rejected before h11, including legal-looking values.
+
+`WebSocketClientFactory.connect(uri)` returns a one-shot awaitable/context manager for both direct and SOCKS egress. It deliberately does not expose the dependency's async-iteration reconnect API: Plan 04 owns connection-generation failure, closure, and reconnect and must obtain a fresh handle for each attempt. Re-entering a used handle is an explicit error. The shared redactor covers URL userinfo, secret query names in absolute and origin-form targets, ordinary and structured sensitive headers (including `Cookie` and `Set-Cookie`), and secret assignments. Client construction installs the idempotent filter on the pinned HTTPX/httpcore/websockets client logger names so dependency DEBUG/INFO output and exception fields pass through that redactor. Verify the foundation's locked HTTPX, httpcore, and `python-socks[asyncio]` dependencies are installed.
 
 The function-scoped `tests/support/socks5_server.py` implements only the SOCKS5 greeting, optional username/password auth, and CONNECT required by the tests. It records the requested address type/domain before proxying to an explicitly mapped loopback HTTP or WebSocket server, so `socks5h` remote-name resolution is observable without external DNS. It rejects any destination not in the test mapping and stores only redacted diagnostics.
 
@@ -194,19 +218,26 @@ def test_ban_survives_worker_restart(tmp_path) -> None:
 
 def test_assignment_precedes_deterministic_egress_local_sharding() -> None:
     assignments = assign_instruments(
-        ["BTCUSDT", "ETHUSDT", "SOLUSDT"], channel="trade",
-        egresses=[egress("a", max_subscriptions=2), egress("b", max_subscriptions=2)])
+        ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        channel="trade",
+        egresses=[egress("a", max_subscriptions=2), egress("b", max_subscriptions=2)],
+    )
     shards = pack_egress_shards(assignments)
     assert all(len(shard.instrument_keys) <= 2 for shard in shards)
-    assert all(len({item.egress_id for item in shard.assignments}) == 1 for shard in shards)
+    assert all(
+        len({item.egress_id for item in shard.assignments}) == 1 for shard in shards
+    )
 
 
 @pytest.mark.network
 @pytest.mark.asyncio
 async def test_failed_proxy_closes_generation_and_only_new_generation_moves(
-    loopback_socks_pair, loopback_apps,
+    loopback_socks_pair,
+    loopback_apps,
 ) -> None:
-    manager = egress_manager(loopback_socks_pair, assignment_key="okx/spot/BTC-USDT/books")
+    manager = egress_manager(
+        loopback_socks_pair, assignment_key="okx/spot/BTC-USDT/books"
+    )
     first = await manager.open_generation()
     assert await first.rest_probe() == "ok"
     loopback_socks_pair.fail(first.egress_id)
@@ -283,13 +314,19 @@ def test_token_bucket_is_keyed_by_exchange_quota_group_and_endpoint() -> None:
     budgets.add(("binance", "shared-nat", "depth"), capacity=10, refill_per_second=1)
     assert budgets.try_acquire(("binance", "shared-nat", "depth"), cost=10)
     assert not budgets.try_acquire(("binance", "shared-nat", "depth"), cost=1)
-    assert budgets.try_acquire(("okx", "shared-nat", "depth"), cost=1, default_capacity=10)
+    assert budgets.try_acquire(
+        ("okx", "shared-nat", "depth"), cost=1, default_capacity=10
+    )
 
 
 @pytest.mark.parametrize(
     ("status", "retry_after", "expected"),
-    [(429, "3", RetryAction.THROTTLE), (418, "120", RetryAction.BAN),
-     (503, None, RetryAction.BACKOFF), (400, None, RetryAction.DO_NOT_RETRY)],
+    [
+        (429, "3", RetryAction.THROTTLE),
+        (418, "120", RetryAction.BAN),
+        (503, None, RetryAction.BACKOFF),
+        (400, None, RetryAction.DO_NOT_RETRY),
+    ],
 )
 def test_http_retry_classification(status, retry_after, expected) -> None:
     assert classify_http(status, retry_after=retry_after).action is expected
@@ -297,23 +334,31 @@ def test_http_retry_classification(status, retry_after, expected) -> None:
 
 def test_full_jitter_never_exceeds_cap() -> None:
     rng = random.Random(7)
-    assert all(0 <= full_jitter_ns(5, base_ns=1_000, cap_ns=10_000, rng=rng) <= 10_000
-               for _ in range(100))
+    assert all(
+        0 <= full_jitter_ns(5, base_ns=1_000, cap_ns=10_000, rng=rng) <= 10_000
+        for _ in range(100)
+    )
 
 
 def test_rest_retry_stops_at_attempt_or_job_deadline() -> None:
     policy = retry_policy(max_attempts=5)
     assert policy.decide(attempt=5, now_ns=0, deadline_ns=seconds(60)).retry is False
-    decision = policy.decide(attempt=1, now_ns=0, deadline_ns=seconds(2), retry_after="3")
+    decision = policy.decide(
+        attempt=1, now_ns=0, deadline_ns=seconds(2), retry_after="3"
+    )
     assert decision.retry is False
     assert decision.reason == "retry_after_exceeds_deadline"
 
 
-@given(attempt=st.integers(min_value=0, max_value=20),
-       base_ns=st.integers(min_value=1, max_value=seconds(10)),
-       cap_ns=st.integers(min_value=1, max_value=minutes(2)),
-       seed=st.integers(min_value=0, max_value=2**32 - 1))
-def test_full_jitter_is_always_inside_exponential_cap(attempt, base_ns, cap_ns, seed) -> None:
+@given(
+    attempt=st.integers(min_value=0, max_value=20),
+    base_ns=st.integers(min_value=1, max_value=seconds(10)),
+    cap_ns=st.integers(min_value=1, max_value=minutes(2)),
+    seed=st.integers(min_value=0, max_value=2**32 - 1),
+)
+def test_full_jitter_is_always_inside_exponential_cap(
+    attempt, base_ns, cap_ns, seed
+) -> None:
     delay = full_jitter_ns(attempt, base_ns, cap_ns, random.Random(seed))
     assert 0 <= delay <= min(cap_ns, base_ns * 2**attempt)
 
@@ -331,7 +376,10 @@ def test_retry_decision_never_crosses_attempt_or_monotonic_deadline(scenario) ->
     decision = scenario.policy.decide(**scenario.inputs)
     if decision.retry:
         assert scenario.inputs["attempt"] < scenario.policy.max_attempts
-        assert scenario.inputs["now_ns"] + decision.delay_ns <= scenario.inputs["deadline_ns"]
+        assert (
+            scenario.inputs["now_ns"] + decision.delay_ns
+            <= scenario.inputs["deadline_ns"]
+        )
 ```
 
 - [ ] **Step 2: Run and verify budget/retry modules are missing**
@@ -387,12 +435,20 @@ async def test_bootstrap_runs_before_deep_snapshot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_future_high_priority_does_not_block_ready_lower_priority(fake_clock) -> None:
+async def test_future_high_priority_does_not_block_ready_lower_priority(
+    fake_clock,
+) -> None:
     scheduler = RestScheduler(fake_budgets(tokens=10), clock=fake_clock)
-    await scheduler.submit(job("future-bootstrap", priority=RestPriority.LIVE_BOOTSTRAP,
-                               ready_monotonic_ns=seconds(30)))
-    await scheduler.submit(job("ready-deep", priority=RestPriority.DEEP_SNAPSHOT,
-                               ready_monotonic_ns=0))
+    await scheduler.submit(
+        job(
+            "future-bootstrap",
+            priority=RestPriority.LIVE_BOOTSTRAP,
+            ready_monotonic_ns=seconds(30),
+        )
+    )
+    await scheduler.submit(
+        job("ready-deep", priority=RestPriority.DEEP_SNAPSHOT, ready_monotonic_ns=0)
+    )
     assert (await scheduler.next_ready()).id == "ready-deep"
     assert fake_clock.monotonic_ns() == 0
 
@@ -400,24 +456,31 @@ async def test_future_high_priority_does_not_block_ready_lower_priority(fake_clo
 @pytest.mark.asyncio
 async def test_expired_waiting_job_is_dropped_without_dispatch(fake_clock) -> None:
     scheduler = RestScheduler(fake_budgets(tokens=10), clock=fake_clock)
-    await scheduler.submit(job("expired", ready_monotonic_ns=seconds(20),
-                               deadline_ns=seconds(10)))
+    await scheduler.submit(
+        job("expired", ready_monotonic_ns=seconds(20), deadline_ns=seconds(10))
+    )
     fake_clock.advance(seconds(20))
     assert await scheduler.next_ready_or_none() is None
     assert scheduler.expired_ids() == ("expired",)
 
 
 def test_overloaded_deep_interval_stretches_and_emits_context() -> None:
-    plan = solve_interval(requested_ns=30_000_000_000, jobs=100, cost=50,
-                          available_tokens_per_second=50, policy="stretch_with_warning")
+    plan = solve_interval(
+        requested_ns=30_000_000_000,
+        jobs=100,
+        cost=50,
+        available_tokens_per_second=50,
+        policy="stretch_with_warning",
+    )
     assert plan.effective_ns == 100_000_000_000
     assert plan.warning.requested_ns == 30_000_000_000
     assert plan.warning.affected_symbols == 100
 
 
 def test_capacity_recovery_steps_down_without_request_spike() -> None:
-    controller = IntervalController(current_ns=120_000_000_000, recovery_step=0.20,
-                                    healthy_refreshes_required=3)
+    controller = IntervalController(
+        current_ns=120_000_000_000, recovery_step=0.20, healthy_refreshes_required=3
+    )
     assert controller.recover_toward(30_000_000_000) == 120_000_000_000
     assert controller.recover_toward(30_000_000_000) == 120_000_000_000
     assert controller.recover_toward(30_000_000_000) == 96_000_000_000
@@ -425,24 +488,39 @@ def test_capacity_recovery_steps_down_without_request_spike() -> None:
 
 def test_periodic_replaceable_jobs_coalesce_instead_of_backlogging() -> None:
     scheduler = RestScheduler(fake_budgets(tokens=0))
-    scheduler.submit_nowait(job("deep-btc", logical_key=("btc", "deep"), scheduled_ns=1))
-    scheduler.submit_nowait(job("deep-btc-new", logical_key=("btc", "deep"), scheduled_ns=2))
+    scheduler.submit_nowait(
+        job("deep-btc", logical_key=("btc", "deep"), scheduled_ns=1)
+    )
+    scheduler.submit_nowait(
+        job("deep-btc-new", logical_key=("btc", "deep"), scheduled_ns=2)
+    )
     assert scheduler.pending_ids() == ("deep-btc-new",)
 
 
 def test_deep_interval_above_max_is_capacity_failure() -> None:
     with pytest.raises(CapacityError, match="max effective interval"):
-        solve_interval(requested_ns=seconds(30), jobs=1000, cost=250,
-                       available_tokens_per_second=1, max_effective_ns=minutes(15))
+        solve_interval(
+            requested_ns=seconds(30),
+            jobs=1000,
+            cost=250,
+            available_tokens_per_second=1,
+            max_effective_ns=minutes(15),
+        )
 
 
 def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() -> None:
     sinks = recording_interval_sinks()
-    change = interval_change(exchange="okx", endpoint="books-full",
-                             requested_ns=seconds(30), effective_ns=minutes(2),
-                             healthy_egress_count=2,
-                             symbols=("BTC-USDT", "ETH-USDT"), config_sha256="a" * 64,
-                             cause="capacity_shortfall", direction="stretch")
+    change = interval_change(
+        exchange="okx",
+        endpoint="books-full",
+        requested_ns=seconds(30),
+        effective_ns=minutes(2),
+        healthy_egress_count=2,
+        symbols=("BTC-USDT", "ETH-USDT"),
+        config_sha256="a" * 64,
+        cause="capacity_shortfall",
+        direction="stretch",
+    )
     published = IntervalChangePublisher(sinks).publish(change)
     expected_context = {
         "event_id": published.event_id,
@@ -456,18 +534,48 @@ def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() ->
         "direction": "stretch",
     }
     assert {key: sinks.logs.one()[key] for key in expected_context} == expected_context
-    assert {key: sinks.controls.one().payload[key] for key in expected_context} == expected_context
-    assert sinks.metrics.counter("collector_interval_changes_total",
-                                 exchange="okx", endpoint="books-full",
-                                 direction="stretch").value == 1
-    assert sinks.metrics.gauge("collector_requested_interval_seconds",
-                               exchange="okx", endpoint="books-full").value == 30
-    assert sinks.metrics.gauge("collector_effective_interval_seconds",
-                               exchange="okx", endpoint="books-full").value == 120
-    assert sinks.metrics.gauge("collector_healthy_egresses",
-                               exchange="okx", endpoint="books-full").value == 2
-    assert sinks.metrics.gauge("collector_interval_affected_instruments",
-                               exchange="okx", endpoint="books-full").value == 2
+    assert {
+        key: sinks.controls.one().payload[key] for key in expected_context
+    } == expected_context
+    assert (
+        sinks.metrics.counter(
+            "collector_interval_changes_total",
+            exchange="okx",
+            endpoint="books-full",
+            direction="stretch",
+        ).value
+        == 1
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_requested_interval_seconds",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 30
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_effective_interval_seconds",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 120
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_healthy_egresses", exchange="okx", endpoint="books-full"
+        ).value
+        == 2
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_interval_affected_instruments",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 2
+    )
     assert sinks.metrics.label_names == {"exchange", "endpoint", "direction"}
     assert sinks.controls.one().logical_stream == "_control"
     assert published.rest_metadata.requested_interval_ns == seconds(30)
@@ -516,31 +624,52 @@ git commit -m "feat: schedule prioritized public rest jobs"
 ```python
 def test_first_catalog_is_baseline_not_mass_new_listing(tmp_path) -> None:
     store = CatalogStore.open(tmp_path / "catalog.sqlite")
-    changes = store.apply_snapshot(exchange="binance", market="spot", observed_at_ns=100,
-                                   instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")])
+    changes = store.apply_snapshot(
+        exchange="binance",
+        market="spot",
+        observed_at_ns=100,
+        instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")],
+    )
     assert changes.new_listings == ()
 
 
 def test_recent_official_tradable_time_can_enter_on_first_baseline(tmp_path) -> None:
     store = CatalogStore.open(tmp_path / "catalog.sqlite")
     changes = store.apply_snapshot(
-        exchange="bitget", market="perpetual", observed_at_ns=ns("2026-07-31T12:00:00Z"),
-        instruments=[instrument("NEWUSDT", tradable_at_ns=ns("2026-07-31T11:00:00Z"),
-                                tradable_at_source="exchange")], initial_lookback_ns=hours(72))
+        exchange="bitget",
+        market="perpetual",
+        observed_at_ns=ns("2026-07-31T12:00:00Z"),
+        instruments=[
+            instrument(
+                "NEWUSDT",
+                tradable_at_ns=ns("2026-07-31T11:00:00Z"),
+                tradable_at_source="exchange",
+            )
+        ],
+        initial_lookback_ns=hours(72),
+    )
     assert [item.instrument_key for item in changes.new_listings] == ["NEWUSDT"]
 
 
 def test_selection_is_union_with_fixed_priority_and_top_n_per_quote() -> None:
     fixed = ResolvedFixedSelection(instrument_keys=frozenset({"PF_XBTUSD"}))
-    result = select(catalog(), fixed=fixed, quotes=["USDT"], top_n=2,
-                    active_new=["NEWUSDT"], now_ns=1_000)
+    result = select(
+        catalog(),
+        fixed=fixed,
+        quotes=["USDT"],
+        top_n=2,
+        active_new=["NEWUSDT"],
+        now_ns=1_000,
+    )
     assert result.selected == frozenset({"PF_XBTUSD", "BTCUSDT", "ETHUSDT", "NEWUSDT"})
     assert result.reason("PF_XBTUSD").fixed is True
 
 
 def test_top_n_exit_grace_prevents_boundary_churn() -> None:
     previous = selected_top("ALTUSDT", last_selected_ns=100)
-    result = select(updated_catalog_without_alt(), previous=previous, now_ns=120, exit_grace_ns=30)
+    result = select(
+        updated_catalog_without_alt(), previous=previous, now_ns=120, exit_grace_ns=30
+    )
     assert "ALTUSDT" in result.selected
 ```
 
@@ -582,35 +711,52 @@ git commit -m "feat: select fixed top and new symbols"
 ```python
 def test_capacity_trims_lowest_top_then_latest_new_but_never_fixed() -> None:
     result = admit(
-        candidates=[fixed("BTC"), top("ETH", rank=1), top("ALT", rank=20),
-                    new("NEW1", first_seen_ns=10), new("NEW2", first_seen_ns=20)],
-        slots=3, policy="degrade_low_priority_with_warning")
+        candidates=[
+            fixed("BTC"),
+            top("ETH", rank=1),
+            top("ALT", rank=20),
+            new("NEW1", first_seen_ns=10),
+            new("NEW2", first_seen_ns=20),
+        ],
+        slots=3,
+        policy="degrade_low_priority_with_warning",
+    )
     assert result.admitted == ("BTC", "NEW1", "NEW2")
     assert result.rejected == ("ALT", "ETH")
 
 
 def test_fixed_pairs_over_capacity_always_fail() -> None:
     with pytest.raises(CapacityError, match="fixed pairs"):
-        admit([fixed("BTC"), fixed("ETH")], slots=1,
-              policy="degrade_low_priority_with_warning")
+        admit(
+            [fixed("BTC"), fixed("ETH")],
+            slots=1,
+            policy="degrade_low_priority_with_warning",
+        )
 
 
 def test_canonical_fixed_pair_resolves_to_one_stable_instrument_key() -> None:
-    catalog = fake_catalog(instruments=[instrument("BTC-USDT", canonical_pair="BTC/USDT")])
+    catalog = fake_catalog(
+        instruments=[instrument("BTC-USDT", canonical_pair="BTC/USDT")]
+    )
     result = resolve_fixed_requests(["BTC/USDT"], catalog)
     assert result.instrument_keys == frozenset({"BTC-USDT"})
 
 
 @pytest.mark.parametrize("request", ["UNKNOWN/USDT", "AMBIGUOUS/USDT"])
-def test_unknown_or_ambiguous_canonical_fixed_pair_fails(request, catalog_with_ambiguity) -> None:
+def test_unknown_or_ambiguous_canonical_fixed_pair_fails(
+    request, catalog_with_ambiguity
+) -> None:
     with pytest.raises(FixedPairResolutionError):
         resolve_fixed_requests([request], catalog_with_ambiguity)
 
 
 @pytest.mark.asyncio
-async def test_probe_engine_is_provider_neutral_and_timestamped(fake_probe_provider) -> None:
+async def test_probe_engine_is_provider_neutral_and_timestamped(
+    fake_probe_provider,
+) -> None:
     result = await ProbeEngine(clock=FakeClock(time_ns=123)).run(
-        config_bundle(), providers={"okx": fake_probe_provider},
+        config_bundle(),
+        providers={"okx": fake_probe_provider},
     )
     assert result.observed_at_ns == 123
     assert result.exchanges["okx"].selection.fixed.instrument_keys == {"BTC-USDT"}
