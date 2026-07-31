@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pickle
 from importlib import resources
 from pathlib import Path
@@ -310,7 +311,11 @@ def test_base_urls_require_a_secure_scheme_and_hostname(tmp_path: Path) -> None:
     [
         "https://example.com:bad",
         "https://example.com:99999",
+        "https://example.com:",
         "https://exa mple.com",
+        "https://exa%20mple.com",
+        "https://exa\x80mple.com",
+        "https://exa\x9fmple.com",
         "https://example.com:\\bad",
     ],
 )
@@ -322,7 +327,7 @@ def test_base_urls_reject_values_network_clients_cannot_parse(
         tmp_path / "invalid.yaml",
         _BLOCK_RECORD.replace(
             "https://data-api.binance.vision",
-            invalid_url,
+            json.dumps(invalid_url),
         ),
     )
 

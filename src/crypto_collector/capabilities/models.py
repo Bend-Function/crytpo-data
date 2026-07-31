@@ -40,7 +40,7 @@ def _is_public_base_url(value: str, *, scheme: str) -> bool:
     if any(
         character.isspace()
         or ord(character) < 0x20
-        or ord(character) == 0x7F
+        or 0x7F <= ord(character) < 0xA0
         or character == "\\"
         for character in value
     ):
