@@ -119,6 +119,8 @@ class LoopbackApps:
     https_port: int
     websocket_port: int
     secure_websocket_port: int
+    https_connection_count: int = 0
+    https_hosts: list[str] = field(default_factory=list)
 
     @property
     def http_url(self) -> str:
@@ -146,20 +148,48 @@ class LoopbackApps:
 
     @classmethod
     async def start(cls, *, server_ssl: ssl.SSLContext) -> LoopbackApps:
+        holder: dict[str, LoopbackApps] = {}
+
+        async def serve_http(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+            *,
+            record_tls_connection: bool,
+        ) -> None:
+            if record_tls_connection:
+                holder["apps"].https_connection_count += 1
+            try:
+                while True:
+                    try:
+                        request = await reader.readuntil(b"\r\n\r\n")
+                    except asyncio.IncompleteReadError:
+                        break
+                    if record_tls_connection:
+                        for line in request.split(b"\r\n"):
+                            if line.lower().startswith(b"host:"):
+                                holder["apps"].https_hosts.append(
+                                    line.partition(b":")[2].strip().decode("ascii")
+                                )
+                                break
+                    writer.write(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Length: 2\r\n"
+                        b"Connection: keep-alive\r\n\r\n"
+                        b"ok"
+                    )
+                    await writer.drain()
+            finally:
+                await _close_writer(writer)
+
         async def handle_http(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
-            try:
-                await reader.readuntil(b"\r\n\r\n")
-                writer.write(
-                    b"HTTP/1.1 200 OK\r\n"
-                    b"Content-Length: 2\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b"ok"
-                )
-                await writer.drain()
-            finally:
-                await _close_writer(writer)
+            await serve_http(reader, writer, record_tls_connection=False)
+
+        async def handle_https(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            await serve_http(reader, writer, record_tls_connection=True)
 
         async def handle_websocket(connection: ServerConnection) -> None:
             await connection.send("ready")
@@ -168,7 +198,7 @@ class LoopbackApps:
         http_server = await asyncio.start_server(handle_http, "127.0.0.1", 0)
         http_socket = http_server.sockets[0]
         https_server = await asyncio.start_server(
-            handle_http,
+            handle_https,
             "127.0.0.1",
             0,
             ssl=server_ssl,
@@ -183,7 +213,7 @@ class LoopbackApps:
             ssl=server_ssl,
         )
         secure_websocket_socket = secure_websocket_server.sockets[0]
-        return cls(
+        instance = cls(
             http_server=http_server,
             https_server=https_server,
             websocket_server=websocket_server,
@@ -193,6 +223,8 @@ class LoopbackApps:
             websocket_port=int(websocket_socket.getsockname()[1]),
             secure_websocket_port=int(secure_websocket_socket.getsockname()[1]),
         )
+        holder["apps"] = instance
+        return instance
 
     async def close(self) -> None:
         self.http_server.close()

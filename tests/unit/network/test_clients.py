@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import traceback
+
 import pytest
 
 from crypto_collector.config import SecretRef, SecretSnapshot
@@ -34,6 +36,17 @@ def test_direct_websocket_disables_auto_proxy_detection() -> None:
     )
 
     assert spec.proxy is None
+
+
+def test_websocket_spec_repr_redacts_uri_credentials() -> None:
+    spec = build_websocket_connect_spec(
+        direct_egress(),
+        "wss://user:password@example.test/ws?token=secret-token",
+        secrets=SecretSnapshot.empty(),
+    )
+
+    assert "password" not in repr(spec)
+    assert "secret-token" not in repr(spec)
 
 
 def test_socks5h_resolves_proxy_reference_only_from_snapshot(
@@ -87,6 +100,7 @@ def test_builder_never_resolves_a_secret_reference(
     "proxy_url",
     [
         "socks5h://user:password@127.0.0.1:not-a-port",
+        "socks5h://user:password@127.0.0.1:0",
         "http://user:password@127.0.0.1:1080",
         "socks5h://user:password@127.0.0.1:1080/path",
     ],
@@ -103,3 +117,38 @@ def test_invalid_proxy_secret_is_rejected_without_disclosure(proxy_url: str) -> 
 
     assert "password" not in str(captured.value)
     assert proxy_url not in str(captured.value)
+
+
+def test_invalid_proxy_exception_chain_does_not_disclose_secret() -> None:
+    proxy_url = "socks5h://user:password\uff20proxy.invalid:1080"
+    reference = SecretRef.parse("env:SOCKS_URL")
+    egress = Egress.model_validate(
+        {"id": "socks-1", "type": "socks5h", "url": reference}
+    )
+    secrets = SecretSnapshot.from_test_values({reference: proxy_url})
+
+    with pytest.raises(ValueError, match="invalid proxy URL") as captured:
+        build_clients(egress, secrets=secrets)
+
+    diagnostic = "".join(
+        traceback.format_exception(captured.type, captured.value, captured.tb)
+    )
+    assert "password" not in diagnostic
+    assert proxy_url not in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_socks_transport_ignores_host_ca_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SSL_CERT_FILE", "/definitely/missing/collector-ca.pem")
+    reference = SecretRef.parse("env:SOCKS_URL")
+    egress = Egress.model_validate(
+        {"id": "socks-1", "type": "socks5", "url": reference}
+    )
+    secrets = SecretSnapshot.from_test_values(
+        {reference: "socks5://user:password@127.0.0.1:1080"}
+    )
+
+    clients = build_clients(egress, secrets=secrets)
+    await clients.aclose()

@@ -41,3 +41,29 @@ def test_exception_text_is_redacted_before_logging() -> None:
     assert "password" not in redacted
     assert "abc" not in redacted
     assert "127.0.0.1:1080" in redacted
+
+
+def test_redactor_removes_complete_comma_delimited_authorization_value() -> None:
+    redacted = redact(
+        'Authorization: Digest username="collector", response="secret-response"'
+    )
+
+    assert "collector" not in redacted
+    assert "secret-response" not in redacted
+
+
+def test_redactor_removes_aws_presigned_query_credentials() -> None:
+    redacted = redact(
+        "https://bucket.example/object?"
+        "X-Amz-Credential=access-key&X-Amz-Signature=request-signature"
+    )
+
+    assert "access-key" not in redacted
+    assert "request-signature" not in redacted
+
+
+def test_redactor_removes_httpcore_proxy_auth_repr() -> None:
+    redacted = redact("connect_tcp.started auth=(b'user', b'password') timeout=10")
+
+    assert "user" not in redacted
+    assert "password" not in redacted

@@ -5,6 +5,7 @@ from typing import TypeAlias
 
 from crypto_collector.config.models import EgressConfig
 from crypto_collector.config.primitives import SecretValue
+from crypto_collector.observability.redaction import redact
 
 Egress: TypeAlias = EgressConfig
 
@@ -39,7 +40,7 @@ class WebSocketConnectSpec:
     def __repr__(self) -> str:
         proxy = "configured" if self.proxy is not None else None
         return (
-            f"WebSocketConnectSpec(uri={self.uri!r}, proxy={proxy!r}, "
+            f"WebSocketConnectSpec(uri={redact(self.uri)!r}, proxy={proxy!r}, "
             f"open_timeout={self.open_timeout!r}, "
             f"close_timeout={self.close_timeout!r}, max_queue={self.max_queue!r})"
         )
