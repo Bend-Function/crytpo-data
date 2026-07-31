@@ -35,7 +35,7 @@
 
 ### 2.2 质量目标
 
-- 正常运行时，从接收事件到持久化的未刷盘窗口不超过约 1 秒。
+- 在已声明的健康存储环境和 2 倍预计峰值负载下，每条 accepted record 的 `durability_lag`（记录的 `monotonic_ns` 到包含它的 zstd frame 完成 `fdatasync/fsync` 的单调时钟差）不得超过 1.000 秒。存储阻塞或故障造成的越界必须可观测并触发安全动作；该 SLO 不是对操作系统、硬件或断电故障的零丢失保证。
 - 不静默抽样或忽略已检测到的数据缺口；检测到的 gap 必须进入 `_control` 数据与指标。
 - 原始 payload 的字段名、嵌套结构和值语义保持交易所原样。
 - 文件、派生结果和归档对象均具有确定性 lineage 与强 checksum。
@@ -62,6 +62,7 @@
 | canonical pair | 用户配置使用的统一表示，例如 `BTC/USDT`。只用于选择和显示。 |
 | native symbol | 某交易所某协议的真实标识，例如 `BTC-USDT-SWAP`、`BTCUSDT`、`BTC/USDT`、`PF_XBTUSD`。写盘路径和 envelope 必须保存它。 |
 | raw | 交易所事件或 REST 响应加采集 envelope 后的记录，不做字段标准化。 |
+| accepted record | connector 已完成最小协议校验、生成 envelope 并成功放入 raw writer queue 的记录；durability SLO 从 envelope 的 `monotonic_ns` 开始计时。 |
 | control | 连接、订阅、gap、限频、配置、恢复、轮转和暂停等运行事件。 |
 | closed manifest | 数据文件已关闭、fsync、重命名后生成的不可变元数据与 SHA-256。 |
 | derived | materializer 从 closed raw manifests 确定性生成的 Parquet 数据。 |
@@ -263,7 +264,10 @@ books:
     overload_policy: stretch_with_warning
 
 writer:
-  flush_interval: 1s
+  flush_interval: 500ms
+  durability_slo: 1s
+  durability_critical: 5s
+  max_sync_concurrency: 8
   rotate_interval: 1h
   max_compressed_size: 1GiB
 
@@ -451,12 +455,17 @@ data/raw/<exchange>/<market>/_market/<stream>/<YYYY>/<MM>/<DD>/<HH>/...
 ### 11.3 写盘与轮转
 
 - 活动文件名带 `.partial`，只允许一个 writer 持有。
-- 每个不超过约 1 秒的持久化批次写成独立 zstd frame，并执行 flush + fdatasync/fsync；轮转和有序停止还要同步文件及父目录元数据。
+- 每个 exchange worker 只有一个 durability coordinator。它按 `flush_interval` 收集所有 dirty stream files，写出各自独立 zstd frame，并以有界 `max_sync_concurrency` 执行 `fdatasync/fsync`；不能为每个 symbol/stream 启动不受控的独立同步循环。
+- `config check` 要求 `flush_interval <= durability_slo / 2`，为压缩、写入和同步留出预算。默认值分别是 500ms 和 1s。
+- 对每条记录计算 `durability_lag = fsync_completed_monotonic_ns - record.monotonic_ns`。该值不回写已经持久化的 raw 行，而是进入内存 histogram、metrics 和 closed manifest 汇总。
+- rolling durability max 或 p99 超过 `durability_slo` 时生成 `writer_durability_slo_breach` ERROR。`oldest_unpersisted_age` 达到 `durability_critical`（默认 5s）或同步调用返回不可恢复错误时，停止该 exchange worker 的新 REST/WS 输入、有序关闭连接并进入 `PAUSED_WRITER`；其他 exchange workers 继续运行。
+- 轮转和有序停止还要同步文件及父目录元数据。活动文件数量和同步耗时属于容量预算，必须在目标存储上通过 2 倍负载验收；单靠配置推算不能证明 SLO。
+- 如果保持当前 per-symbol/per-stream 文件布局无法通过 durability 验收，不能放宽指标或减少 gap 可见性来过关；必须回到设计评审，选择更合适的 journal/group-commit 存储结构后再实施。
 - UTC 小时边界或压缩后大小阈值任一满足即轮转。
 - 关闭顺序：flush -> fsync -> close -> 原子 rename -> 计算 SHA-256 -> 原子写 manifest。
 - 一个 closed data file 只对应一个 config hash。热加载会先轮转受影响文件。
 - 启动时扫描 `.partial`，验证独立 zstd frames，保留完整 frames；坏尾移入 quarantine，恢复数据写成新的 closed part 和 manifest，并生成 control gap/recovery 事件。
-- 进程被强制终止等模型化故障下，最多接受约一个 flush interval 的未持久化窗口；该边界不是物理意义上的零丢失保证。
+- 当 durability SLO 正常满足时，进程被强制终止后的模型化未持久化窗口不超过 1s。SLO 已越界、内核未履行同步或硬件故障时不能承诺该上限；恢复状态、缺失 complete manifest 和运行告警共同表明数据可能不完整。
 
 ### 11.4 Raw manifest
 
@@ -468,6 +477,7 @@ manifest 至少包含：
 - worker instance、connection generations、writer sequence 范围。
 - config SHA、egress IDs、requested/effective REST interval。
 - gap/reconnect/parse/checksum/queue-overflow 计数与 control references。
+- durability lag 的 count/p50/p95/p99/max、sync duration、SLO breach count 和 sync failure count。
 - close reason、created/closed time、恢复或 quarantine 信息。
 
 manifest 是 materializer 和 archiver 的输入事实。它不可原地修改；后续 ACK、receipt、revision 或 tombstone 使用独立文件/状态记录。
@@ -512,8 +522,11 @@ data/derived/<exchange>/<market>/<symbol_key>/<dataset>/
 ```
 
 - Parquet 使用稳定 schema、zstd 压缩和原子提交。
-- derived manifest 包含输入 raw manifest 路径与 SHA、配置 SHA、代码版本、schema 版本、窗口范围、row count 和输出 SHA。
-- 同一输入集合、配置和代码版本必须生成字节语义一致的结果；排序 tie-breaker 使用 event/receive time、worker instance、writer sequence 和 connection generation。
+- materialization identity 由排序后的输入 raw manifest SHA-256 集合、resolved config SHA、代码 revision、依赖 lockfile SHA、算法/schema 版本和 Parquet writer fingerprint 共同确定。
+- derived manifest 包含 materialization identity、输入 raw manifest 路径与 SHA、窗口范围、row count、canonical rows SHA-256 和每个输出文件的 SHA-256。
+- 相同 materialization identity 必须生成完全相同的逻辑 rows 和 canonical rows SHA-256。canonical digest 使用固定字段顺序、规范化的 Decimal/timestamp/null 编码和确定性 row order 计算。
+- row order 的最终键为 effective event time、received time、raw manifest SHA-256、该 manifest 数据文件中的零基 record index。`worker_instance_id`、`writer_sequence` 和 `connection_generation` 继续作为数据质量字段，但不作为跨重跑的最终 source locator。
+- Parquet byte-for-byte identity 只在相同 writer fingerprint（实现、版本、压缩参数、row-group 设置和文件 metadata policy）下要求。writer fingerprint 不同但 canonical rows SHA-256 相同时视为语义一致的新构建，不宣称文件字节相同。
 - 默认 revision horizon 为 24 小时。horizon 内出现新的 late raw manifest 时，生成递增的不可变 `rev=N`。
 - revision 是受影响 partition/window 的完整替代版本，不是增量 patch；manifest 用 `supersedes_revision` 建立关系。
 - 读取方对同一 partition 选择最高已提交 revision。horizon 外只允许显式 `materialize --reprocess`。
@@ -632,6 +645,7 @@ optional target 失败不阻止清理。它会在 grace 内持续 best-effort �
 | WS 断线、checksum/sequence gap | 作废 generation，写 control gap，退避重连，必要时切健康 egress，重建 live state | 单 channel/shard |
 | REST 429/ban/timeout | 收缩预算、遵循 Retry-After、熔断；deep interval 拉长 | 单 endpoint/egress |
 | queue overflow | 写 gap，关闭并重建该 channel，不静默 sampling | 单 channel |
+| durability SLO 持续越界或 sync 失败 | 停止该 exchange 的新输入，关闭连接并进入 `PAUSED_WRITER`；保留未确认 `.partial` 供恢复 | 单 exchange |
 | worker crash/单目录写错 | supervisor 退避重启该交易所，恢复 `.partial` | 单 exchange |
 | shared disk critical | 全部 collectors 安全进入 `PAUSED_LOW_DISK` | 所有 collectors；archiver 继续 |
 | archiver/materializer crash | 从 closed manifests 幂等重放 | 单独服务，不影响 collector |
@@ -655,7 +669,8 @@ v1 不内置 Email、Telegram 等通知集成；Prometheus/宿主监控负责告
 
 ### 15.2 核心指标
 
-- 每 exchange/market/symbol/stream 的 last-event age、event rate、queue fill、flush age。
+- 每 exchange/market/symbol/stream 的 last-event age、event rate、queue fill、flush age、durability lag histogram 和 oldest-unpersisted age。
+- 每 exchange writer 的 dirty/active file count、sync queue depth、sync duration、sync concurrency、SLO breaches 和 sync failures。
 - connection generation、reconnect、heartbeat timeout、sequence/checksum gap。
 - 每 egress 的健康、延迟、429/403/418、熔断和 token budget。
 - requested/effective deep snapshot interval 与 interval stretch 次数。
@@ -702,13 +717,14 @@ Docker Compose：
 ### 18.1 离线 CI
 
 - 单元测试：配置继承、严格 schema、symbol/path 映射、selection union、rate budgets、sticky egress、retry 分类、窗口对齐、rotation、manifest 和 archive states。
-- 属性测试：order book 状态转换、sequence/gap 检测、percent encoding 可逆、窗口边界、幂等 materialization 和 retry backoff 上限。
+- 属性测试：order book 状态转换、sequence/gap 检测、percent encoding 可逆、窗口边界、canonical row ordering/digest、幂等 materialization 和 retry backoff 上限。
 - 协议 fixture/golden tests：五家交易所 snapshot/delta、heartbeat、reset、未知字段和错误 payload。
 - Kraken CRC32 使用原始十进制字符串；Binance/OKX/Bybit/Bitget 分别覆盖其官方序列规则。
 - 本地 fake HTTP/WS exchange 注入 429、Retry-After、403/418、5xx、超时、乱序、断线、慢 consumer 和 schema drift。
 - 本地 SOCKS fixture 验证 REST/WS 代理、DNS 策略、generation sticky、failover 和 secret redaction。
+- durability coordinator tests：使用可控单调时钟和 fake sync 注入慢写、并发上限、SLO 越界、`PAUSED_WRITER`、sync error 与恢复；普通 CI 不用墙上时钟断言性能。
 - kill/recovery tests：写盘中强杀 worker、坏 zstd 尾部、manifest 原子性、disk warning/critical 和 reload rollback。
-- materializer golden tests：固定事件生成已知 30s/1m bars、盘口 features、空窗口、gap、late complete revision。
+- materializer golden tests：固定事件生成已知 30s/1m bars、盘口 features、空窗口、gap、late complete revision；在不同临时目录和输入发现顺序下重复运行，canonical rows SHA-256 必须一致。
 - archive round-trip：off/auto/zstd、multipart 中断恢复、stored hash、解压 source hash、mount guard 和 cleanup gates。
 - S3 使用本地兼容服务做 integration；OSS SDK/transport 使用契约测试。真实 OSS/S3 测试仅在显式 credentials 环境运行。
 
@@ -722,13 +738,15 @@ Docker Compose：
 
 ### 18.3 端到端验收
 
+性能验收必须记录 CPU、内存、存储设备、filesystem、mount options、活跃文件数和数据生成速率。此处的“健康存储”指 data root 可写、余量高于 warning、没有注入 I/O 错误，且测试期间内核/设备没有报告故障；离开这个边界时验证的是告警和暂停行为，不再宣称满足 1 秒 SLO。
+
 1. 使用已知固定对在五家交易所同时短时采集 Spot/Perpetual 可用频道。
 2. 测试配置缩短轮转时间，确认所有 stream 产生可解压 raw、closed manifest 和合法 SHA-256。
 3. 至少一次 WS 断线、REST 429、worker kill 和 archive multipart 中断故障注入均产生预期 control/恢复状态。
 4. 生成 30s/1m Parquet，重复运行结果一致，quality windows 能解释所有注入 gap。
 5. 完成至少一个 required archive target 的 upload/verify/restore 双哈希往返。
 6. 有可用 SOCKS 环境时，至少一个 REST 和一个 WS generation 经代理成功。
-7. 合成负载按预计峰值的 2 倍运行，内存稳定；无故障正常路径的 flush latency 不超过约 1 秒，不能出现未记录 queue loss。
+7. 在已声明健康存储上按预计峰值的 2 倍连续运行至少 10 分钟，内存保持有界，每条 accepted record 的 `durability_lag <= 1.000s`，不能出现未记录 queue loss；报告同时给出 p50/p95/p99/max、活跃文件数和 sync IOPS。
 8. 日志、manifest、metrics 和失败 traceback 中不出现 proxy 或 storage credentials。
 
 ## 19. 数据兼容与 API 漂移
