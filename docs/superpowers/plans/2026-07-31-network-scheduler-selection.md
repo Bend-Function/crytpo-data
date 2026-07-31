@@ -184,6 +184,7 @@ git commit -m "feat: create explicit direct and socks clients"
 ### Task 2: Sticky Assignment and Persistent Egress Health
 
 **Files:**
+- Modify: `src/crypto_collector/network/__init__.py`
 - Create: `src/crypto_collector/network/assignment.py`
 - Create: `src/crypto_collector/network/health.py`
 - Create: `src/crypto_collector/network/state_store.py`
@@ -202,7 +203,9 @@ def test_rendezvous_assignment_is_order_independent() -> None:
 
 
 def test_unhealthy_egress_is_skipped_only_for_new_generation() -> None:
-    assignment = StickyAssignment.create("okx/spot/BTC-USDT/books", egress("a"))
+    assignment = StickyAssignment.create(
+        "okx/spot/BTC-USDT/books", egress("a"), generation=7
+    )
     health = HealthSnapshot(unavailable=frozenset({("okx", "a")}))
     assert assignment.egress_id == "a"
     assert choose_egress(assignment.key, [egress("a"), egress("b")], health).id == "b"
@@ -210,19 +213,34 @@ def test_unhealthy_egress_is_skipped_only_for_new_generation() -> None:
 
 def test_ban_survives_worker_restart(tmp_path) -> None:
     store = EgressStateStore.open(tmp_path / "okx-network.sqlite")
-    store.record_ban(exchange="okx", quota_group="nat-a", until_ns=9_000, reason="429")
+    store.record_ban(
+        exchange="okx", quota_group="nat-a", until_unix_ns=9_000, reason="429"
+    )
     store.close()
     reopened = EgressStateStore.open(tmp_path / "okx-network.sqlite")
-    assert reopened.load_quota("okx", "nat-a").ban_until_ns == 9_000
+    assert reopened.load_quota("okx", "nat-a").ban_until_unix_ns == 9_000
 
 
 def test_assignment_precedes_deterministic_egress_local_sharding() -> None:
     assignments = assign_instruments(
         ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        exchange="binance",
+        market="spot",
         channel="trade",
-        egresses=[egress("a", max_subscriptions=2), egress("b", max_subscriptions=2)],
+        egresses=[
+            egress("a", max_ws_connections=2),
+            egress("b", max_ws_connections=2),
+        ],
+        subscriptions_per_connection=2,
     )
-    shards = pack_egress_shards(assignments)
+    shards = pack_egress_shards(
+        assignments,
+        egresses=[
+            egress("a", max_ws_connections=2),
+            egress("b", max_ws_connections=2),
+        ],
+        subscriptions_per_connection=2,
+    )
     assert all(len(shard.instrument_keys) <= 2 for shard in shards)
     assert all(
         len({item.egress_id for item in shard.assignments}) == 1 for shard in shards
@@ -231,23 +249,27 @@ def test_assignment_precedes_deterministic_egress_local_sharding() -> None:
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_failed_proxy_closes_generation_and_only_new_generation_moves(
-    loopback_socks_pair,
+async def test_failed_proxy_moves_only_the_new_connection_generation(
+    failover_socks_pair,
     loopback_apps,
+    tmp_path,
 ) -> None:
-    manager = egress_manager(
-        loopback_socks_pair, assignment_key="okx/spot/BTC-USDT/books"
-    )
-    first = await manager.open_generation()
-    assert await first.rest_probe() == "ok"
-    loopback_socks_pair.fail(first.egress_id)
-    with pytest.raises(TransportError):
-        await first.websocket.recv()
-    assert first.egress_id == manager.assignment_for(first.generation).egress_id
-    second = await manager.reconnect_after_failure(first)
-    assert second.generation == first.generation + 1
-    assert second.egress_id != first.egress_id
-    assert await second.rest_probe() == "ok"
+    first_proxy, _second_proxy = failover_socks_pair
+    first_assignment = choose_egress(assignment_key, egresses)
+    async with build_clients(first_assignment, secrets=secrets) as first_generation:
+        assert (await first_generation.http.get(loopback_apps.proxied_http_url)).status_code == 200
+    await first_proxy.close()
+    with EgressStateStore.open(tmp_path / "okx-network.sqlite") as store:
+        store.record_transport_failure(
+            exchange="okx", egress_id=first_assignment.id, reason="connect_error"
+        )
+        admitted = store.admit_health(
+            exchange="okx", egresses=egresses, now_unix_ns=1, now_monotonic_ns=1
+        )
+        second_assignment = choose_egress(
+            assignment_key, egresses, health=admitted.snapshot(now_monotonic_ns=1)
+        )
+        assert second_assignment.id != first_assignment.id
 ```
 
 - [ ] **Step 2: Run and verify assignment modules are absent**
@@ -258,7 +280,13 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement stable rendezvous hashing and SQLite state**
 
-Use `sha256(f"{exchange}/{market}/{instrument_key}/{channel}\0{egress_id}".encode()).digest()` as the unsigned score and select the highest healthy candidate with remaining configured capacity. Do not include a shard ID in that hash: assign each instrument/channel first, then sort by instrument key and pack egress-local shards under that egress's connection/subscription limits. Keep each chosen egress in an immutable `StickyAssignment` for the whole connection generation. A transport failure invalidates/closes that generation; it never migrates an open generation in place. Reconnect creates the next generation and may choose another healthy egress. Exercise that behavior through the real local SOCKS clients from Task 1. SQLite uses WAL with separate transport and quota tables:
+Use `sha256(f"{exchange}/{market}/{instrument_key}/{channel}\0{egress_id}".encode()).digest()` as the unsigned score and select the highest healthy candidate with remaining configured capacity. Assignment keys have four conceptual non-empty components: parse the first two `/` separators as exchange and market, the final separator as channel, and preserve the complete middle substring as `instrument_key`. This is required for stable keys such as Kraken Spot `BTC/USDT`; exchange, market, and channel themselves may not contain `/`. Validate those slash constraints before iterating instruments so an empty cohort cannot bypass them. Reject duplicate egress IDs and duplicate instrument keys rather than resolving them by input order. `choose_egress()` returns the selected immutable `Egress`; `StickyAssignment.create(..., generation=N)` freezes the decision that the runtime binds to a connection generation.
+
+Do not include a shard ID in the hash. `assign_instruments()` first sorts instruments, then chooses the highest-ranked healthy egress with remaining capacity. The explicit capacity of one egress for this assignment cohort is `egress.max_ws_connections * subscriptions_per_connection`, where the latter value comes from the capability registry or an admitted conservative override. `pack_egress_shards()` then sorts by canonical assignment key and chunks per egress without exceeding either limit. Capacity is checked before returning any partial plan.
+
+Plan 03 owns only assignment, health, and immutable generation-decision records. Plan 04 owns opening, invalidating, closing, and incrementing actual connection generations. A transport failure never mutates a `StickyAssignment` or migrates an open client in place; the Plan 04 runtime closes the failed generation and asks Plan 03 to choose for the next generation. The integration test exercises this boundary with the real local SOCKS clients from Task 1, but does not introduce a second production generation manager here.
+
+All persisted `*_until_ns` and `last_success_ns` values are UTC Unix epoch nanoseconds; `last_latency_ns` is an elapsed duration. Monotonic values are process-local and must never be stored. `EgressStateStore.admit_health(..., now_unix_ns, now_monotonic_ns)` opens one explicit WAL read transaction, atomically reads all quota and transport restrictions, and converts each remaining epoch duration exactly once into an immutable process-local monotonic deadline. The returned `AdmittedHealth` also carries immutable `QuotaProbeAdmission` and `TransportProbeAdmission` tokens containing the restriction revision captured by that same transaction. Thereafter `AdmittedHealth.snapshot(now_monotonic_ns=...)` classifies probe eligibility using monotonic time only. It keeps every restricted egress unavailable after expiry until an explicit successful public probe; a persisted revision change requires explicit re-admission and is never silently cached inside the store. SQLite uses WAL, `synchronous=FULL`, a busy timeout, exact schema version fencing, and separate transport and quota tables:
 
 ```sql
 CREATE TABLE quota_state (
@@ -268,19 +296,25 @@ CREATE TABLE quota_state (
   cooldown_until_ns INTEGER NOT NULL,
   current_rate_multiplier TEXT NOT NULL,
   last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
   PRIMARY KEY (exchange, quota_group)
 );
 CREATE TABLE egress_state (
   exchange TEXT NOT NULL,
   egress_id TEXT NOT NULL,
   consecutive_transport_failures INTEGER NOT NULL,
+  transport_cooldown_until_ns INTEGER NOT NULL,
   last_success_ns INTEGER,
   last_latency_ns INTEGER,
+  last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
   PRIMARY KEY (exchange, egress_id)
 );
 ```
 
-Recovery requires cooldown expiry followed by an explicit successful public probe. A process restart loads the persisted restriction before scheduling any request.
+Quota and transport restriction updates use `MAX(existing_until, observed_until)` so an out-of-order response cannot shorten an active restriction, and increment the corresponding `restriction_revision`. Probe success accepts only a token minted by that store's admission, checks its monotonic deadline, and conditionally clears only the captured revision. It never compares the persisted epoch deadline to a fresh wall clock after admission, so a backward wall-clock jump cannot prolong an already eligible probe and a late success can never clear a newer 429, ban, cooldown, or transport failure. A process restart opens and admits this state before scheduling any request. Multiple egresses that share one `(exchange, quota_group)` share quota restriction state, while transport failures remain isolated by `(exchange, egress_id)`.
+
+Opening acquires `BEGIN IMMEDIATE` before reading `user_version`, so a concurrent initializer cannot race the exact version fence. A database already declaring version 1 is validated without running any creation statement; fresh/version-0 initialization creates, validates, and sets version 1 in that same transaction. Validation uses `PRAGMA table_xinfo` for the complete ordered column contract, including affinity, nullability, composite-primary-key ordinal, and the hidden/generated flag. It also uses `PRAGMA index_xinfo` to require the exact primary-key columns in ascending order with `BINARY` collation. `set_rate_multiplier()` accepts only finite `Decimal` values in `(0, 1]`, because Task 3 may shrink admitted rate but may never exceed hard configured capacity; values are stored with `str(Decimal)` without ambient-context normalization. The Task 2 assignment, admission, snapshot, probe-token, state-store, and stale-probe symbols deliberately exported from `network/__init__.py` are part of this public API.
 
 - [ ] **Step 4: Run assignment and state tests**
 
@@ -390,12 +424,20 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement endpoint token buckets and bounded retry decisions**
 
-Token refill uses injected monotonic time and never exceeds capacity. Apply server rate headers through exchange-specific observers without allowing a malformed header to increase configured hard capacity. Retry only anonymous GET, WebSocket connect, and subscribe. A REST job defaults to at most five attempts and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. `Retry-After` accepts integer seconds and HTTP-date using injected wall time; explicit exchange ban codes persist state. Schema/parse failures consume a channel error budget but do not loop network retries. WS generations may reconnect indefinitely with a 60s backoff cap, but cannot bypass active egress/quota-group circuits.
+Token refill uses injected monotonic time and never exceeds capacity. Apply server rate headers through exchange-specific observers without allowing a malformed header to increase configured hard capacity. Retry only anonymous GET, WebSocket connect, and subscribe. A REST job defaults to at most five attempts and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. One injected `Clock` supplies both domains: retry-job deadlines and sleeps use `monotonic_ns()`, while HTTP-date parsing and persisted restriction deadlines use `time_ns()`. `Retry-After` accepts integer seconds and HTTP-date; explicit exchange ban codes persist state. Schema/parse failures consume a channel error budget but do not loop network retries. WS generations may reconnect indefinitely with a 60s backoff cap, but cannot bypass active egress/quota-group circuits.
 
 ```python
+now_monotonic_ns = clock.monotonic_ns()
+now_unix_ns = clock.time_ns()
 delay_ns = max(parsed_retry_after_ns, full_jitter_ns(attempt, base_ns, cap_ns, rng))
+# RetryPolicy compares now_monotonic_ns + delay_ns with the job's monotonic deadline.
 if decision.action is RetryAction.BAN:
-    state_store.record_ban(exchange, quota_group, now_ns + delay_ns, decision.reason)
+    state_store.record_ban(
+        exchange=exchange,
+        quota_group=quota_group,
+        until_unix_ns=now_unix_ns + delay_ns,
+        reason=decision.reason,
+    )
 elif decision.action is RetryAction.THROTTLE:
     budget.shrink(multiplier=0.5, floor=minimum_rate)
 ```
