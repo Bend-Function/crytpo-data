@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,15 +29,66 @@ _SECRET_QUERY_NAMES = frozenset(
         "x-oss-security-token",
     }
 )
+SENSITIVE_HEADER_NAMES = frozenset(
+    {
+        "access-key",
+        "access-passphrase",
+        "access-sign",
+        "api-key",
+        "api-sign",
+        "authorization",
+        "ok-access-key",
+        "ok-access-passphrase",
+        "ok-access-sign",
+        "proxy-authorization",
+        "x-amz-security-token",
+        "x-api-key",
+        "x-bapi-api-key",
+        "x-bapi-sign",
+        "x-mbx-apikey",
+        "x-oss-security-token",
+    }
+)
+_SENSITIVE_HEADER_PATTERN = "|".join(
+    re.escape(name) for name in sorted(SENSITIVE_HEADER_NAMES, key=len, reverse=True)
+)
 _SECRET_HEADER = re.compile(
-    r"(?im)\b(?P<name>authorization|proxy-authorization|"
-    r"x-oss-security-token|x-amz-security-token)\s*:\s*[^\r\n]+"
+    rf"(?im)\b(?P<name>{_SENSITIVE_HEADER_PATTERN})\s*:\s*[^\r\n]+"
+)
+_SECRET_HEADER_REPR = re.compile(
+    rf"(?i)(?P<prefix>b?['\"](?:{_SENSITIVE_HEADER_PATTERN})"
+    r"['\"]\s*[:,]\s*b?)"
+    r"(?P<quote>['\"])(?:\\.|(?!(?P=quote)).)*(?P=quote)"
 )
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(?P<name>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|"
     r"ACCESS_KEY)[A-Z0-9_]*)\s*=\s*[^\s,;&]+"
 )
-_AUTH_REPR = re.compile(r"(?i)\bauth\s*=\s*\([^\r\n)]*\)")
+_AUTH_REPR = re.compile(
+    r"(?i)\bauth[ \t]*=[ \t]*\([ \t]*"
+    r"b?(?P<auth_user_quote>['\"])(?:\\[^\r\n]|(?!(?P=auth_user_quote))[^\r\n])*"
+    r"(?P=auth_user_quote)[ \t]*,[ \t]*"
+    r"b?(?P<auth_password_quote>['\"])(?:\\[^\r\n]|"
+    r"(?!(?P=auth_password_quote))[^\r\n])*"
+    r"(?P=auth_password_quote)[ \t]*\)"
+)
+_SECRET_QUERY_ASSIGNMENT = re.compile(
+    r"(?i)(?P<prefix>[?&](?:access_key|access_key_id|access_token|api_key|"
+    r"apikey|authorization|client_secret|ossaccesskeyid|password|"
+    r"security-token|secret|secret_key|session_token|sig|signature|token|"
+    r"x-amz-credential|x-amz-security-token|x-amz-signature|"
+    r"x-oss-security-token)=)[^&\s]+"
+)
+_DEPENDENCY_EXCEPTION = re.compile(r"(?is)\bexception\s*=.*$")
+_DEPENDENCY_LOGGERS = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+    "websockets.client",
+)
 
 
 def _redact_url(match: re.Match[str]) -> str:
@@ -69,9 +121,43 @@ def _redact_url(match: re.Match[str]) -> str:
 
 def redact(text: str) -> str:
     redacted = _URL.sub(_redact_url, text)
+    redacted = _SECRET_QUERY_ASSIGNMENT.sub(
+        lambda match: f"{match.group('prefix')}***", redacted
+    )
     redacted = _SECRET_HEADER.sub(lambda match: f"{match.group('name')}: ***", redacted)
+    redacted = _SECRET_HEADER_REPR.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('quote')}***{match.group('quote')}"
+        ),
+        redacted,
+    )
     redacted = _AUTH_REPR.sub("auth=(***)", redacted)
     return _SECRET_ASSIGNMENT.sub(
         lambda match: f"{match.group('name')}=***",
         redacted,
     )
+
+
+class _DependencyLogRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            rendered = record.getMessage()
+        except (AttributeError, TypeError, ValueError):
+            rendered = str(record.msg)
+        rendered = redact(rendered)
+        rendered = _DEPENDENCY_EXCEPTION.sub("exception=***", rendered)
+        record.msg = rendered
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+_DEPENDENCY_FILTER = _DependencyLogRedactionFilter()
+
+
+def install_dependency_log_redaction() -> None:
+    for name in _DEPENDENCY_LOGGERS:
+        logger = logging.getLogger(name)
+        if _DEPENDENCY_FILTER not in logger.filters:
+            logger.addFilter(_DEPENDENCY_FILTER)

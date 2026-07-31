@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
-from crypto_collector.observability.redaction import redact
+from crypto_collector.observability.redaction import (
+    install_dependency_log_redaction,
+    redact,
+)
 
 
 @pytest.mark.parametrize(
@@ -67,3 +72,60 @@ def test_redactor_removes_httpcore_proxy_auth_repr() -> None:
 
     assert "user" not in redacted
     assert "password" not in redacted
+
+
+def test_redactor_removes_auth_repr_with_parentheses_in_credentials() -> None:
+    redacted = redact("connect_tcp.started auth=(b'user)', b'pass)word') timeout=10")
+
+    assert "user" not in redacted
+    assert "pass)word" not in redacted
+    assert "timeout=10" in redacted
+
+
+def test_redactor_does_not_match_auth_repr_across_carriage_return() -> None:
+    text = "auth=(b'user', b'pass\rword') timeout=10"
+
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "headers=[(b'Authorization', b'Bearer structured-secret')]",
+        "headers={'Proxy-Authorization': 'Basic structured-secret'}",
+        'headers={"x-amz-security-token": "structured-secret"}',
+        "headers=[(b'X-MBX-APIKEY', b'structured-secret')]",
+        "headers={'OK-ACCESS-PASSPHRASE': 'structured-secret'}",
+    ],
+)
+def test_redactor_removes_structured_sensitive_headers(text: str) -> None:
+    redacted = redact(text)
+
+    assert "structured-secret" not in redacted
+
+
+def test_dependency_log_filter_redacts_urls_headers_paths_and_exceptions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    install_dependency_log_redaction()
+    caplog.set_level(logging.DEBUG)
+
+    logging.getLogger("httpx").info(
+        "HTTP Request: GET %s",
+        "https://user:url-secret@example.test/path?apiKey=query-secret",
+    )
+    logging.getLogger("httpcore.http11").debug(
+        "receive_response_headers.complete headers=%r",
+        [(b"Authorization", b"Bearer header-secret")],
+    )
+    logging.getLogger("websockets.client").debug("> GET /ws?token=path-secret HTTP/1.1")
+    logging.getLogger("httpcore.connection").debug(
+        "connect_tcp.failed exception=%r",
+        ValueError("bare-exception-secret"),
+    )
+
+    assert "url-secret" not in caplog.text
+    assert "query-secret" not in caplog.text
+    assert "header-secret" not in caplog.text
+    assert "path-secret" not in caplog.text
+    assert "bare-exception-secret" not in caplog.text
