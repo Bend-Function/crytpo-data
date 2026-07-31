@@ -3,6 +3,10 @@
 .pytest_cache/
 __pycache__/
 *.py[cod]
+data/
+dist/
+.coverage
+*.egg-info/
 
 # Local brainstorming companion artifacts
 .superpowers/

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crypto-market-data-collector"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "prometheus-client>=0.22,<1",
+  "pydantic>=2.11,<3",
+  "ruamel.yaml>=0.18,<0.19",
+  "simplejson>=3.20,<4",
+  "typer>=0.16,<1",
+  "zstandard>=0.23,<1",
+]
+
+[project.optional-dependencies]
+collector = [
+  "httpx[socks]>=0.28,<1",
+  "python-socks[asyncio]>=2.7,<3",
+  "websockets>=17,<18",
+]
+materializer = ["pyarrow>=18,<24"]
+archive = ["boto3>=1.39,<2", "oss2>=2.19,<3"]
+dev = [
+  "hatchling>=1.27,<2",
+  "hypothesis>=6.130,<7",
+  "moto[s3,server]>=5,<6",
+  "pip-tools>=7.4,<8",
+  "pytest>=9,<10",
+  "pytest-asyncio>=1,<2",
+  "pytest-socket>=0.7,<1",
+  "respx>=0.22,<1",
+  "ruff>=0.12,<1",
+  "mypy>=1.17,<2",
+]
+
+[project.scripts]
+collector = "crypto_collector.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crypto_collector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "live: opt-in test that contacts a public external service",
+  "network: test that uses a local network fixture",
+  "performance: target-host performance acceptance test",
+]
+asyncio_mode = "auto"
+addopts = "--disable-socket --allow-unix-socket"

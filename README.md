@@ -1,1 +1,17 @@
-# crytpo-data
+# Crypto Market Data Collector
+
+Install the locked dependency set for the role you are running:
+
+```bash
+python -m pip install --require-hashes -r requirements/collector.lock
+python -m pip install --require-hashes -r requirements/materializer.lock
+python -m pip install --require-hashes -r requirements/archiver.lock
+python -m pip install --require-hashes -r requirements/dev.lock
+```
+
+The test suite disables network access by default. Public API smoke tests are an
+explicit opt-in and never authenticate or place orders:
+
+```bash
+RUN_LIVE_API_TESTS=1 python -m pytest --force-enable-socket tests/smoke -q
+```

@@ -24,14 +24,14 @@ The local environment uses Python 3.11. Recreate it from the repository root:
 
 ```bash
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -r requirements-smoke.txt
+.venv/bin/python -m pip install --require-hashes -r requirements/dev.lock
 ```
 
 Smoke tests are opt-in because they contact live exchange endpoints. Run all
 five exchanges with:
 
 ```bash
-RUN_LIVE_API_TESTS=1 .venv/bin/pytest -q tests/smoke
+RUN_LIVE_API_TESTS=1 .venv/bin/pytest --force-enable-socket -q tests/smoke
 ```
 
 Without `RUN_LIVE_API_TESTS=1`, the suite must skip every network test. The
