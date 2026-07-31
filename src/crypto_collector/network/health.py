@@ -6,6 +6,72 @@ from decimal import Decimal
 EgressHealthKey = tuple[str, str]
 
 
+class _AdmissionMint:
+    __slots__ = ("_claims", "_store_identity")
+
+    _claims: tuple[object, ...]
+    _store_identity: object
+
+    def __init__(self, store_identity: object, claims: tuple[object, ...]) -> None:
+        object.__setattr__(self, "_store_identity", store_identity)
+        object.__setattr__(self, "_claims", claims)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("admission mints are immutable")
+
+    def belongs_to(self, store_identity: object) -> bool:
+        return self._store_identity is store_identity
+
+    def matches(self, claims: tuple[object, ...]) -> bool:
+        return _claim_values_match(self._claims, claims)
+
+
+def _claim_values_match(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(
+            _claim_values_match(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if isinstance(left, str) and isinstance(right, str):
+        return str.__eq__(left, right) is True
+    if isinstance(left, int) and isinstance(right, int):
+        return int.__eq__(left, right) is True
+    return left is right
+
+
+def _quota_probe_claims(
+    exchange: str,
+    quota_group: str,
+    restriction_revision: int,
+    probe_after_monotonic_ns: int,
+) -> tuple[object, ...]:
+    return (
+        "quota",
+        exchange,
+        quota_group,
+        restriction_revision,
+        probe_after_monotonic_ns,
+    )
+
+
+def _transport_probe_claims(
+    exchange: str,
+    egress_id: str,
+    restriction_revision: int,
+    probe_after_monotonic_ns: int,
+) -> tuple[object, ...]:
+    return (
+        "transport",
+        exchange,
+        egress_id,
+        restriction_revision,
+        probe_after_monotonic_ns,
+    )
+
+
 def _nonnegative(value: int, *, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{field_name} must be a non-negative integer")
@@ -28,40 +94,155 @@ class HealthSnapshot:
         return (exchange, egress_id) in self.probe_eligible
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class QuotaProbeAdmission:
     exchange: str
     quota_group: str
     restriction_revision: int
     probe_after_monotonic_ns: int
-    _store_identity: object = field(repr=False)
+    _mint: _AdmissionMint = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.exchange or not self.quota_group:
-            raise ValueError("quota probe admission keys must be non-empty")
+        if (
+            type(self.exchange) is not str
+            or not self.exchange
+            or type(self.quota_group) is not str
+            or not self.quota_group
+        ):
+            raise ValueError("quota probe admission keys must be non-empty strings")
         _nonnegative(self.restriction_revision, field_name="restriction_revision")
         _nonnegative(
             self.probe_after_monotonic_ns,
             field_name="probe monotonic deadline",
         )
+        if type(self._mint) is not _AdmissionMint or not self._mint.matches(
+            self._claims()
+        ):
+            raise ValueError("quota probe admission does not match minted claims")
+
+    def _claims(self) -> tuple[object, ...]:
+        return _quota_probe_claims(
+            self.exchange,
+            self.quota_group,
+            self.restriction_revision,
+            self.probe_after_monotonic_ns,
+        )
+
+    def _belongs_to(self, store_identity: object) -> bool:
+        return (
+            type(self._mint) is _AdmissionMint
+            and self._mint.matches(self._claims())
+            and self._mint.belongs_to(store_identity)
+        )
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        exchange: str,
+        quota_group: str,
+        restriction_revision: int,
+        probe_after_monotonic_ns: int,
+        store_identity: object,
+    ) -> QuotaProbeAdmission:
+        claims = _quota_probe_claims(
+            exchange,
+            quota_group,
+            restriction_revision,
+            probe_after_monotonic_ns,
+        )
+        return cls(
+            exchange=exchange,
+            quota_group=quota_group,
+            restriction_revision=restriction_revision,
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class TransportProbeAdmission:
     exchange: str
     egress_id: str
     restriction_revision: int
     probe_after_monotonic_ns: int
-    _store_identity: object = field(repr=False)
+    _mint: _AdmissionMint = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.exchange or not self.egress_id:
-            raise ValueError("transport probe admission keys must be non-empty")
+        if (
+            type(self.exchange) is not str
+            or not self.exchange
+            or type(self.egress_id) is not str
+            or not self.egress_id
+        ):
+            raise ValueError("transport probe admission keys must be non-empty strings")
         _nonnegative(self.restriction_revision, field_name="restriction_revision")
         _nonnegative(
             self.probe_after_monotonic_ns,
             field_name="probe monotonic deadline",
         )
+        if type(self._mint) is not _AdmissionMint or not self._mint.matches(
+            self._claims()
+        ):
+            raise ValueError("transport probe admission does not match minted claims")
+
+    def _claims(self) -> tuple[object, ...]:
+        return _transport_probe_claims(
+            self.exchange,
+            self.egress_id,
+            self.restriction_revision,
+            self.probe_after_monotonic_ns,
+        )
+
+    def _belongs_to(self, store_identity: object) -> bool:
+        return (
+            type(self._mint) is _AdmissionMint
+            and self._mint.matches(self._claims())
+            and self._mint.belongs_to(store_identity)
+        )
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        exchange: str,
+        egress_id: str,
+        restriction_revision: int,
+        probe_after_monotonic_ns: int,
+        store_identity: object,
+    ) -> TransportProbeAdmission:
+        claims = _transport_probe_claims(
+            exchange,
+            egress_id,
+            restriction_revision,
+            probe_after_monotonic_ns,
+        )
+        return cls(
+            exchange=exchange,
+            egress_id=egress_id,
+            restriction_revision=restriction_revision,
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
+
+
+def _admitted_health_claims(
+    probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...],
+    quota_probe_admissions: tuple[QuotaProbeAdmission, ...],
+    transport_probe_admissions: tuple[TransportProbeAdmission, ...],
+) -> tuple[object, ...]:
+    return (
+        "health",
+        probe_after_monotonic_ns,
+        tuple(
+            (admission, admission._mint, admission._claims())
+            for admission in quota_probe_admissions
+        ),
+        tuple(
+            (admission, admission._mint, admission._claims())
+            for admission in transport_probe_admissions
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +250,18 @@ class AdmittedHealth:
     probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...] = ()
     quota_probe_admissions: tuple[QuotaProbeAdmission, ...] = ()
     transport_probe_admissions: tuple[TransportProbeAdmission, ...] = ()
+    _mint: _AdmissionMint | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         keys: set[EgressHealthKey] = set()
         for key, deadline in self.probe_after_monotonic_ns:
-            if not key[0] or not key[1]:
-                raise ValueError("admitted health keys must be non-empty")
+            if (
+                type(key[0]) is not str
+                or not key[0]
+                or type(key[1]) is not str
+                or not key[1]
+            ):
+                raise ValueError("admitted health keys must be non-empty strings")
             if key in keys:
                 raise ValueError("admitted health keys must be unique")
             keys.add(key)
@@ -91,6 +278,41 @@ class AdmittedHealth:
         ]
         if len(set(transport_keys)) != len(transport_keys):
             raise ValueError("transport probe admission keys must be unique")
+        claims = _admitted_health_claims(
+            self.probe_after_monotonic_ns,
+            self.quota_probe_admissions,
+            self.transport_probe_admissions,
+        )
+        if self._mint is None:
+            if (
+                self.probe_after_monotonic_ns
+                or self.quota_probe_admissions
+                or self.transport_probe_admissions
+            ):
+                raise ValueError("non-empty admitted health requires minted claims")
+        elif type(self._mint) is not _AdmissionMint or not self._mint.matches(claims):
+            raise ValueError("admitted health does not match minted claims")
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...],
+        quota_probe_admissions: tuple[QuotaProbeAdmission, ...],
+        transport_probe_admissions: tuple[TransportProbeAdmission, ...],
+        store_identity: object,
+    ) -> AdmittedHealth:
+        claims = _admitted_health_claims(
+            probe_after_monotonic_ns,
+            quota_probe_admissions,
+            transport_probe_admissions,
+        )
+        return cls(
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            quota_probe_admissions=quota_probe_admissions,
+            transport_probe_admissions=transport_probe_admissions,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
 
     def snapshot(self, *, now_monotonic_ns: int) -> HealthSnapshot:
         now_monotonic_ns = _nonnegative(now_monotonic_ns, field_name="now_monotonic_ns")
