@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 collector = [
+  "httpcore>=1.0,<2",
   "httpx[socks]>=0.28,<1",
   "python-socks[asyncio]>=2.7,<3",
   "websockets>=17,<18",
@@ -27,6 +28,7 @@ dev = [
   "hatchling>=1.27,<2",
   "hypothesis>=6.130,<7",
   "moto[s3,server]>=5,<6",
+  "pip>=25.3,<26.2",
   "pip-tools>=7.4,<8",
   "pytest>=9,<10",
   "pytest-asyncio>=1,<2",

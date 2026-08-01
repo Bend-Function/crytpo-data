@@ -137,6 +137,16 @@ class SecretSnapshot:
         raise AttributeError("SecretSnapshot is immutable")
 
     @classmethod
+    def empty(cls) -> SecretSnapshot:
+        return cls({})
+
+    @classmethod
+    def from_test_values(cls, values: Mapping[SecretRef, str]) -> SecretSnapshot:
+        if any(type(value) is not str for value in values.values()):
+            raise TypeError("test secret values must be strings")
+        return cls({ref: SecretValue(value) for ref, value in values.items()})
+
+    @classmethod
     def resolve_all(cls, refs: Iterable[SecretRef]) -> SecretSnapshot:
         distinct = sorted(set(refs), key=SecretRef.fingerprint_value)
         resolved: dict[SecretRef, SecretValue] = {}

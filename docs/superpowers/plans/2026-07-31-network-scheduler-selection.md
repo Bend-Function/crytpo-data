@@ -27,15 +27,17 @@
 ```python
 def test_direct_http_client_ignores_host_proxy_environment(monkeypatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://unexpected.invalid:8080")
-    spec = build_http_client_spec(Egress(id="direct", type="direct"),
-                                  secrets=SecretSnapshot.empty())
+    spec = build_http_client_spec(
+        Egress(id="direct", type="direct"), secrets=SecretSnapshot.empty()
+    )
     assert spec.trust_env is False
     assert spec.proxy is None
 
 
 def test_direct_websocket_disables_auto_proxy_detection() -> None:
     spec = build_websocket_connect_spec(
-        Egress(id="direct", type="direct"), "wss://example.test/ws",
+        Egress(id="direct", type="direct"),
+        "wss://example.test/ws",
         secrets=SecretSnapshot.empty(),
     )
     assert spec.proxy is None
@@ -47,19 +49,24 @@ def test_socks5h_resolves_proxy_reference_only_at_client_creation(monkeypatch) -
     secrets = SecretSnapshot.resolve_all([egress.url])
     spec = build_http_client_spec(egress, secrets=secrets)
     ws_spec = build_websocket_connect_spec(
-        egress, "wss://example.test/ws", secrets=secrets,
+        egress,
+        "wss://example.test/ws",
+        secrets=secrets,
     )
     assert spec.proxy.reveal().startswith("socks5h://")
     assert "password" not in repr(spec)
     assert "password" not in repr(ws_spec)
 
 
-@pytest.mark.parametrize("text", [
-    "https://user:pass@example.test/path?token=abc",
-    "Authorization: Bearer abc",
-    "x-oss-security-token: abc",
-    "AWS_SECRET_ACCESS_KEY=abc",
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://user:pass@example.test/path?token=abc",
+        "Authorization: Bearer abc",
+        "x-oss-security-token: abc",
+        "AWS_SECRET_ACCESS_KEY=abc",
+    ],
+)
 def test_redactor_removes_supported_secret_forms(text: str) -> None:
     assert "abc" not in redact(text)
     assert "pass" not in redact(text)
@@ -67,11 +74,15 @@ def test_redactor_removes_supported_secret_forms(text: str) -> None:
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(loopback_socks5, loopback_apps) -> None:
+async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(
+    loopback_socks5, loopback_apps
+) -> None:
     ref = SecretRef.parse("env:SOCKS_URL")
-    secrets = SecretSnapshot.from_test_values({
-        ref: loopback_socks5.url(scheme="socks5h", credentials=("u", "secret")),
-    })
+    secrets = SecretSnapshot.from_test_values(
+        {
+            ref: loopback_socks5.url(scheme="socks5h", credentials=("u", "secret")),
+        }
+    )
     clients = build_clients(socks_egress(ref), secrets=secrets)
     assert (await clients.http.get("http://venue.invalid/catalog")).status_code == 200
     async with clients.websocket.connect("ws://venue.invalid/ws") as websocket:
@@ -83,7 +94,9 @@ async def test_socks5h_http_and_websocket_delegate_dns_to_proxy(loopback_socks5,
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_direct_clients_ignore_host_proxy_environment(monkeypatch, loopback_apps) -> None:
+async def test_direct_clients_ignore_host_proxy_environment(
+    monkeypatch, loopback_apps
+) -> None:
     monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:1")
     clients = build_clients(direct_egress(), secrets=SecretSnapshot.empty())
     assert (await clients.http.get(loopback_apps.http_url)).status_code == 200
@@ -118,25 +131,40 @@ class WebSocketConnectSpec:
     max_queue: int = 16
 
     def __repr__(self) -> str:
-        return (f"WebSocketConnectSpec(uri={self.uri!r}, "
-                f"proxy={'configured' if self.proxy else None!r}, "
-                f"open_timeout={self.open_timeout!r}, "
-                f"close_timeout={self.close_timeout!r}, max_queue={self.max_queue!r})")
+        return (
+            f"WebSocketConnectSpec(uri={self.uri!r}, "
+            f"proxy={'configured' if self.proxy else None!r}, "
+            f"open_timeout={self.open_timeout!r}, "
+            f"close_timeout={self.close_timeout!r}, max_queue={self.max_queue!r})"
+        )
 
 
-def build_http_client_spec(egress: Egress, *, secrets: SecretSnapshot) -> HttpClientSpec:
+def build_http_client_spec(
+    egress: Egress, *, secrets: SecretSnapshot
+) -> HttpClientSpec:
     proxy = None if egress.type == "direct" else secrets.value_for(egress.url)
     return HttpClientSpec(proxy=proxy, trust_env=False)
 
 
 def build_websocket_connect_spec(
-    egress: Egress, uri: str, *, secrets: SecretSnapshot,
+    egress: Egress,
+    uri: str,
+    *,
+    secrets: SecretSnapshot,
 ) -> WebSocketConnectSpec:
     proxy = None if egress.type == "direct" else secrets.value_for(egress.url)
     return WebSocketConnectSpec(uri=uri, proxy=proxy)
 ```
 
-Direct egress uses `SecretSnapshot.empty()` so both builders retain one signature. Builders never resolve a reference and never store plaintext strings in repr-able objects. Client constructors are the only consumers of `SecretValue.reveal()`: HTTPX receives `proxy=None | spec.proxy.reveal()`, `trust_env=False`, explicit timeouts/limits, and `follow_redirects=False`; `websockets.connect` receives explicit `proxy=None | spec.proxy.reveal()` plus the timeout/queue fields. The redactor must parse URLs and redact userinfo plus known secret query/header/env names. All exception logging passes through it. Verify the foundation's locked HTTPX SOCKS and `python-socks[asyncio]` dependencies are installed; never use host `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` implicitly.
+Direct egress uses `SecretSnapshot.empty()` so both builders retain one signature. Builders never resolve a reference and never store plaintext strings in repr-able objects. Client constructors are the only consumers of `SecretValue.reveal()`. They parse the proxy once into a non-repr credential endpoint shared by the HTTP and WebSocket paths; the WebSocket factory retains neither the secret snapshot nor the source URL. The custom HTTPX transport preserves the logical target hostname in pool keys and TLS SNI while delegating only the SOCKS CONNECT operation. HTTP connection limits come from `egress.max_http_concurrency`, with keepalive capped by that same value. Direct and SOCKS delegates both sit behind a final validating transport, so a later request hook cannot bypass sensitive-header validation. Both clients use `trust_env=False`, explicit timeouts/limits, and no ambient proxy or CA discovery.
+
+`NetworkClients.http` is a composition facade rather than an `httpx.AsyncClient` subclass. Its complete request surface is `get(url, *, params=None, timeout=<configured>)`; it also exposes only the timeout property, closed state, and `aclose()` needed for lifecycle management. It has no `headers`, `cookies`, `auth`, `follow_redirects`, `extensions`, `request`, `send`, `build_request`, or `stream` escape hatch. `get` is an ordinary function that synchronously builds and validates a normalized request, discards caller-owned URL/parameter objects at the boundary, and returns the real HTTPX `send` coroutine so `asyncio.create_task(clients.http.get(...))` remains valid. Targets must be absolute HTTP(S) URLs with a host and no fragment delimiter, including an empty `#`. URL userinfo and sensitive query names, including percent-encoded names and structured `params`, are sanitized in the diagnostic request and rejected before any I/O. Redirects and authentication remain fixed off. The facade installs a reject-all cookie policy so response `Set-Cookie` values are never persisted or replayed. The final transport repeats validation as defense against a late internal request hook: it restores a rejected non-GET method to a generic diagnostic value and sanitizes/rejects both credential headers and `Cookie` before delegation.
+
+The traceback secrecy guarantee begins at this facade boundary: collector/dependency traceback frames after the call boundary plus every exception and attached request object must contain only sanitized data. It cannot include the originating caller frame or caller-owned objects because Python callers necessarily retain their own arguments. Tests exclude only that unavoidable caller ownership and scan the controlled collector/dependency frames and exception graph.
+
+SOCKS userinfo is validated at construction as paired, non-empty ASCII fields of 1-255 bytes with strictly validated percent escapes, matching the locked `python-socks` implementation and RFC 1929 framing. Invalid configuration clears revealed plaintext before raising a generic error whose cause/context graph and collector traceback locals contain no source URL. Proxy and target WebSocket URLs reject literal whitespace, C0/C1 control characters, backslashes, encoded hostnames, and empty forbidden delimiters. A proxy URL may have an equivalent trailing `/` but no other path, query, or fragment. Target WebSocket URIs reject userinfo before the dependency boundary. The collector owns the proxy TCP socket before the first cancellable connect and closes it on timeout, cancellation, negotiation failure, handshake failure, and socket-option failure. The pinned `python-socks` adapter invokes its socket-owning handshake primitive under the collector's deadline and never changes process-global warning filters across an await. External cancellation keeps its control-flow identity but discards dependency traceback locals; WebSocket open timeout is reclassified outside the cancellation context. Connection, negotiation, and socket-option errors are likewise mapped outside their sensitive dependency exception contexts into the HTTPX/httpcore or WebSocket classifications. HTTP protocol errors raised after response headers are mapped at the response-stream boundary, and all sensitive request headers are sanitized and rejected before h11, including legal-looking values.
+
+`WebSocketClientFactory.connect(uri)` returns a one-shot awaitable/context manager for both direct and SOCKS egress. It deliberately does not expose the dependency's async-iteration reconnect API: Plan 04 owns connection-generation failure, closure, and reconnect and must obtain a fresh handle for each attempt. Re-entering a used handle is an explicit error. The shared redactor covers URL userinfo, secret query names in absolute and origin-form targets, ordinary and structured sensitive headers (including `Cookie` and `Set-Cookie`), and secret assignments. Client construction installs the idempotent filter on the pinned HTTPX/httpcore/websockets client logger names so dependency DEBUG/INFO output and exception fields pass through that redactor. Verify the foundation's locked HTTPX, httpcore, and `python-socks[asyncio]` dependencies are installed.
 
 The function-scoped `tests/support/socks5_server.py` implements only the SOCKS5 greeting, optional username/password auth, and CONNECT required by the tests. It records the requested address type/domain before proxying to an explicitly mapped loopback HTTP or WebSocket server, so `socks5h` remote-name resolution is observable without external DNS. It rejects any destination not in the test mapping and stores only redacted diagnostics.
 
@@ -156,6 +184,7 @@ git commit -m "feat: create explicit direct and socks clients"
 ### Task 2: Sticky Assignment and Persistent Egress Health
 
 **Files:**
+- Modify: `src/crypto_collector/network/__init__.py`
 - Create: `src/crypto_collector/network/assignment.py`
 - Create: `src/crypto_collector/network/health.py`
 - Create: `src/crypto_collector/network/state_store.py`
@@ -174,7 +203,9 @@ def test_rendezvous_assignment_is_order_independent() -> None:
 
 
 def test_unhealthy_egress_is_skipped_only_for_new_generation() -> None:
-    assignment = StickyAssignment.create("okx/spot/BTC-USDT/books", egress("a"))
+    assignment = StickyAssignment.create(
+        "okx/spot/BTC-USDT/books", egress("a"), generation=7
+    )
     health = HealthSnapshot(unavailable=frozenset({("okx", "a")}))
     assert assignment.egress_id == "a"
     assert choose_egress(assignment.key, [egress("a"), egress("b")], health).id == "b"
@@ -182,37 +213,63 @@ def test_unhealthy_egress_is_skipped_only_for_new_generation() -> None:
 
 def test_ban_survives_worker_restart(tmp_path) -> None:
     store = EgressStateStore.open(tmp_path / "okx-network.sqlite")
-    store.record_ban(exchange="okx", quota_group="nat-a", until_ns=9_000, reason="429")
+    store.record_ban(
+        exchange="okx", quota_group="nat-a", until_unix_ns=9_000, reason="429"
+    )
     store.close()
     reopened = EgressStateStore.open(tmp_path / "okx-network.sqlite")
-    assert reopened.load_quota("okx", "nat-a").ban_until_ns == 9_000
+    assert reopened.load_quota("okx", "nat-a").ban_until_unix_ns == 9_000
 
 
 def test_assignment_precedes_deterministic_egress_local_sharding() -> None:
     assignments = assign_instruments(
-        ["BTCUSDT", "ETHUSDT", "SOLUSDT"], channel="trade",
-        egresses=[egress("a", max_subscriptions=2), egress("b", max_subscriptions=2)])
-    shards = pack_egress_shards(assignments)
+        ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+        exchange="binance",
+        market="spot",
+        channel="trade",
+        egresses=[
+            egress("a", max_ws_connections=2),
+            egress("b", max_ws_connections=2),
+        ],
+        subscriptions_per_connection=2,
+    )
+    shards = pack_egress_shards(
+        assignments,
+        egresses=[
+            egress("a", max_ws_connections=2),
+            egress("b", max_ws_connections=2),
+        ],
+        subscriptions_per_connection=2,
+    )
     assert all(len(shard.instrument_keys) <= 2 for shard in shards)
-    assert all(len({item.egress_id for item in shard.assignments}) == 1 for shard in shards)
+    assert all(
+        len({item.egress_id for item in shard.assignments}) == 1 for shard in shards
+    )
 
 
 @pytest.mark.network
 @pytest.mark.asyncio
-async def test_failed_proxy_closes_generation_and_only_new_generation_moves(
-    loopback_socks_pair, loopback_apps,
+async def test_failed_proxy_moves_only_the_new_connection_generation(
+    failover_socks_pair,
+    loopback_apps,
+    tmp_path,
 ) -> None:
-    manager = egress_manager(loopback_socks_pair, assignment_key="okx/spot/BTC-USDT/books")
-    first = await manager.open_generation()
-    assert await first.rest_probe() == "ok"
-    loopback_socks_pair.fail(first.egress_id)
-    with pytest.raises(TransportError):
-        await first.websocket.recv()
-    assert first.egress_id == manager.assignment_for(first.generation).egress_id
-    second = await manager.reconnect_after_failure(first)
-    assert second.generation == first.generation + 1
-    assert second.egress_id != first.egress_id
-    assert await second.rest_probe() == "ok"
+    first_proxy, _second_proxy = failover_socks_pair
+    first_assignment = choose_egress(assignment_key, egresses)
+    async with build_clients(first_assignment, secrets=secrets) as first_generation:
+        assert (await first_generation.http.get(loopback_apps.proxied_http_url)).status_code == 200
+    await first_proxy.close()
+    with EgressStateStore.open(tmp_path / "okx-network.sqlite") as store:
+        store.record_transport_failure(
+            exchange="okx", egress_id=first_assignment.id, reason="connect_error"
+        )
+        admitted = store.admit_health(
+            exchange="okx", egresses=egresses, now_unix_ns=1, now_monotonic_ns=1
+        )
+        second_assignment = choose_egress(
+            assignment_key, egresses, health=admitted.snapshot(now_monotonic_ns=1)
+        )
+        assert second_assignment.id != first_assignment.id
 ```
 
 - [ ] **Step 2: Run and verify assignment modules are absent**
@@ -223,7 +280,13 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement stable rendezvous hashing and SQLite state**
 
-Use `sha256(f"{exchange}/{market}/{instrument_key}/{channel}\0{egress_id}".encode()).digest()` as the unsigned score and select the highest healthy candidate with remaining configured capacity. Do not include a shard ID in that hash: assign each instrument/channel first, then sort by instrument key and pack egress-local shards under that egress's connection/subscription limits. Keep each chosen egress in an immutable `StickyAssignment` for the whole connection generation. A transport failure invalidates/closes that generation; it never migrates an open generation in place. Reconnect creates the next generation and may choose another healthy egress. Exercise that behavior through the real local SOCKS clients from Task 1. SQLite uses WAL with separate transport and quota tables:
+Use `sha256(f"{exchange}/{market}/{instrument_key}/{channel}\0{egress_id}".encode()).digest()` as the unsigned score and select the highest healthy candidate with remaining configured capacity. Assignment keys have four conceptual non-empty components: parse the first two `/` separators as exchange and market, the final separator as channel, and preserve the complete middle substring as `instrument_key`. This is required for stable keys such as Kraken Spot `BTC/USDT`; exchange, market, and channel themselves may not contain `/`. Validate those slash constraints before iterating instruments so an empty cohort cannot bypass them. Reject duplicate egress IDs and duplicate instrument keys rather than resolving them by input order. `choose_egress()` returns the selected immutable `Egress`; `StickyAssignment.create(..., generation=N)` freezes the decision that the runtime binds to a connection generation.
+
+Do not include a shard ID in the hash. `assign_instruments()` first sorts instruments, then chooses the highest-ranked healthy egress with remaining capacity. The explicit capacity of one egress for this assignment cohort is `egress.max_ws_connections * subscriptions_per_connection`, where the latter value comes from the capability registry or an admitted conservative override. `pack_egress_shards()` then sorts by canonical assignment key and chunks per egress without exceeding either limit. Capacity is checked before returning any partial plan.
+
+Plan 03 owns only assignment, health, and immutable generation-decision records. Plan 04 owns opening, invalidating, closing, and incrementing actual connection generations. A transport failure never mutates a `StickyAssignment` or migrates an open client in place; the Plan 04 runtime closes the failed generation and asks Plan 03 to choose for the next generation. The integration test exercises this boundary with the real local SOCKS clients from Task 1, but does not introduce a second production generation manager here.
+
+All persisted `*_until_ns` and `last_success_ns` values are UTC Unix epoch nanoseconds; `last_latency_ns` is an elapsed duration. Monotonic values are process-local and must never be stored. `EgressStateStore.admit_health(..., now_unix_ns, now_monotonic_ns)` opens one explicit WAL read transaction, atomically reads all quota and transport restrictions, and converts each remaining epoch duration exactly once into an immutable process-local monotonic deadline. The returned `AdmittedHealth` also carries immutable `QuotaProbeAdmission` and `TransportProbeAdmission` tokens containing the restriction revision captured by that same transaction. Thereafter `AdmittedHealth.snapshot(now_monotonic_ns=...)` classifies probe eligibility using monotonic time only. It keeps every restricted egress unavailable after expiry until an explicit successful public probe; a persisted revision change requires explicit re-admission and is never silently cached inside the store. SQLite uses WAL, `synchronous=FULL`, a busy timeout, exact schema version fencing, and separate transport and quota tables:
 
 ```sql
 CREATE TABLE quota_state (
@@ -233,19 +296,25 @@ CREATE TABLE quota_state (
   cooldown_until_ns INTEGER NOT NULL,
   current_rate_multiplier TEXT NOT NULL,
   last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
   PRIMARY KEY (exchange, quota_group)
 );
 CREATE TABLE egress_state (
   exchange TEXT NOT NULL,
   egress_id TEXT NOT NULL,
   consecutive_transport_failures INTEGER NOT NULL,
+  transport_cooldown_until_ns INTEGER NOT NULL,
   last_success_ns INTEGER,
   last_latency_ns INTEGER,
+  last_reason TEXT,
+  restriction_revision INTEGER NOT NULL,
   PRIMARY KEY (exchange, egress_id)
 );
 ```
 
-Recovery requires cooldown expiry followed by an explicit successful public probe. A process restart loads the persisted restriction before scheduling any request.
+Quota and transport restriction updates use `MAX(existing_until, observed_until)` so an out-of-order response cannot shorten an active restriction, and increment the corresponding `restriction_revision`. Probe success accepts only a token minted by that store's admission, checks its monotonic deadline, and conditionally clears only the captured revision. Each immutable mint binds its store identity to every public claim (kind, exchange, quota-group or egress key, restriction revision, and monotonic deadline); the aggregate `AdmittedHealth` mint also binds its deadline set and exact child-token identities. Claim matching is type-sensitive and accepts only the exact private mint type; claim keys must be non-empty exact built-in `str` values, so subclasses with overridden equality and duck-typed mints cannot impersonate another key or store. The store additionally records a weak reference and frozen original claims for each exact child admission object returned by a successfully completed `admit_health()` call. Probe success requires that same registered object and original claims; merely reading the store identity and calling an underscored constructor, copying/replacing a token, or mutating an issued object's fields cannot create authority. Weak-reference cleanup prevents repeated health admissions from creating an unbounded registry. Probe-success authority also requires the exact `QuotaProbeAdmission` or `TransportProbeAdmission` class, rejecting subclasses before their overridable methods are called. Probe success never compares the persisted epoch deadline to a fresh wall clock after admission, so a backward wall-clock jump cannot prolong an already eligible probe and a late success can never clear a newer 429, ban, cooldown, or transport failure. A process restart opens and admits this state before scheduling any request. Multiple egresses that share one `(exchange, quota_group)` share quota restriction state, while transport failures remain isolated by `(exchange, egress_id)`.
+
+Opening applies WAL mode and acquires `BEGIN IMMEDIATE` before reading `user_version`, so a concurrent initializer cannot race the exact version fence. The WAL switch itself can return `SQLITE_BUSY` before the transaction exists; initialization therefore retries only `SQLITE_BUSY`/`SQLITE_LOCKED` with bounded exponential delay, 100ms per-attempt SQLite waits, and one five-second monotonic deadline covering WAL setup and schema initialization. The deadline is checked before every subsequent attempt, so contention cannot expire and then succeed through one extra initialization. It restores the normal five-second connection busy timeout only after successful initialization. A database already declaring version 1 is validated without running any creation statement; fresh/version-0 initialization creates, validates, and sets version 1 in that same transaction. Validation uses `PRAGMA table_xinfo` for the complete ordered column contract, including affinity, nullability, composite-primary-key ordinal, and the hidden/generated flag. It also uses `PRAGMA index_xinfo` to require the exact primary-key columns in ascending order with `BINARY` collation, then compares the complete non-internal `sqlite_schema` object set and canonical table DDL. Extra tables, indexes, views, or triggers and semantic DDL drift such as `CHECK`, non-key `COLLATE`, `STRICT`, or `WITHOUT ROWID` fail the version fence. `set_rate_multiplier()` accepts only exact built-in, finite `Decimal` values in `(0, 1]`, because Task 3 may shrink admitted rate but may never exceed hard configured capacity; values are stored with `str(Decimal)` without ambient-context normalization. The Task 2 assignment, admission, snapshot, probe-token, state-store, and stale-probe symbols deliberately exported from `network/__init__.py` are part of this public API.
 
 - [ ] **Step 4: Run assignment and state tests**
 
@@ -279,13 +348,19 @@ def test_token_bucket_is_keyed_by_exchange_quota_group_and_endpoint() -> None:
     budgets.add(("binance", "shared-nat", "depth"), capacity=10, refill_per_second=1)
     assert budgets.try_acquire(("binance", "shared-nat", "depth"), cost=10)
     assert not budgets.try_acquire(("binance", "shared-nat", "depth"), cost=1)
-    assert budgets.try_acquire(("okx", "shared-nat", "depth"), cost=1, default_capacity=10)
+    assert budgets.try_acquire(
+        ("okx", "shared-nat", "depth"), cost=1, default_capacity=10
+    )
 
 
 @pytest.mark.parametrize(
     ("status", "retry_after", "expected"),
-    [(429, "3", RetryAction.THROTTLE), (418, "120", RetryAction.BAN),
-     (503, None, RetryAction.BACKOFF), (400, None, RetryAction.DO_NOT_RETRY)],
+    [
+        (429, "3", RetryAction.THROTTLE),
+        (418, "120", RetryAction.BAN),
+        (503, None, RetryAction.BACKOFF),
+        (400, None, RetryAction.DO_NOT_RETRY),
+    ],
 )
 def test_http_retry_classification(status, retry_after, expected) -> None:
     assert classify_http(status, retry_after=retry_after).action is expected
@@ -293,23 +368,31 @@ def test_http_retry_classification(status, retry_after, expected) -> None:
 
 def test_full_jitter_never_exceeds_cap() -> None:
     rng = random.Random(7)
-    assert all(0 <= full_jitter_ns(5, base_ns=1_000, cap_ns=10_000, rng=rng) <= 10_000
-               for _ in range(100))
+    assert all(
+        0 <= full_jitter_ns(5, base_ns=1_000, cap_ns=10_000, rng=rng) <= 10_000
+        for _ in range(100)
+    )
 
 
 def test_rest_retry_stops_at_attempt_or_job_deadline() -> None:
     policy = retry_policy(max_attempts=5)
     assert policy.decide(attempt=5, now_ns=0, deadline_ns=seconds(60)).retry is False
-    decision = policy.decide(attempt=1, now_ns=0, deadline_ns=seconds(2), retry_after="3")
+    decision = policy.decide(
+        attempt=1, now_ns=0, deadline_ns=seconds(2), retry_after="3"
+    )
     assert decision.retry is False
     assert decision.reason == "retry_after_exceeds_deadline"
 
 
-@given(attempt=st.integers(min_value=0, max_value=20),
-       base_ns=st.integers(min_value=1, max_value=seconds(10)),
-       cap_ns=st.integers(min_value=1, max_value=minutes(2)),
-       seed=st.integers(min_value=0, max_value=2**32 - 1))
-def test_full_jitter_is_always_inside_exponential_cap(attempt, base_ns, cap_ns, seed) -> None:
+@given(
+    attempt=st.integers(min_value=0, max_value=20),
+    base_ns=st.integers(min_value=1, max_value=seconds(10)),
+    cap_ns=st.integers(min_value=1, max_value=minutes(2)),
+    seed=st.integers(min_value=0, max_value=2**32 - 1),
+)
+def test_full_jitter_is_always_inside_exponential_cap(
+    attempt, base_ns, cap_ns, seed
+) -> None:
     delay = full_jitter_ns(attempt, base_ns, cap_ns, random.Random(seed))
     assert 0 <= delay <= min(cap_ns, base_ns * 2**attempt)
 
@@ -327,7 +410,10 @@ def test_retry_decision_never_crosses_attempt_or_monotonic_deadline(scenario) ->
     decision = scenario.policy.decide(**scenario.inputs)
     if decision.retry:
         assert scenario.inputs["attempt"] < scenario.policy.max_attempts
-        assert scenario.inputs["now_ns"] + decision.delay_ns <= scenario.inputs["deadline_ns"]
+        assert (
+            scenario.inputs["now_ns"] + decision.delay_ns
+            <= scenario.inputs["deadline_ns"]
+        )
 ```
 
 - [ ] **Step 2: Run and verify budget/retry modules are missing**
@@ -338,14 +424,39 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement endpoint token buckets and bounded retry decisions**
 
-Token refill uses injected monotonic time and never exceeds capacity. Apply server rate headers through exchange-specific observers without allowing a malformed header to increase configured hard capacity. Retry only anonymous GET, WebSocket connect, and subscribe. A REST job defaults to at most five attempts and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. `Retry-After` accepts integer seconds and HTTP-date using injected wall time; explicit exchange ban codes persist state. Schema/parse failures consume a channel error budget but do not loop network retries. WS generations may reconnect indefinitely with a 60s backoff cap, but cannot bypass active egress/quota-group circuits.
+`BudgetRegistry` keys every endpoint bucket by the exact non-empty `(exchange, quota_group, endpoint)` triple. A bucket accepts only exact built-in `int` or finite `Decimal` capacity, refill, and cost values; booleans, floats, subclasses, zero/negative limits, and non-finite values are rejected. It starts full, refills from the injected monotonic clock, never moves its refill baseline backward after a clock anomaly, and keeps exact decimal accounting independent of the ambient Decimal context. Configured capacity and refill rate are immutable hard ceilings, and a cost above hard capacity is a configuration error rather than a temporary miss. A throttle may only reduce the current refill rate toward a validated floor; `set_refill_multiplier()` applies the absolute persisted multiplier and permits controlled recovery without exceeding the hard rate. Exchange-specific response observers remain responsible for interpreting venue headers as an available-token value; the shared `observe_available()` boundary accepts only a conservative decimal grammar and clamps local tokens downward, so malformed, stale, or larger observations can never increase tokens or either hard ceiling.
+
+`RetryPolicy` is the bounded REST-job decision primitive. Retry only anonymous GET, WebSocket connect, and subscribe at their owning call sites; schema/parse failures consume a channel error budget and never enter this policy. A REST job defaults to at most five attempts, a 250ms base, and a 30-second cap, and may never sleep/retry beyond its monotonic deadline; a later periodic run is a new job. Full jitter is inclusive in `[0, min(cap, base * 2**attempt)]` and handles arbitrarily large attempt counters without constructing an unbounded integer. The policy reads only monotonic inputs for ordinary backoff. It reads the injected wall clock only when converting an HTTP-date `Retry-After`; integer delay-seconds and HTTP-date are accepted, while malformed values are ignored rather than expanding a delay. `RetryDecision.delay_ns` retains the computed delay even when `retry` is false because the attempt limit or job deadline was reached, and `cause` preserves the original HTTP/exchange signal separately from that scheduling `reason`.
+
+`apply_quota_retry_effect()` runs independently of whether the current job will retry. BAN writes the group-wide durable ban deadline using `now_unix_ns + decision.delay_ns` and persists `decision.cause`, so exhausting one job cannot erase a 418 or explicit payload ban. THROTTLE reduces only the selected endpoint bucket; a plain 429 does not manufacture the explicit group-wide ban/cooldown and successful-probe requirement reserved for a venue ban signal. Pure 5xx/backoff does not mutate quota state, and pure connection failure remains the per-egress transport-health path from Task 2. WS generations may reconnect indefinitely with a 60s backoff cap, but Plan 04 must still gate every generation on the admitted quota-group and egress circuits.
 
 ```python
-delay_ns = max(parsed_retry_after_ns, full_jitter_ns(attempt, base_ns, cap_ns, rng))
+now_monotonic_ns = clock.monotonic_ns()
+now_unix_ns = clock.time_ns()
+classification = classify_http(
+    response.status_code,
+    response.headers.get("Retry-After"),
+)
+decision = policy.decide(
+    attempt=attempt,
+    now_ns=now_monotonic_ns,
+    deadline_ns=job.deadline_ns,
+    classification=classification,
+)
+apply_quota_retry_effect(
+    decision,
+    exchange=exchange,
+    quota_group=quota_group,
+    now_unix_ns=now_unix_ns,
+    state_store=state_store,
+    budget=budget,
+    throttle_multiplier=Decimal("0.5"),
+    minimum_refill_per_second=minimum_rate,
+)
 if decision.action is RetryAction.BAN:
-    state_store.record_ban(exchange, quota_group, now_ns + delay_ns, decision.reason)
-elif decision.action is RetryAction.THROTTLE:
-    budget.shrink(multiplier=0.5, floor=minimum_rate)
+    assert state_store.load_quota(exchange, quota_group).ban_until_unix_ns >= (
+        now_unix_ns + decision.delay_ns
+    )
 ```
 
 - [ ] **Step 4: Run deterministic budget/retry tests**
@@ -368,8 +479,14 @@ git commit -m "feat: enforce per-quota-group request budgets"
 - Create: `src/crypto_collector/scheduler/models.py`
 - Create: `src/crypto_collector/scheduler/rest.py`
 - Create: `src/crypto_collector/scheduler/interval_observability.py`
+- Modify: `src/crypto_collector/network/rate_limit.py`
+- Modify: `src/crypto_collector/domain/envelope.py`
+- Modify: `src/crypto_collector/config/models.py`
 - Test: `tests/unit/scheduler/test_rest.py`
 - Test: `tests/unit/scheduler/test_interval_observability.py`
+- Test: `tests/unit/network/test_rate_limit.py`
+- Test: `tests/unit/domain/test_envelope.py`
+- Test: `tests/unit/config/test_models.py`
 
 - [ ] **Step 1: Write failing priority and hysteresis tests**
 
@@ -383,12 +500,20 @@ async def test_bootstrap_runs_before_deep_snapshot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_future_high_priority_does_not_block_ready_lower_priority(fake_clock) -> None:
+async def test_future_high_priority_does_not_block_ready_lower_priority(
+    fake_clock,
+) -> None:
     scheduler = RestScheduler(fake_budgets(tokens=10), clock=fake_clock)
-    await scheduler.submit(job("future-bootstrap", priority=RestPriority.LIVE_BOOTSTRAP,
-                               ready_monotonic_ns=seconds(30)))
-    await scheduler.submit(job("ready-deep", priority=RestPriority.DEEP_SNAPSHOT,
-                               ready_monotonic_ns=0))
+    await scheduler.submit(
+        job(
+            "future-bootstrap",
+            priority=RestPriority.LIVE_BOOTSTRAP,
+            ready_monotonic_ns=seconds(30),
+        )
+    )
+    await scheduler.submit(
+        job("ready-deep", priority=RestPriority.DEEP_SNAPSHOT, ready_monotonic_ns=0)
+    )
     assert (await scheduler.next_ready()).id == "ready-deep"
     assert fake_clock.monotonic_ns() == 0
 
@@ -396,50 +521,79 @@ async def test_future_high_priority_does_not_block_ready_lower_priority(fake_clo
 @pytest.mark.asyncio
 async def test_expired_waiting_job_is_dropped_without_dispatch(fake_clock) -> None:
     scheduler = RestScheduler(fake_budgets(tokens=10), clock=fake_clock)
-    await scheduler.submit(job("expired", ready_monotonic_ns=seconds(20),
-                               deadline_ns=seconds(10)))
+    await scheduler.submit(
+        job("expired", ready_monotonic_ns=seconds(20), deadline_ns=seconds(10))
+    )
     fake_clock.advance(seconds(20))
     assert await scheduler.next_ready_or_none() is None
     assert scheduler.expired_ids() == ("expired",)
 
 
 def test_overloaded_deep_interval_stretches_and_emits_context() -> None:
-    plan = solve_interval(requested_ns=30_000_000_000, jobs=100, cost=50,
-                          available_tokens_per_second=50, policy="stretch_with_warning")
+    plan = solve_interval(
+        requested_ns=30_000_000_000,
+        jobs=100,
+        cost=50,
+        available_tokens_per_second=50,
+        policy="stretch_with_warning",
+    )
     assert plan.effective_ns == 100_000_000_000
     assert plan.warning.requested_ns == 30_000_000_000
     assert plan.warning.affected_symbols == 100
 
 
 def test_capacity_recovery_steps_down_without_request_spike() -> None:
-    controller = IntervalController(current_ns=120_000_000_000, recovery_step=0.20,
-                                    healthy_refreshes_required=3)
-    assert controller.recover_toward(30_000_000_000) == 120_000_000_000
-    assert controller.recover_toward(30_000_000_000) == 120_000_000_000
-    assert controller.recover_toward(30_000_000_000) == 96_000_000_000
+    controller = IntervalController(
+        current_ns=120_000_000_000, recovery_step=0.20, healthy_refreshes_required=3
+    )
+    first = controller.propose_toward(30_000_000_000, refresh_id=1)
+    controller.commit(first)
+    second = controller.propose_toward(30_000_000_000, refresh_id=2)
+    controller.commit(second)
+    third = controller.propose_toward(30_000_000_000, refresh_id=3)
+    assert third.effective_ns == 96_000_000_000
+    assert controller.current_ns == 120_000_000_000
 
 
 def test_periodic_replaceable_jobs_coalesce_instead_of_backlogging() -> None:
     scheduler = RestScheduler(fake_budgets(tokens=0))
-    scheduler.submit_nowait(job("deep-btc", logical_key=("btc", "deep"), scheduled_ns=1))
-    scheduler.submit_nowait(job("deep-btc-new", logical_key=("btc", "deep"), scheduled_ns=2))
+    scheduler.submit_nowait(
+        job("deep-btc", logical_key=("btc", "deep"), scheduled_ns=1)
+    )
+    scheduler.submit_nowait(
+        job("deep-btc-new", logical_key=("btc", "deep"), scheduled_ns=2)
+    )
     assert scheduler.pending_ids() == ("deep-btc-new",)
 
 
 def test_deep_interval_above_max_is_capacity_failure() -> None:
     with pytest.raises(CapacityError, match="max effective interval"):
-        solve_interval(requested_ns=seconds(30), jobs=1000, cost=250,
-                       available_tokens_per_second=1, max_effective_ns=minutes(15))
+        solve_interval(
+            requested_ns=seconds(30),
+            jobs=1000,
+            cost=250,
+            available_tokens_per_second=1,
+            max_effective_ns=minutes(15),
+        )
 
 
 def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() -> None:
     sinks = recording_interval_sinks()
-    change = interval_change(exchange="okx", endpoint="books-full",
-                             requested_ns=seconds(30), effective_ns=minutes(2),
-                             healthy_egress_count=2,
-                             symbols=("BTC-USDT", "ETH-USDT"), config_sha256="a" * 64,
-                             cause="capacity_shortfall", direction="stretch")
-    published = IntervalChangePublisher(sinks).publish(change)
+    change = interval_change(
+        exchange="okx",
+        endpoint="books-full",
+        requested_ns=seconds(30),
+        effective_ns=minutes(2),
+        healthy_egress_count=2,
+        symbols=("BTC-USDT", "ETH-USDT"),
+        config_sha256="a" * 64,
+        cause="capacity_shortfall",
+        direction="stretch",
+    )
+    published = IntervalChangePublisher(
+        sinks,
+        allowed_metric_series=frozenset({(Exchange.OKX, "books-full")}),
+    ).publish(change)
     expected_context = {
         "event_id": published.event_id,
         "requested_interval_ns": seconds(30),
@@ -452,22 +606,52 @@ def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() ->
         "direction": "stretch",
     }
     assert {key: sinks.logs.one()[key] for key in expected_context} == expected_context
-    assert {key: sinks.controls.one().payload[key] for key in expected_context} == expected_context
-    assert sinks.metrics.counter("collector_interval_changes_total",
-                                 exchange="okx", endpoint="books-full",
-                                 direction="stretch").value == 1
-    assert sinks.metrics.gauge("collector_requested_interval_seconds",
-                               exchange="okx", endpoint="books-full").value == 30
-    assert sinks.metrics.gauge("collector_effective_interval_seconds",
-                               exchange="okx", endpoint="books-full").value == 120
-    assert sinks.metrics.gauge("collector_healthy_egresses",
-                               exchange="okx", endpoint="books-full").value == 2
-    assert sinks.metrics.gauge("collector_interval_affected_instruments",
-                               exchange="okx", endpoint="books-full").value == 2
+    assert {
+        key: sinks.controls.one().payload[key] for key in expected_context
+    } == expected_context
+    assert (
+        sinks.metrics.counter(
+            "collector_interval_changes_total",
+            exchange="okx",
+            endpoint="books-full",
+            direction="stretch",
+        ).value
+        == 1
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_requested_interval_seconds",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 30
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_effective_interval_seconds",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 120
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_healthy_egresses", exchange="okx", endpoint="books-full"
+        ).value
+        == 2
+    )
+    assert (
+        sinks.metrics.gauge(
+            "collector_interval_affected_instruments",
+            exchange="okx",
+            endpoint="books-full",
+        ).value
+        == 2
+    )
     assert sinks.metrics.label_names == {"exchange", "endpoint", "direction"}
     assert sinks.controls.one().logical_stream == "_control"
-    assert published.rest_metadata.requested_interval_ns == seconds(30)
-    assert published.rest_metadata.effective_interval_ns == minutes(2)
+    assert published.rest_intervals.requested_interval_ns == seconds(30)
+    assert published.rest_intervals.effective_interval_ns == minutes(2)
     assert "config_sha256" not in sinks.metrics.label_names
     assert "instrument" not in sinks.metrics.label_names
 ```
@@ -480,64 +664,284 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement the five priority classes**
 
-Keep two bounded heaps plus a logical-key index: future jobs use `(ready_monotonic_ns, insertion_sequence)`, while currently dispatchable jobs use `(priority, insertion_sequence)`. Before each dispatch, move every now-ready future job into the ready heap and discard/report jobs whose monotonic deadline has passed; sleep until the earliest future readiness only when the ready heap is empty. This prevents a future high-priority job from idling capacity while lower-priority work is ready. Priorities are live bootstrap/gap recovery, catalog/status/time, core derivative REST, deep snapshot, then replaceable reference data. A job carries requested/effective interval, endpoint cost, eligible egress IDs, generation-stickiness requirement, deadline, attempt, logical coalescing key, and control context. High priorities are strict among currently ready jobs; periodic deep/reference jobs are replaceable and coalesce by logical key across both heaps so throttling cannot create stale backlog. Stretching is deterministic from admitted symbols and healthy quota-group budgets, capped by the configured 15m default. Fixed/required work above that cap is a capacity error; other symbols return to admission policy. Require three healthy refreshes, then shorten by 20% per refresh.
+Keep two physically bounded heaps plus a logical-key index: future jobs use `(ready_monotonic_ns, insertion_sequence)`, while currently dispatchable jobs use `(priority, insertion_sequence)`. `SchedulerConfig.max_pending_jobs` is the hard live-job/combined-heap bound and `event_history_limit` bounds expired and evicted history; both accept only `1..1_000_000`, and the direct scheduler constructor enforces the same limit before constructing a collection. Replacement physically removes the prior entry before insertion; an older occurrence is `STALE_IGNORED`, an exact repeat is idempotent, and a conflicting equal occurrence fails. Compare that logical occurrence before sweeping expired incumbents, then sweep them before applying the capacity limit so dead work cannot reject fresh work. An already-expired newer occurrence supersedes its older logical occurrence but never evicts unrelated live work. Replacement remains atomic at capacity. If the queue is full, higher-priority fixed work may evict the lowest-priority replaceable job; replaceable incoming work never triggers eviction, and every other submission fails explicitly. `RestJob.control_context` is recursively immutable after validation, including nested objects and arrays, so queued identity and idempotency cannot be changed through an alias. Periodic deep/reference jobs use `StableCadence`: a stable anchor plus SHA-256-derived instrument phase, latest-due-only missed-slot handling, and a future first slot after an interval change, so recovery never creates a synchronized catch-up burst.
 
-Every effective-interval change creates one immutable `IntervalChange` with a generated event ID and publishes it synchronously to three injected sinks before the new schedule becomes active: a structured JSON warning, bounded-cardinality Prometheus counter/gauges, and a reserved `_control` `NativeEventDraft`. The log and control payload include requested/effective interval, endpoint, healthy-egress count, affected instrument keys, config SHA, cause, and direction. Metrics expose requested/effective seconds, healthy-egress count, affected-instrument count, and change count as numeric values; their only labels are the bounded `exchange`, `endpoint`, and where applicable `direction`. Config hashes and instrument keys are never metric labels. Failure to enqueue the reserved control record rejects the schedule change and enters the writer-critical path rather than creating a silent stretch. The same requested/effective values are attached to every resulting REST envelope through `RestMetadata`. Startup calculation, periodic stretch/recovery, and reload all use this publisher; unchanged intervals emit nothing.
+Before each dispatch, promote every now-ready future job and scan the bounded live index to expire all jobs whose monotonic deadline has passed. The inclusive deadline contract is shared with Task 3: dispatch at `now == deadline` is allowed and expiry begins one nanosecond later. Deadline validation, token refill/acquisition, readiness quotation, and the returned dispatch stamp use one scheduler-sampled `now_ns`; a later budget clock read cannot admit an already-expired request. A future high-priority job cannot idle ready lower-priority work. A budget-blocked high-priority job blocks lower-priority work only on overlapping `BudgetKey` values; independent budgets remain work-conserving. `TokenBucket.ready_at_ns()` quotes exact availability without consuming tokens and derives missing-token ratios without ambient Decimal arithmetic, while `BudgetRegistry.try_acquire_one()` atomically selects and consumes one distinct candidate. `RestJob` carries ordered `RestBudgetRoute` values and an optional exact generation `SourceContext`; `LIVE_BOOTSTRAP` requires that exact connection generation before admission. `RestScheduler` returns `RestDispatch`, binding the selected egress, consumed budget, monotonic admission time, and source context. Shared quota keys are deduplicated. The scheduler and budgets must share one injected clock. `next_ready()` waits through an injected `MonotonicWaiter` for the minimum future readiness, budget-ready time, or expiry wake and is interruptible by submit, resource change, close, fake-clock advance, or cancellation. A representable finite deadline is scheduled once without a fixed cap; an integer deadline beyond float representation waits for an explicit resource/submit/close wake rather than overflowing or polling daily.
+
+`solve_interval()` uses integer ratios from exact `Decimal` values and computes `ceil(jobs * cost * 1e9 / admitted_rate)`. Its scalar rate is a pre-reserved, quota-group-deduplicated rate for the already admitted endpoint cohort, not a raw per-egress sum or an independently reusable venue total; Task 6 owns competing-workload allocation and required-versus-candidate admission before calling this primitive. The configured 15-minute cap is inclusive. Fixed/admitted work beyond it is a capacity error. Require three distinct committed healthy refreshes, then shorten by 20% on every subsequent healthy refresh using an exact integer-ratio complement and ceiling; when nanosecond rounding would otherwise stall above the target, advance by one nanosecond. Unhealthy or stretch observations reset the streak. `propose_interval()` permits only unchanged or stretched values. Every recovery proposal freezes its target and refresh identity, and commit/activation recomputes the only legal transition from controller state, so callers cannot forge or bypass the streak. Recovery is `propose_toward -> publish -> commit`; changed proposals cannot use the no-publication `commit()` path, publication failure changes neither interval, streak, revision, jobs, nor REST metadata, and controller mutation is rejected while synchronous publication is in progress.
+
+Every effective-interval change creates one immutable `IntervalChange` with a generated event ID. The publisher validates `(Exchange, logical_endpoint)` against a finite metric-series allowlist before any side effect, then uses the reserved control writer boundary `try_emit(draft, SourceContext.internal(), shard="_control")` as the commit gate. The isolated Task 4 enum remains a test adapter; `ControlEnqueueResultLike` structurally consumes Plan 02's canonical result through its `StrEnum status` and exact boolean `accepted` properties without redefining the storage model. `ACCEPTED` and `ACCEPTED_HIGH_WATER` permit activation; overflow, non-accepting results, inconsistent or malformed results, and exceptions reject activation and enter writer-critical. After control acceptance, structured logging and fixed-label Prometheus updates are independently attempted; a secondary failure returns a degraded receipt and enters critical but does not reject activation or invite duplicate control retry. The log and control payload include previous/requested/effective interval, endpoint, healthy-egress count, sorted affected instrument keys, config SHA, cause, and direction. Counter labels are exactly `exchange, endpoint, direction`; gauge labels are exactly `exchange, endpoint`. Event IDs, causes, hashes, paths, params, and instruments are never labels.
+
+The publisher returns a validated `RestIntervalContext`, not an incomplete `RestMetadata`. `RestDispatch.build_rest_metadata()` is the only scheduler builder: it defensively copies request params/headers and takes attempt plus requested/effective interval only from the frozen job. Canonical `RestMetadata` requires both interval fields together and `effective >= requested`; attaching context rejects pre-existing mismatches rather than silently overwriting them. Startup calculation, periodic stretch/recovery, and reload all use this publisher; unchanged intervals emit nothing.
 
 - [ ] **Step 4: Run scheduler tests**
 
-Run: `.venv/bin/python -m pytest tests/unit/scheduler/test_rest.py tests/unit/scheduler/test_interval_observability.py -q`
+Run: `.venv/bin/python -m pytest tests/unit/scheduler tests/unit/network/test_rate_limit.py tests/unit/domain/test_envelope.py tests/unit/config/test_models.py -q`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/scheduler tests/unit/scheduler
+git add src/crypto_collector/scheduler src/crypto_collector/network/rate_limit.py src/crypto_collector/domain/envelope.py src/crypto_collector/config/models.py tests/unit/scheduler tests/unit/network/test_rate_limit.py tests/unit/domain/test_envelope.py tests/unit/config/test_models.py docs/superpowers/plans/2026-07-31-network-scheduler-selection.md
 git commit -m "feat: schedule prioritized public rest jobs"
 ```
 
 ### Task 5: Catalog State and Fixed/Top-N/New-Listing Union
 
 **Files:**
+- Modify: `src/crypto_collector/config/models.py`
 - Create: `src/crypto_collector/selection/__init__.py`
 - Create: `src/crypto_collector/selection/models.py`
 - Create: `src/crypto_collector/selection/catalog_store.py`
 - Create: `src/crypto_collector/selection/selector.py`
 - Test: `tests/unit/selection/test_catalog_store.py`
 - Test: `tests/unit/selection/test_selector.py`
+- Test: `tests/unit/config/test_models.py`
+
+#### Authoritative Task 5 Contract Clarification
+
+This clarification is normative and overrides the abbreviated examples below. An
+`instrument_key` is stable only inside one `(exchange, market)` scope; it is never a
+globally unique identifier. Every catalog, fixed selection, selection policy/state, and
+selection result therefore carries the exact same `SelectionScope`. Catalog-dependent
+objects also carry the catalog revision that produced them, and a mismatched scope or
+revision is an error rather than an empty result or best-effort union.
+
+Only a provider-complete snapshot may mutate catalog presence. A
+`CompleteCatalogSnapshot` carries its scope, wall-clock observation time, stable
+snapshot ID, optional exchange-reported total, one record per stable instrument key,
+and an ordered tuple of `SnapshotPage(raw_reference, request_cursor, next_cursor)`.
+The first page has no request cursor, every next cursor equals the following request
+cursor, cursors advance without repetition, and the final page has `next_cursor=None`.
+The constructor rejects duplicate/cross-scope records, a non-terminal or discontinuous
+page chain, inconsistent reported counts, and an empty result unless the provider
+supplies an explicit authoritative-empty fact. The canonical digest binds every page
+triple, not merely its count or raw reference. One page from a multi-page response, a
+failed page, or an unproven empty response never reaches `CatalogStore`. The store uses
+one `BEGIN IMMEDIATE` transaction to compare and update the per-scope observed-time/
+revision/digest high-water, instruments, lifecycle episode state, announcement
+confirmations, and durable control-change outbox. It validates complete immutable
+`CatalogChanges` and `TurnoverChanges` results before commit, so a result-validation
+error also rolls back all writes. Older times fail; an equal time is idempotent only for
+the same canonical digest and otherwise conflicts. Missing instruments become
+non-present only after this complete-snapshot gate.
+
+Catalog metadata and 24-hour turnover have independent observation times and raw
+provenance. `CompleteTurnoverSnapshot` has the same completeness and high-water rules,
+binds the exact catalog revision against which it was fetched, and lists the complete
+set of instrument keys covered even when the venue omits a value for some of them. A
+catalog-revision mismatch or coverage outside that revision fails without mutation. It
+stores exact, finite, non-negative `Decimal` quote turnover, its method/currency,
+`turnover_observed_at_ns`, and the raw ticker reference. Contract counts are not a
+turnover method. A catalog correction that changes an instrument's quote asset clears
+its inherited turnover rather than blocking the catalog revision or relabeling the old
+currency. A computed value must explicitly identify the base-volume/reference-
+price conversion. A selection policy supplies `turnover_max_age_ns`; Top N ignores
+missing, uncovered by the latest complete turnover snapshot, stale, wrong-currency,
+non-present, or non-tradable observations. An exchange-reported snapshot item count
+matches the complete coverage count; observations remain a subset when covered ticker
+rows omit turnover. Ranking is independent for each quote and deterministic by
+`(-turnover, instrument_key)`. A turnover snapshot cannot predate the catalog
+observation to which it binds. When a view's turnover binding equals its current catalog
+revision, its coverage contains only present keys and its turnover observation is not
+earlier than the catalog observation; an older binding may retain historical coverage,
+but the selector rejects it for current Top N.
+
+New-listing eligibility is durable episode state, not a transient `new_listings`
+return value and not caller-supplied keys. The initial complete baseline suppresses all
+fallback-local episodes; an official continuous-trading/listing time may opt in only
+when `observed_at - initial_lookback <= tradable_at <= observed_at`. A pre-open record
+does not start a window. If it later becomes tradable without an eligible official
+time, the fallback is that first catalog-confirmed tradable observation
+(`first_tradable_seen`), not the earlier pre-open `first_seen`. The provider also maps
+native state to a canonical lifecycle phase while retaining the native fields. Missing
+from one complete snapshot is not delisting, reappearance alone is not relisting, and a
+pause/resume preserves the original episode/window. Only an explicit terminal/delisted
+phase followed by catalog-confirmed tradability establishes a persisted relisting
+episode. Every explicit terminal observation advances durable
+`last_terminal_seen_ns`; `relist_pending` and this timestamp survive missing, paused,
+pre-open, and process-restart boundaries until tradability consumes them. A relisting
+official time is eligible only when
+`last_terminal_seen_ns < official_tradable_at <= confirmation_observed_at`; otherwise
+the new episode starts at the catalog-confirmed tradable observation using
+`first_tradable_seen`. An active relisted episode retains the terminal timestamp as
+causal provenance.
+
+`ACTIVE_NEW` is the only state with `new_listing_eligible=True` and requires paired
+episode start/source fields. `BASELINE`, `PENDING`, and `PENDING_OFFICIAL` are ineligible
+and carry no episode fields. `PENDING`, `PENDING_OFFICIAL`, and `RELIST_PENDING` are
+necessarily non-tradable; a catalog-confirmed tradable observation consumes the pending
+state before publishing the row. `RELIST_PENDING` is ineligible, requires terminal
+evidence, and may retain the prior episode fields for history. Missing and paused active
+rows keep their episode state. A `DELISTED` row is always `RELIST_PENDING`, and its
+terminal timestamp equals that observation's `last_seen_ns`, including repeated
+terminal observations. The selector independently requires `ACTIVE_NEW`, present, and
+tradable. Initial paused/unknown rows and already-tradable rows with an ineligible future
+official time remain baseline rather than becoming delayed false new listings. The
+selector derives active episodes using the half-open interval
+`tradable_at <= now < tradable_at + capture_duration`; announcements remain hints until
+a complete catalog snapshot confirms tradability. If a hint supplies both a stable key
+and canonical pair, both must match the same current tradable instrument. Independent
+canonical-pair-only hints confirm only when exactly one current tradable instrument
+matches; zero or multiple matches remain pending. Confirmed announcement deltas and
+outbox events always carry that resolved target's real `instrument_key`. Independent
+hints for one instrument remain independent: announcement delta identity is the stable
+hint ID, while `instrument_key` is its target association.
+
+Top-N exit grace is persisted in a scope/policy-bound `SelectionState`. The first
+refresh where an instrument leaves Top N freezes `top_exit_started_at_ns`; repeated
+refreshes never move it. Re-entry clears it, and a later exit starts a new grace period.
+Grace is also half-open and ends exactly at `exit_started + exit_grace`. The store
+commits a result with compare-and-swap checks over catalog revision, turnover revision,
+policy ID, and prior state revision so restarts resume the same deadline and stale
+workers cannot overwrite a newer decision. Catalog and selection changes expose full
+previous/current values and are inserted into the durable outbox in the same
+transaction for later `_control` publication/acknowledgement. The selection checkpoint
+stores the complete immutable instrument snapshot for every entry; it never rebinds a
+historical previous value to the latest catalog row after restart. `CatalogChanges`
+exposes the same values as immutable `CatalogDelta` entries, in addition to its
+classification tuples.
+
+`SelectionConfig` adds strict positive `turnover_max_age_ns` (YAML alias
+`turnover_max_age`, default 15 minutes). The quote-asset collection must be non-empty;
+this holds for the root configuration and every exchange, market, or symbol override.
+Fixed requests may be empty. Elements in both collections are stripped, non-empty, and
+unique under Unicode case-folding; ambiguous duplicates fail config validation rather
+than being silently deduplicated. Selection ranks and durations fit signed 64-bit
+integers at both root and override validation boundaries. `SelectionPolicy.policy_id`
+is a canonical SHA-256 over its scope-independent values, including quote order, Top N,
+turnover freshness, new-listing duration, and exit grace.
+
+The public boundary is:
+
+```python
+class CatalogStore:
+    def apply_catalog_snapshot(
+        self,
+        snapshot: CompleteCatalogSnapshot,
+        *,
+        initial_lookback_ns: int = 0,
+    ) -> CatalogChanges: ...
+
+    def apply_turnover_snapshot(
+        self, snapshot: CompleteTurnoverSnapshot
+    ) -> TurnoverChanges: ...
+
+    def load_view(self, scope: SelectionScope) -> CatalogView: ...
+
+    def load_selection_state(
+        self, scope: SelectionScope, policy_id: str
+    ) -> SelectionState | None: ...
+
+    def commit_selection(
+        self,
+        result: SelectionResult,
+        *,
+        expected_catalog_revision: int,
+        expected_turnover_revision: int,
+        expected_state_revision: int | None,
+    ) -> SelectionState: ...
+
+    def pending_changes(
+        self, scope: SelectionScope
+    ) -> tuple[CatalogControlChange, ...]: ...
+
+    def ack_change(self, event_id: str) -> bool: ...
+
+
+def select(
+    catalog: CatalogView,
+    *,
+    fixed: ResolvedFixedSelection,
+    policy: SelectionPolicy,
+    previous: SelectionState | None,
+    now_ns: int,
+) -> SelectionResult: ...
+```
+
+`ResolvedFixedSelection` contains scope, exact catalog revision, and keys already
+resolved by Task 6. Fixed keys bypass only the quote filter: every key must still be
+present and tradable in that exact catalog revision. `SelectionReason` is a bitset with
+at least `FIXED`, `NEW_LISTING`, `TOP_N`, and `TOP_N_GRACE`; rank is quote-local and
+optional, and admission priority is the highest overlapping reason in the order fixed,
+new listing, then Top N/grace. Returned mappings and nested catalog JSON are recursively
+immutable. All integer/time fields reject booleans and floats.
 
 - [ ] **Step 1: Write failing first-run, turnover, and grace tests**
 
 ```python
 def test_first_catalog_is_baseline_not_mass_new_listing(tmp_path) -> None:
-    store = CatalogStore.open(tmp_path / "catalog.sqlite")
-    changes = store.apply_snapshot(exchange="binance", market="spot", observed_at_ns=100,
-                                   instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")])
-    assert changes.new_listings == ()
+    scope = SelectionScope(Exchange.BINANCE, Market.SPOT)
+    with CatalogStore.open(tmp_path / "catalog.sqlite") as store:
+        changes = store.apply_catalog_snapshot(
+            complete_catalog_snapshot(
+                scope,
+                observed_at_ns=100,
+                instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")],
+            ),
+            initial_lookback_ns=hours(72),
+        )
+        restarted_view = store.load_view(scope)
+    assert changes.new_listing_episodes == ()
+    assert all(not item.new_listing_eligible for item in restarted_view.instruments)
 
 
 def test_recent_official_tradable_time_can_enter_on_first_baseline(tmp_path) -> None:
-    store = CatalogStore.open(tmp_path / "catalog.sqlite")
-    changes = store.apply_snapshot(
-        exchange="bitget", market="perpetual", observed_at_ns=ns("2026-07-31T12:00:00Z"),
-        instruments=[instrument("NEWUSDT", tradable_at_ns=ns("2026-07-31T11:00:00Z"),
-                                tradable_at_source="exchange")], initial_lookback_ns=hours(72))
-    assert [item.instrument_key for item in changes.new_listings] == ["NEWUSDT"]
+    scope = SelectionScope(Exchange.BITGET, Market.PERPETUAL)
+    observed_at_ns = ns("2026-07-31T12:00:00Z")
+    with CatalogStore.open(tmp_path / "catalog.sqlite") as store:
+        changes = store.apply_catalog_snapshot(
+            complete_catalog_snapshot(
+                scope,
+                observed_at_ns=observed_at_ns,
+                instruments=[
+                    instrument(
+                        "NEWUSDT",
+                        tradable_at_ns=ns("2026-07-31T11:00:00Z"),
+                        tradable_at_source="exchange",
+                    )
+                ],
+            ),
+            initial_lookback_ns=hours(72),
+        )
+    assert [item.instrument_key for item in changes.new_listing_episodes] == [
+        "NEWUSDT"
+    ]
 
 
 def test_selection_is_union_with_fixed_priority_and_top_n_per_quote() -> None:
-    fixed = ResolvedFixedSelection(instrument_keys=frozenset({"PF_XBTUSD"}))
-    result = select(catalog(), fixed=fixed, quotes=["USDT"], top_n=2,
-                    active_new=["NEWUSDT"], now_ns=1_000)
-    assert result.selected == frozenset({"PF_XBTUSD", "BTCUSDT", "ETHUSDT", "NEWUSDT"})
+    view = catalog_view_with_fresh_turnover_and_active_new_listing()
+    fixed = ResolvedFixedSelection(
+        scope=view.scope,
+        catalog_revision=view.catalog_revision,
+        instrument_keys=frozenset({"PF_XBTUSD"}),
+    )
+    result = select(
+        view,
+        fixed=fixed,
+        policy=selection_policy(quotes=("USDT",), top_n=2),
+        previous=None,
+        now_ns=1_000,
+    )
+    assert result.selected == frozenset(
+        {"PF_XBTUSD", "BTCUSDT", "ETHUSDT", "NEWUSDT"}
+    )
     assert result.reason("PF_XBTUSD").fixed is True
 
 
 def test_top_n_exit_grace_prevents_boundary_churn() -> None:
-    previous = selected_top("ALTUSDT", last_selected_ns=100)
-    result = select(updated_catalog_without_alt(), previous=previous, now_ns=120, exit_grace_ns=30)
+    previous = state_with_top_exit("ALTUSDT", top_exit_started_at_ns=100)
+    result = select(
+        updated_catalog_without_alt(),
+        fixed=resolved_empty_fixed_for_current_revision(),
+        policy=selection_policy(exit_grace_ns=30),
+        previous=previous,
+        now_ns=129,
+    )
     assert "ALTUSDT" in result.selected
+    assert result.next_state.entry("ALTUSDT").top_exit_started_at_ns == 100
+    assert "ALTUSDT" not in select_from_result_state(result, now_ns=130).selected
 ```
 
 - [ ] **Step 2: Run and verify selection modules are missing**
@@ -548,7 +952,27 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement persistent catalog provenance and selection reasons**
 
-Persist stable instrument key, all protocol wire symbols, canonical pair, quote/base/settlement, status, lifecycle fields, `tradable_at`, its source, first/last seen, turnover value/method/currency, and raw catalog reference. Compare Top N only within one exchange/market/quote. Never treat contract count as quote turnover. The selector accepts only `ResolvedFixedSelection`, never raw user strings; Task 6 resolves those against a current venue catalog. Fixed instrument keys bypass quote filters. New-listing expiry is `tradable_at + capture_duration`; announcements are hints until the catalog confirms tradability. Return a reason bitset plus rank and admission priority for every instrument.
+Persist stable instrument key, all protocol wire symbols, canonical pair,
+quote/base/settlement, status, lifecycle fields, first/last seen, independent catalog and
+turnover provenance, and the full durable listing-episode state described above. The
+store requires WAL and `synchronous=FULL`, validates its exact versioned schema, retries
+bounded first-open/write contention, and never partially applies a scope snapshot or
+selection checkpoint. Compare Top N only within one exchange/market/quote. Never treat
+contract count as quote turnover. The selector accepts only revision-bound
+`ResolvedFixedSelection`, never raw user strings; Task 6 resolves those against a
+current venue catalog. Fixed keys bypass quote filters but not presence/tradability.
+Return the reason bitset, quote-local rank, admission priority, immutable next state,
+and previous/current deltas for every affected instrument.
+
+Tests cover complete versus partial pagination, authoritative empty handling,
+cross-scope/revision rejection, baseline and relisting episodes across restart, pre-open
+to tradable fallback, repeated terminal evidence, future/old official times, exact
+listing/grace expiry, independent turnover freshness/high-waters, Decimal precision,
+deterministic ties, fixed status validation, repeated refresh without grace extension,
+re-entry/second exit, selection CAS conflicts across concurrent SQLite handles, schema
+tampering, and rollback after injected catalog-result or mid-outbox failures. They also
+prove announcement-only and partial-catalog inputs produce no catalog, selection, or
+outbox mutation.
 
 - [ ] **Step 4: Run selection tests**
 
@@ -559,7 +983,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/selection tests/unit/selection
+git add src/crypto_collector/config/models.py src/crypto_collector/selection tests/unit/config/test_models.py tests/unit/selection
 git commit -m "feat: select fixed top and new symbols"
 ```
 
@@ -573,43 +997,78 @@ git commit -m "feat: select fixed top and new symbols"
 - Test: `tests/unit/selection/test_fixed.py`
 - Test: `tests/unit/config/test_probe_contracts.py`
 
+#### Authoritative Task 6 Contract Clarification
+
+The following rules override the abbreviated examples below:
+
+- Fixed requests are an exact tuple contract. Resolution is market-local: an exact stable key wins, otherwise the canonical pair must have exactly one present, tradable match. Symbol-level `fixed_pairs` are invalid because fixed requests select symbols rather than configure an already selected symbol.
+- Every admission call requires the config SHA. Instrument keys are unique only inside a catalog scope. WS connections are physical exchange-wide resources: reserve fixed demand across all enabled markets first, then allocate whole connection chunks by fixed, new-listing, and Top-N priority. Physical shard indices are unique per egress.
+- REST work is independent of the live WS sticky assignment. Aggregate competing market workloads by logical endpoint and healthy quota group, without multiplying a shared quota-group budget by its egress count. Use exact arithmetic. Reserve the original cadence of deep-snapshot `overload_policy=fail` cohorts, then proportionally stretch flexible cohorts from the remaining budget. If the configured maximum interval is still infeasible, evict only candidates whose selection capacity policy permits degradation, in Top-N/new-listing eviction order, recompute WS and REST allocation, and never evict fixed or selection-capacity `fail` candidates. REST evictions are separate structured evidence with endpoint, depth, cost, requested/max interval, exact available/required rate fractions, reason, and config SHA; they are not represented as fictitious WS slot warnings.
+- A market report labels its repeated physical total as `exchange_capacity_ceiling`; `admission.available_slots` and shards are the scope's actual allocation. A per-market field must never present the full exchange capacity as if every market owned it independently.
+- Provider evidence is immutable, deterministic, and observed inside the request-start/completion window. Endpoint-work evidence carries its own observation time and raw reference. Reports preserve public-time, reachability, resolved date-gate requests, live date-gate evidence, capability-registry SHA, endpoint-budget, endpoint-work, every successful or failed market catalog, raw-reference, selection, admission, shard, and interval-cohort evidence. Provider-registry lookup, identity access, and execution are exchange-local isolation boundaries; failures expose neither provider text nor provider-controlled exception type names.
+- A selected and admitted symbol with deep snapshots enabled requires endpoint work whose kind and depth exactly match its effective symbol configuration. Disabled or capacity-rejected symbols create no deep workload. Different symbol cadences/depths remain separate auditable interval cohorts; the legacy endpoint summary is emitted only when all cohorts have the same requested/effective pair.
+- Date-gated features are disabled unless explicitly configured under `capabilities.date_gated_features.<exchange>.<feature>`. Each enabled request resolves its own `required` policy, applicable markets, archived `available_from`, and `requires_live_probe` into `ProbeRequest`. Availability requires the archived UTC date gate and, when required, an exact live evidence set. Missing or extra live gate evidence is a provider-contract failure; an explicit unavailable optional feature is disabled, while a required one fails the probe.
+- Symbol-level `enabled`, selection, capacity policy, deep depth, cadence, and overload policy are effective inputs. Selection is evaluated under each symbol's final policy and then combined into one scope/revision/config-bound result.
+- Any failed market is reported explicitly. Remaining markets are recomputed from their original selection over exchange-wide WS and REST resources, clearing earlier REST reductions whenever the active market set changes, so no successful report can retain stale admission, empty required intervals, or capacity previously reserved by a failed market. Connection indices are generated only for physical connections actually reserved, never by materializing configured capacity.
+- `ProbeEngine` imports no venue adapter, creates no network client, writes no file, and receives only dependency-injected providers. Plan 04 and Plan 05 own live provider construction.
+
 - [ ] **Step 1: Write failing resolution, admission, and provider-contract tests**
 
 ```python
 def test_capacity_trims_lowest_top_then_latest_new_but_never_fixed() -> None:
     result = admit(
-        candidates=[fixed("BTC"), top("ETH", rank=1), top("ALT", rank=20),
-                    new("NEW1", first_seen_ns=10), new("NEW2", first_seen_ns=20)],
-        slots=3, policy="degrade_low_priority_with_warning")
+        candidates=(
+            fixed("BTC"),
+            top("ETH", rank=1),
+            top("ALT", rank=20),
+            new("NEW1", first_seen_ns=10),
+            new("NEW2", first_seen_ns=20),
+        ),
+        slots=3,
+        config_sha256="c" * 64,
+        policy="degrade_low_priority_with_warning",
+    )
     assert result.admitted == ("BTC", "NEW1", "NEW2")
     assert result.rejected == ("ALT", "ETH")
 
 
 def test_fixed_pairs_over_capacity_always_fail() -> None:
     with pytest.raises(CapacityError, match="fixed pairs"):
-        admit([fixed("BTC"), fixed("ETH")], slots=1,
-              policy="degrade_low_priority_with_warning")
+        admit(
+            (fixed("BTC"), fixed("ETH")),
+            slots=1,
+            config_sha256="c" * 64,
+            policy="degrade_low_priority_with_warning",
+        )
 
 
 def test_canonical_fixed_pair_resolves_to_one_stable_instrument_key() -> None:
-    catalog = fake_catalog(instruments=[instrument("BTC-USDT", canonical_pair="BTC/USDT")])
-    result = resolve_fixed_requests(["BTC/USDT"], catalog)
+    catalog = fake_catalog(
+        instruments=[instrument("BTC-USDT", canonical_pair="BTC/USDT")]
+    )
+    result = resolve_fixed_requests(("BTC/USDT",), catalog)
     assert result.instrument_keys == frozenset({"BTC-USDT"})
 
 
 @pytest.mark.parametrize("request", ["UNKNOWN/USDT", "AMBIGUOUS/USDT"])
-def test_unknown_or_ambiguous_canonical_fixed_pair_fails(request, catalog_with_ambiguity) -> None:
+def test_unknown_or_ambiguous_canonical_fixed_pair_fails(
+    request, catalog_with_ambiguity
+) -> None:
     with pytest.raises(FixedPairResolutionError):
-        resolve_fixed_requests([request], catalog_with_ambiguity)
+        resolve_fixed_requests((request,), catalog_with_ambiguity)
 
 
 @pytest.mark.asyncio
-async def test_probe_engine_is_provider_neutral_and_timestamped(fake_probe_provider) -> None:
+async def test_probe_engine_is_provider_neutral_and_timestamped(
+    fake_probe_provider,
+) -> None:
     result = await ProbeEngine(clock=FakeClock(time_ns=123)).run(
-        config_bundle(), providers={"okx": fake_probe_provider},
+        config_bundle(),
+        providers={"okx": fake_probe_provider},
     )
     assert result.observed_at_ns == 123
-    assert result.exchanges["okx"].selection.fixed.instrument_keys == {"BTC-USDT"}
+    market = result.exchanges["okx"].markets["spot"]
+    assert market.fixed.instrument_keys == frozenset({"BTC-USDT"})
 ```
 
 - [ ] **Step 2: Run and verify resolution/capacity/probe contracts are missing**
@@ -635,7 +1094,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/selection src/crypto_collector/config/probe_contracts.py tests/unit/selection tests/unit/config/test_probe_contracts.py
+git add src/crypto_collector/selection src/crypto_collector/config docs/superpowers/plans/2026-07-31-network-scheduler-selection.md tests/unit/selection tests/unit/config tests/cli/test_config_check.py
 git commit -m "feat: resolve fixed pairs and admit capacity"
 ```
 

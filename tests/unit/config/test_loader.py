@@ -109,6 +109,50 @@ def test_loader_reads_network_fragment_as_root_network_subtree(
     assert loaded.config.network.egress_pool[0].id == "direct"
 
 
+def test_loader_rejects_unknown_explicit_date_gated_feature(
+    config_tree: Path,
+) -> None:
+    root = config_tree / "config.yaml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + """\
+capabilities:
+  date_gated_features:
+    okx:
+      unknown_feature: {}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CapabilityError,
+        match="unknown date-gated capability: okx/unknown_feature",
+    ):
+        load_config(root)
+
+
+def test_loader_rejects_enabled_date_gate_without_applicable_market(
+    config_tree: Path,
+) -> None:
+    root = config_tree / "config.yaml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + """\
+capabilities:
+  date_gated_features:
+    okx:
+      books_rpi: {}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        CapabilityError,
+        match="date-gated capability has no configured applicable market: okx/books_rpi",
+    ):
+        load_config(root)
+
+
 def test_root_network_key_conflicts_with_named_fragment(config_tree: Path) -> None:
     root = config_tree / "config.yaml"
     root.write_text(

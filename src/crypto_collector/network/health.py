@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+EgressHealthKey = tuple[str, str]
+
+
+class _AdmissionMint:
+    __slots__ = ("_claims", "_store_identity")
+
+    _claims: tuple[object, ...]
+    _store_identity: object
+
+    def __init__(self, store_identity: object, claims: tuple[object, ...]) -> None:
+        object.__setattr__(self, "_store_identity", store_identity)
+        object.__setattr__(self, "_claims", claims)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("admission mints are immutable")
+
+    def belongs_to(self, store_identity: object) -> bool:
+        return self._store_identity is store_identity
+
+    def matches(self, claims: tuple[object, ...]) -> bool:
+        return _claim_values_match(self._claims, claims)
+
+
+def _claim_values_match(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, tuple) and isinstance(right, tuple):
+        return len(left) == len(right) and all(
+            _claim_values_match(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if isinstance(left, str) and isinstance(right, str):
+        return str.__eq__(left, right) is True
+    if isinstance(left, int) and isinstance(right, int):
+        return int.__eq__(left, right) is True
+    return left is right
+
+
+def _quota_probe_claims(
+    exchange: str,
+    quota_group: str,
+    restriction_revision: int,
+    probe_after_monotonic_ns: int,
+) -> tuple[object, ...]:
+    return (
+        "quota",
+        exchange,
+        quota_group,
+        restriction_revision,
+        probe_after_monotonic_ns,
+    )
+
+
+def _transport_probe_claims(
+    exchange: str,
+    egress_id: str,
+    restriction_revision: int,
+    probe_after_monotonic_ns: int,
+) -> tuple[object, ...]:
+    return (
+        "transport",
+        exchange,
+        egress_id,
+        restriction_revision,
+        probe_after_monotonic_ns,
+    )
+
+
+def _nonnegative(value: int, *, field_name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class HealthSnapshot:
+    unavailable: frozenset[EgressHealthKey] = field(default_factory=frozenset)
+    probe_eligible: frozenset[EgressHealthKey] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        if not self.probe_eligible <= self.unavailable:
+            raise ValueError("probe-eligible egresses must also be unavailable")
+
+    def is_available(self, exchange: str, egress_id: str) -> bool:
+        return (exchange, egress_id) not in self.unavailable
+
+    def may_probe(self, exchange: str, egress_id: str) -> bool:
+        return (exchange, egress_id) in self.probe_eligible
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class QuotaProbeAdmission:
+    exchange: str
+    quota_group: str
+    restriction_revision: int
+    probe_after_monotonic_ns: int
+    _mint: _AdmissionMint = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.exchange) is not str
+            or not self.exchange
+            or type(self.quota_group) is not str
+            or not self.quota_group
+        ):
+            raise ValueError("quota probe admission keys must be non-empty strings")
+        _nonnegative(self.restriction_revision, field_name="restriction_revision")
+        _nonnegative(
+            self.probe_after_monotonic_ns,
+            field_name="probe monotonic deadline",
+        )
+        if type(self._mint) is not _AdmissionMint or not self._mint.matches(
+            self._claims()
+        ):
+            raise ValueError("quota probe admission does not match minted claims")
+
+    def _claims(self) -> tuple[object, ...]:
+        return _quota_probe_claims(
+            self.exchange,
+            self.quota_group,
+            self.restriction_revision,
+            self.probe_after_monotonic_ns,
+        )
+
+    def _belongs_to(self, store_identity: object) -> bool:
+        return (
+            type(self._mint) is _AdmissionMint
+            and self._mint.matches(self._claims())
+            and self._mint.belongs_to(store_identity)
+        )
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        exchange: str,
+        quota_group: str,
+        restriction_revision: int,
+        probe_after_monotonic_ns: int,
+        store_identity: object,
+    ) -> QuotaProbeAdmission:
+        claims = _quota_probe_claims(
+            exchange,
+            quota_group,
+            restriction_revision,
+            probe_after_monotonic_ns,
+        )
+        return cls(
+            exchange=exchange,
+            quota_group=quota_group,
+            restriction_revision=restriction_revision,
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class TransportProbeAdmission:
+    exchange: str
+    egress_id: str
+    restriction_revision: int
+    probe_after_monotonic_ns: int
+    _mint: _AdmissionMint = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.exchange) is not str
+            or not self.exchange
+            or type(self.egress_id) is not str
+            or not self.egress_id
+        ):
+            raise ValueError("transport probe admission keys must be non-empty strings")
+        _nonnegative(self.restriction_revision, field_name="restriction_revision")
+        _nonnegative(
+            self.probe_after_monotonic_ns,
+            field_name="probe monotonic deadline",
+        )
+        if type(self._mint) is not _AdmissionMint or not self._mint.matches(
+            self._claims()
+        ):
+            raise ValueError("transport probe admission does not match minted claims")
+
+    def _claims(self) -> tuple[object, ...]:
+        return _transport_probe_claims(
+            self.exchange,
+            self.egress_id,
+            self.restriction_revision,
+            self.probe_after_monotonic_ns,
+        )
+
+    def _belongs_to(self, store_identity: object) -> bool:
+        return (
+            type(self._mint) is _AdmissionMint
+            and self._mint.matches(self._claims())
+            and self._mint.belongs_to(store_identity)
+        )
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        exchange: str,
+        egress_id: str,
+        restriction_revision: int,
+        probe_after_monotonic_ns: int,
+        store_identity: object,
+    ) -> TransportProbeAdmission:
+        claims = _transport_probe_claims(
+            exchange,
+            egress_id,
+            restriction_revision,
+            probe_after_monotonic_ns,
+        )
+        return cls(
+            exchange=exchange,
+            egress_id=egress_id,
+            restriction_revision=restriction_revision,
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
+
+
+def _admitted_health_claims(
+    probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...],
+    quota_probe_admissions: tuple[QuotaProbeAdmission, ...],
+    transport_probe_admissions: tuple[TransportProbeAdmission, ...],
+) -> tuple[object, ...]:
+    return (
+        "health",
+        probe_after_monotonic_ns,
+        tuple(
+            (admission, admission._mint, admission._claims())
+            for admission in quota_probe_admissions
+        ),
+        tuple(
+            (admission, admission._mint, admission._claims())
+            for admission in transport_probe_admissions
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedHealth:
+    probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...] = ()
+    quota_probe_admissions: tuple[QuotaProbeAdmission, ...] = ()
+    transport_probe_admissions: tuple[TransportProbeAdmission, ...] = ()
+    _mint: _AdmissionMint | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        keys: set[EgressHealthKey] = set()
+        for key, deadline in self.probe_after_monotonic_ns:
+            if (
+                type(key[0]) is not str
+                or not key[0]
+                or type(key[1]) is not str
+                or not key[1]
+            ):
+                raise ValueError("admitted health keys must be non-empty strings")
+            if key in keys:
+                raise ValueError("admitted health keys must be unique")
+            keys.add(key)
+            _nonnegative(deadline, field_name="probe monotonic deadline")
+        quota_keys = [
+            (admission.exchange, admission.quota_group)
+            for admission in self.quota_probe_admissions
+        ]
+        if len(set(quota_keys)) != len(quota_keys):
+            raise ValueError("quota probe admission keys must be unique")
+        transport_keys = [
+            (admission.exchange, admission.egress_id)
+            for admission in self.transport_probe_admissions
+        ]
+        if len(set(transport_keys)) != len(transport_keys):
+            raise ValueError("transport probe admission keys must be unique")
+        claims = _admitted_health_claims(
+            self.probe_after_monotonic_ns,
+            self.quota_probe_admissions,
+            self.transport_probe_admissions,
+        )
+        if self._mint is None:
+            if (
+                self.probe_after_monotonic_ns
+                or self.quota_probe_admissions
+                or self.transport_probe_admissions
+            ):
+                raise ValueError("non-empty admitted health requires minted claims")
+        elif type(self._mint) is not _AdmissionMint or not self._mint.matches(claims):
+            raise ValueError("admitted health does not match minted claims")
+
+    @classmethod
+    def _minted(
+        cls,
+        *,
+        probe_after_monotonic_ns: tuple[tuple[EgressHealthKey, int], ...],
+        quota_probe_admissions: tuple[QuotaProbeAdmission, ...],
+        transport_probe_admissions: tuple[TransportProbeAdmission, ...],
+        store_identity: object,
+    ) -> AdmittedHealth:
+        claims = _admitted_health_claims(
+            probe_after_monotonic_ns,
+            quota_probe_admissions,
+            transport_probe_admissions,
+        )
+        return cls(
+            probe_after_monotonic_ns=probe_after_monotonic_ns,
+            quota_probe_admissions=quota_probe_admissions,
+            transport_probe_admissions=transport_probe_admissions,
+            _mint=_AdmissionMint(store_identity, claims),
+        )
+
+    def snapshot(self, *, now_monotonic_ns: int) -> HealthSnapshot:
+        now_monotonic_ns = _nonnegative(now_monotonic_ns, field_name="now_monotonic_ns")
+        unavailable = frozenset(key for key, _deadline in self.probe_after_monotonic_ns)
+        probe_eligible = frozenset(
+            key
+            for key, deadline in self.probe_after_monotonic_ns
+            if now_monotonic_ns >= deadline
+        )
+        return HealthSnapshot(
+            unavailable=unavailable,
+            probe_eligible=probe_eligible,
+        )
+
+    def quota_probe(
+        self, *, exchange: str, quota_group: str
+    ) -> QuotaProbeAdmission | None:
+        return next(
+            (
+                admission
+                for admission in self.quota_probe_admissions
+                if admission.exchange == exchange
+                and admission.quota_group == quota_group
+            ),
+            None,
+        )
+
+    def transport_probe(
+        self, *, exchange: str, egress_id: str
+    ) -> TransportProbeAdmission | None:
+        return next(
+            (
+                admission
+                for admission in self.transport_probe_admissions
+                if admission.exchange == exchange and admission.egress_id == egress_id
+            ),
+            None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaState:
+    exchange: str
+    quota_group: str
+    ban_until_unix_ns: int = 0
+    cooldown_until_unix_ns: int = 0
+    current_rate_multiplier: Decimal = Decimal(1)
+    last_reason: str | None = None
+    restriction_revision: int = 0
+
+    @property
+    def restriction_until_unix_ns(self) -> int:
+        return max(self.ban_until_unix_ns, self.cooldown_until_unix_ns)
+
+    @property
+    def requires_probe(self) -> bool:
+        return self.last_reason is not None
+
+
+@dataclass(frozen=True, slots=True)
+class EgressHealthState:
+    exchange: str
+    egress_id: str
+    consecutive_transport_failures: int = 0
+    cooldown_until_unix_ns: int = 0
+    last_success_unix_ns: int | None = None
+    last_latency_ns: int | None = None
+    last_reason: str | None = None
+    restriction_revision: int = 0
+
+    @property
+    def requires_probe(self) -> bool:
+        return self.consecutive_transport_failures > 0

@@ -52,6 +52,7 @@ def _overlay_selection(
         "fixed_pairs",
         "top_n",
         "refresh_interval_ns",
+        "turnover_max_age_ns",
         "exit_grace_ns",
         "capacity_policy",
     ):

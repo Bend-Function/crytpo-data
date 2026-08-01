@@ -94,6 +94,27 @@ def test_routine_rest_has_null_connection_and_structured_metadata() -> None:
     assert row.connection_id is None
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"requested_interval_ns": None},
+        {"effective_interval_ns": None},
+        {
+            "requested_interval_ns": 60_000_000_000,
+            "effective_interval_ns": 30_000_000_000,
+        },
+    ],
+)
+def test_rest_interval_metadata_is_paired_and_never_below_requested(
+    overrides: dict[str, int | None],
+) -> None:
+    values = make_rest_metadata().model_dump()
+    values.update(overrides)
+
+    with pytest.raises(ValidationError, match="interval"):
+        RestMetadata(**values)
+
+
 def test_symbol_data_rejects_missing_instrument_identity() -> None:
     with pytest.raises(ValidationError, match="instrument_key"):
         make_envelope(logical_stream="trade", instrument_key=None, wire_symbol=None)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pickle
 from importlib import resources
 from pathlib import Path
@@ -106,7 +107,7 @@ def test_builtin_registry_contains_the_five_supported_exchanges() -> None:
             "none",
             1000,
         ),
-        ("kraken", "spot", "book", 100, "event_driven", "none", 1000),
+        ("kraken", "spot", "book", 100, "event_driven", "none", 500),
         (
             "kraken",
             "perpetual",
@@ -188,8 +189,33 @@ def test_date_gated_features_capture_known_release_constraints() -> None:
         for feature in bybit.date_gated_features
         if feature.id == "perpetual_full_order_book"
     )
-    assert perpetual_full.available_from is None
+    assert perpetual_full.available_from == "2026-08-11"
     assert perpetual_full.requires_live_probe is True
+
+
+def test_kraken_spot_separates_standard_and_grouped_rest_books() -> None:
+    capability = CapabilityRegistry.load_builtin().for_market("kraken", "spot")
+
+    assert capability.live_book.max_rest_depth == 500
+    assert tuple(
+        (variant.id, variant.max_depth, variant.aggregated)
+        for variant in capability.live_book.rest_book_variants
+    ) == (("grouped_book", 1000, True),)
+
+
+def test_connection_limit_scopes_and_recommendations_match_evidence() -> None:
+    registry = CapabilityRegistry.load_builtin()
+
+    kraken_futures = registry.for_market("kraken", "perpetual")
+    subscription_requests = kraken_futures.connection_limits.subscription_requests
+    assert subscription_requests is not None
+    assert subscription_requests.scope == "connection"
+
+    for market in ("spot", "perpetual"):
+        bitget = registry.for_market("bitget", market)
+        recommended = bitget.connection_limits.recommended_subscriptions_per_connection
+        assert recommended is not None
+        assert recommended < 50
 
 
 def test_capability_digest_uses_validated_content_not_yaml_formatting(
@@ -244,6 +270,22 @@ def test_unsupported_registry_schema_is_rejected(tmp_path: Path) -> None:
         CapabilityRegistry.from_directory(tmp_path)
 
 
+@pytest.mark.parametrize("invalid_version", ["true", "1.0", '"1"', "null"])
+def test_registry_schema_version_requires_an_exact_integer(
+    tmp_path: Path,
+    invalid_version: str,
+) -> None:
+    _write(
+        tmp_path / "invalid.yaml",
+        _BLOCK_RECORD.replace(
+            "schema_version: 1", f"schema_version: {invalid_version}"
+        ),
+    )
+
+    with pytest.raises(CapabilityError, match="schema version.*integer"):
+        CapabilityRegistry.from_directory(tmp_path)
+
+
 def test_unknown_record_fields_are_rejected(tmp_path: Path) -> None:
     _write(tmp_path / "invalid.yaml", _BLOCK_RECORD + "unexpected: true\n")
 
@@ -257,6 +299,35 @@ def test_base_urls_require_a_secure_scheme_and_hostname(tmp_path: Path) -> None:
         _BLOCK_RECORD.replace(
             "https://data-api.binance.vision",
             "https://",
+        ),
+    )
+
+    with pytest.raises(CapabilityError, match="valid https"):
+        CapabilityRegistry.from_directory(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://example.com:bad",
+        "https://example.com:99999",
+        "https://example.com:",
+        "https://exa mple.com",
+        "https://exa%20mple.com",
+        "https://exa\x80mple.com",
+        "https://exa\x9fmple.com",
+        "https://example.com:\\bad",
+    ],
+)
+def test_base_urls_reject_values_network_clients_cannot_parse(
+    tmp_path: Path,
+    invalid_url: str,
+) -> None:
+    _write(
+        tmp_path / "invalid.yaml",
+        _BLOCK_RECORD.replace(
+            "https://data-api.binance.vision",
+            json.dumps(invalid_url),
         ),
     )
 

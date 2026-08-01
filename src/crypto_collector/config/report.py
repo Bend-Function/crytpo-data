@@ -241,14 +241,23 @@ def build_config_report(bundle: ConfigBundle) -> ConfigReport:
                     for pair in scope.selection.fixed_pairs
                 )
 
+        requested_date_gates = config.capabilities.date_gated_features.get(
+            exchange_id, {}
+        )
         date_gates = tuple(
             DateGateDecision(
                 feature=feature.id,
                 markets=feature.markets,
                 available_from=feature.available_from,
-                required=config.capabilities.date_gated_default_required,
+                required=(
+                    config.capabilities.date_gated_default_required
+                    if policy.required is None
+                    else policy.required
+                ),
             )
             for feature in capability.date_gated_features
+            if (policy := requested_date_gates.get(feature.id)) is not None
+            and policy.enabled
         )
         decisions[exchange_id] = ExchangeCapabilityDecision(
             enabled=exchange.enabled,

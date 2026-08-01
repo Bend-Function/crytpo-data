@@ -97,6 +97,38 @@ def _validate_capability_scopes(
 ) -> None:
     known_exchanges = {record.exchange for record in registry.records}
     issues: set[str] = set()
+    for exchange_id, requested_features in sorted(
+        config.capabilities.date_gated_features.items()
+    ):
+        if exchange_id not in known_exchanges:
+            issues.add(f"unknown date-gated capability exchange: {exchange_id}")
+            continue
+        known_features = {
+            feature.id
+            for feature in registry.for_exchange(exchange_id).date_gated_features
+        }
+        for feature_id in sorted(set(requested_features) - known_features):
+            issues.add(f"unknown date-gated capability: {exchange_id}/{feature_id}")
+        configured_markets = set(
+            config.exchanges[exchange_id].markets
+            if exchange_id in config.exchanges
+            else ()
+        )
+        feature_by_id = {
+            feature.id: feature
+            for feature in registry.for_exchange(exchange_id).date_gated_features
+        }
+        for feature_id, policy in sorted(requested_features.items()):
+            feature = feature_by_id.get(feature_id)
+            if (
+                feature is not None
+                and policy.enabled
+                and not configured_markets.intersection(feature.markets)
+            ):
+                issues.add(
+                    "date-gated capability has no configured applicable market: "
+                    f"{exchange_id}/{feature_id}"
+                )
     for exchange_id, exchange in sorted(config.exchanges.items()):
         if exchange_id not in known_exchanges:
             issues.add(f"unknown exchange: {exchange_id}")

@@ -44,6 +44,18 @@ class RestMetadata(FrozenStrictModel):
             raise ValueError(
                 "request_ended_at_ns must not precede request_started_at_ns"
             )
+        requested_interval_ns = self.requested_interval_ns
+        effective_interval_ns = self.effective_interval_ns
+        if (requested_interval_ns is None) != (effective_interval_ns is None):
+            raise ValueError("requested and effective interval metadata must be paired")
+        if (
+            requested_interval_ns is not None
+            and effective_interval_ns is not None
+            and effective_interval_ns < requested_interval_ns
+        ):
+            raise ValueError(
+                "effective interval metadata must not be below requested interval"
+            )
         return self
 
 
