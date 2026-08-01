@@ -1,25 +1,40 @@
 from __future__ import annotations
 
+import errno
 import hashlib
+import os
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
+import zstandard
 from pydantic import ValidationError
 
+import crypto_collector.storage.manifest as manifest_module
+from crypto_collector.domain.envelope import RawEnvelope
 from crypto_collector.domain.json_codec import decode_json
-from crypto_collector.domain.types import CloseReason, Exchange, Market
+from crypto_collector.domain.types import CloseReason, Exchange, Market, Transport
+from crypto_collector.storage.lease import SourceLease, SourceLeaseBusy
 from crypto_collector.storage.manifest import (
     RECOVERY_UNAVAILABLE_FIELDS,
+    CleanupProofEvidenceV1,
+    CleanupProofKind,
     LoadedRawManifest,
     ManifestValidationError,
+    RawManifestReader,
     RawManifestV1,
     RecoverySourceState,
+    SourceDisposition,
+    SourceUnavailable,
     UnsupportedManifestSchema,
     lease_path_for_data,
     load_raw_manifest,
     manifest_path_for_data,
+    validate_local_source,
 )
+from crypto_collector.storage.serialize import encode_envelope
 
 
 def _ns(value: datetime) -> int:
@@ -200,6 +215,16 @@ def test_normal_manifest_canonical_bytes_and_loader_do_not_require_data(
     assert not (tmp_path / "part.jsonl.zst").exists()
 
 
+def test_recovery_control_manifest_uses_normal_measured_schema() -> None:
+    manifest = RawManifestV1.model_validate(
+        normal_manifest_values(close_reason=CloseReason.RECOVERY_CONTROL)
+    )
+
+    assert manifest.close_reason is CloseReason.RECOVERY_CONTROL
+    assert manifest.durability_measurement == "measured"
+    assert manifest.recovery_transaction_id is None
+
+
 @pytest.mark.parametrize("schema_version", [2, 0, True, 1.0, "1"])
 def test_manifest_schema_version_is_independent_and_strict(
     schema_version: object,
@@ -318,6 +343,13 @@ def test_recovery_manifest_requires_exact_reconstructed_and_unavailable_facts() 
             RawManifestV1.model_validate(recovery_manifest_values(**overrides))
 
 
+def test_recovery_manifest_cannot_use_recovery_control_close_reason() -> None:
+    with pytest.raises(ValidationError):
+        RawManifestV1.model_validate(
+            recovery_manifest_values(close_reason=CloseReason.RECOVERY_CONTROL)
+        )
+
+
 def test_owned_control_recovery_keeps_created_at_unavailable() -> None:
     manifest = RawManifestV1.model_validate(owned_control_manifest_values())
     assert manifest.created_at_ns is None
@@ -433,3 +465,366 @@ def test_loader_wraps_unrepresentable_utc_timestamp(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestValidationError):
         load_raw_manifest(path)
+
+
+def _write_readable_part(
+    tmp_path: Path,
+) -> tuple[Path, Path, RawEnvelope, RawManifestV1]:
+    data_root = tmp_path / "data"
+    data_path = data_root / DATA_RELATIVE_PATH
+    data_path.parent.mkdir(parents=True)
+    envelope = RawEnvelope(
+        exchange=Exchange.OKX,
+        market=Market.SPOT,
+        instrument_key="BTC-USDT",
+        wire_symbol="BTC-USDT",
+        logical_stream="trade",
+        native_channel="trades",
+        transport=Transport.WEBSOCKET,
+        event_time_ns=None,
+        event_time_source=None,
+        received_at_ns=FIRST_RECEIVED_NS,
+        monotonic_ns=123,
+        worker_instance_id="worker-1",
+        connection_id="connection-1",
+        connection_generation=1,
+        writer_sequence=7,
+        egress_id="direct-primary",
+        config_sha256="b" * 64,
+        payload={"price": Decimal("1.250")},
+    )
+    frame = zstandard.ZstdCompressor(
+        level=3,
+        write_checksum=True,
+        write_content_size=True,
+    ).compress(encode_envelope(envelope))
+    data_path.write_bytes(frame)
+    manifest = RawManifestV1.model_validate(
+        normal_manifest_values(
+            file_size_bytes=len(frame),
+            file_sha256=hashlib.sha256(frame).hexdigest(),
+            record_count=1,
+            first_received_at_ns=FIRST_RECEIVED_NS,
+            last_received_at_ns=FIRST_RECEIVED_NS,
+            first_event_time_ns=None,
+            last_event_time_ns=None,
+            writer_sequence_first=7,
+            writer_sequence_last=7,
+            durability_sample_count=1,
+        )
+    )
+    manifest_path = data_root / MANIFEST_RELATIVE_PATH
+    manifest_path.write_bytes(manifest.canonical_bytes())
+    return data_root, manifest_path, envelope, manifest
+
+
+def test_local_source_validation_requires_the_exact_held_lease(
+    tmp_path: Path,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    loaded = load_raw_manifest(manifest_path)
+    expected_lease_path = lease_path_for_data(data_root / manifest.data_relative_path)
+
+    with SourceLease.shared(expected_lease_path) as lease:
+        result = validate_local_source(
+            loaded,
+            data_root=data_root,
+            resolver=_MissingResolver(None),
+            lease=lease,
+        )
+    assert result.disposition is SourceDisposition.PRESENT_VERIFIED
+    assert result.cleanup_proof is None
+
+    with (
+        SourceLease.shared(tmp_path / "different.lease") as wrong_lease,
+        pytest.raises(ManifestValidationError, match="lease"),
+    ):
+        validate_local_source(
+            loaded,
+            data_root=data_root,
+            resolver=_MissingResolver(None),
+            lease=wrong_lease,
+        )
+
+
+def test_local_source_validation_rejects_data_hash_mismatch(tmp_path: Path) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    data_path = data_root / manifest.data_relative_path
+    data_path.write_bytes(data_path.read_bytes() + b"corrupt")
+
+    with (
+        SourceLease.shared(lease_path_for_data(data_path)) as lease,
+        pytest.raises(ManifestValidationError, match="size|SHA-256"),
+    ):
+        validate_local_source(
+            load_raw_manifest(manifest_path),
+            data_root=data_root,
+            resolver=_MissingResolver(None),
+            lease=lease,
+        )
+
+
+class _MissingResolver:
+    def __init__(self, evidence: CleanupProofEvidenceV1 | None) -> None:
+        self.evidence = evidence
+        self.calls: list[dict[str, Any]] = []
+
+    def resolve_missing(self, **kwargs: Any) -> CleanupProofEvidenceV1 | None:
+        self.calls.append(kwargs)
+        return self.evidence
+
+
+def _cleanup_evidence(
+    loaded: LoadedRawManifest,
+    *,
+    kind: CleanupProofKind = CleanupProofKind.FINAL_TOMBSTONE,
+) -> CleanupProofEvidenceV1:
+    manifest = loaded.manifest
+    return CleanupProofEvidenceV1(
+        schema_version=1,
+        kind=kind,
+        proof_relative_path="cleanup/okx/proof.json",
+        proof_size_bytes=10,
+        proof_sha256="d" * 64,
+        source_manifest_relative_path=manifest.manifest_relative_path,
+        source_manifest_sha256=loaded.sha256,
+        source_data_relative_path=manifest.data_relative_path,
+        source_data_size_bytes=manifest.file_size_bytes,
+        source_data_sha256=manifest.file_sha256,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (CleanupProofKind.DURABLE_INTENT, SourceDisposition.CLEANUP_INTENT),
+        (CleanupProofKind.FINAL_TOMBSTONE, SourceDisposition.CLEANUP_TOMBSTONE),
+    ],
+)
+def test_missing_source_maps_only_exact_cleanup_evidence(
+    tmp_path: Path,
+    kind: CleanupProofKind,
+    expected: SourceDisposition,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    (data_root / manifest.data_relative_path).unlink()
+    loaded = load_raw_manifest(manifest_path)
+    evidence = _cleanup_evidence(loaded, kind=kind)
+
+    with SourceLease.shared(
+        lease_path_for_data(data_root / manifest.data_relative_path)
+    ) as lease:
+        result = validate_local_source(
+            loaded,
+            data_root=data_root,
+            resolver=_MissingResolver(evidence),
+            lease=lease,
+            expected_cleanup_proof=evidence,
+        )
+
+    assert result.disposition is expected
+    assert result.cleanup_proof == evidence
+
+
+def test_missing_source_without_proof_is_unexplained(tmp_path: Path) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    (data_root / manifest.data_relative_path).unlink()
+    loaded = load_raw_manifest(manifest_path)
+
+    with SourceLease.shared(
+        lease_path_for_data(data_root / manifest.data_relative_path)
+    ) as lease:
+        result = validate_local_source(
+            loaded,
+            data_root=data_root,
+            resolver=_MissingResolver(None),
+            lease=lease,
+        )
+
+    assert result.disposition is SourceDisposition.MISSING_UNEXPLAINED
+    assert result.cleanup_proof is None
+
+
+def test_raw_manifest_reader_streams_rows_while_holding_shared_lease(
+    tmp_path: Path,
+) -> None:
+    data_root, manifest_path, envelope, manifest = _write_readable_part(tmp_path)
+    lease_path = lease_path_for_data(data_root / manifest.data_relative_path)
+
+    with RawManifestReader(manifest_path) as reader:
+        with pytest.raises(SourceLeaseBusy):
+            SourceLease.exclusive(lease_path, blocking=False)
+        assert list(reader) == [envelope]
+
+    with SourceLease.exclusive(lease_path, blocking=False):
+        pass
+
+
+def _track_data_file_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    data_path: Path,
+) -> list[int]:
+    original = manifest_module._open_regular_no_follow
+    opened: list[int] = []
+
+    def tracked(path: Path) -> tuple[int, Path]:
+        fd, absolute = original(path)
+        if absolute == data_path:
+            opened.append(fd)
+        return fd, absolute
+
+    monkeypatch.setattr(manifest_module, "_open_regular_no_follow", tracked)
+    return opened
+
+
+def _assert_fd_is_closed(fd: int) -> None:
+    with pytest.raises(OSError) as captured:
+        os.fstat(fd)
+    assert captured.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("failure_point", ["hash", "fdopen", "zstd_reader"])
+def test_raw_manifest_reader_enter_failure_closes_fd_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    data_path = data_root / manifest.data_relative_path
+    lease_path = lease_path_for_data(data_path)
+    opened = _track_data_file_opens(monkeypatch, data_path)
+    retained_data_files: list[Any] = []
+
+    if failure_point == "hash":
+        original_hash = manifest_module._hash_fd
+        hash_calls = 0
+
+        def fail_second_hash(fd: int) -> tuple[int, str]:
+            nonlocal hash_calls
+            hash_calls += 1
+            if hash_calls == 2:
+                raise RuntimeError("injected hash failure")
+            return original_hash(fd)
+
+        monkeypatch.setattr(manifest_module, "_hash_fd", fail_second_hash)
+    elif failure_point == "fdopen":
+
+        def fail_fdopen(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected fdopen failure")
+
+        monkeypatch.setattr(manifest_module.os, "fdopen", fail_fdopen)
+    else:
+        original_fdopen = manifest_module.os.fdopen
+
+        def retain_fdopen(*args: Any, **kwargs: Any) -> Any:
+            data_file = original_fdopen(*args, **kwargs)
+            retained_data_files.append(data_file)
+            return data_file
+
+        class FailingDecompressor:
+            def stream_reader(self, *_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("injected zstd_reader failure")
+
+        monkeypatch.setattr(
+            manifest_module.zstandard,
+            "ZstdDecompressor",
+            FailingDecompressor,
+        )
+        monkeypatch.setattr(manifest_module.os, "fdopen", retain_fdopen)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        RawManifestReader(manifest_path).__enter__()
+
+    assert len(opened) == 2
+    _assert_fd_is_closed(opened[-1])
+    assert not retained_data_files or retained_data_files[0].closed
+    with SourceLease.exclusive(lease_path, blocking=False):
+        pass
+
+
+def test_raw_manifest_reader_buffer_initialization_failure_closes_zstd_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    data_path = data_root / manifest.data_relative_path
+    lease_path = lease_path_for_data(data_path)
+    opened = _track_data_file_opens(monkeypatch, data_path)
+    retained_data_files: list[Any] = []
+    original_fdopen = manifest_module.os.fdopen
+
+    def retain_fdopen(*args: Any, **kwargs: Any) -> Any:
+        data_file = original_fdopen(*args, **kwargs)
+        retained_data_files.append(data_file)
+        return data_file
+
+    class TrackingZstdReader:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    zstd_reader = TrackingZstdReader()
+
+    class TrackingDecompressor:
+        def stream_reader(
+            self,
+            *_args: object,
+            **_kwargs: object,
+        ) -> TrackingZstdReader:
+            return zstd_reader
+
+    def fail_buffered_reader(_raw: object) -> None:
+        raise RuntimeError("injected buffered reader failure")
+
+    monkeypatch.setattr(
+        manifest_module.zstandard,
+        "ZstdDecompressor",
+        TrackingDecompressor,
+    )
+    monkeypatch.setattr(manifest_module.os, "fdopen", retain_fdopen)
+    monkeypatch.setattr(manifest_module.io, "BufferedReader", fail_buffered_reader)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        RawManifestReader(manifest_path).__enter__()
+
+    assert zstd_reader.closed
+    assert retained_data_files[0].closed
+    assert len(opened) == 2
+    _assert_fd_is_closed(opened[-1])
+    with SourceLease.exclusive(lease_path, blocking=False):
+        pass
+
+
+def test_raw_manifest_reader_reports_missing_data_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    (data_root / manifest.data_relative_path).unlink()
+
+    with pytest.raises(SourceUnavailable), RawManifestReader(manifest_path):
+        pass
+
+
+def test_raw_manifest_reader_rejects_manifest_at_wrong_root(tmp_path: Path) -> None:
+    _data_root, manifest_path, _envelope, _manifest = _write_readable_part(tmp_path)
+    displaced = tmp_path / "displaced.manifest.json"
+    displaced.write_bytes(manifest_path.read_bytes())
+
+    with (
+        pytest.raises(ManifestValidationError, match="path"),
+        RawManifestReader(displaced),
+    ):
+        pass
+
+
+def test_source_reader_contract_is_exported_from_storage_package() -> None:
+    from crypto_collector import storage
+
+    assert storage.CleanupProofEvidenceV1 is CleanupProofEvidenceV1
+    assert storage.RawManifestReader is RawManifestReader
+    assert storage.SourceDisposition is SourceDisposition
+    assert storage.SourceLease is SourceLease
+    assert storage.decode_envelope_jsonl.__name__ == "decode_envelope_jsonl"
+    assert storage.validate_local_source is validate_local_source

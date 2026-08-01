@@ -1,9 +1,27 @@
 from enum import Enum
 
 from crypto_collector.domain.envelope import RawEnvelope
-from crypto_collector.domain.json_codec import encode_json, validate_json_payload
+from crypto_collector.domain.json_codec import (
+    decode_json,
+    encode_json,
+    validate_json_payload,
+)
+from crypto_collector.domain.types import (
+    CoverageMode,
+    Exchange,
+    IntegrityMode,
+    Market,
+    Transport,
+)
 
 _ENUM_FIELDS = ("exchange", "market", "transport", "integrity_mode", "coverage")
+_ENUM_TYPES = {
+    "exchange": Exchange,
+    "market": Market,
+    "transport": Transport,
+    "integrity_mode": IntegrityMode,
+    "coverage": CoverageMode,
+}
 
 
 def encode_envelope(envelope: RawEnvelope) -> bytes:
@@ -20,3 +38,20 @@ def encode_envelope(envelope: RawEnvelope) -> bytes:
     validate_json_payload(json_domain_wire)
     RawEnvelope.model_validate(wire)
     return encode_json(wire) + b"\n"
+
+
+def decode_envelope_jsonl(line: bytes) -> RawEnvelope:
+    if type(line) is not bytes:
+        raise TypeError("raw envelope line must be bytes")
+    if not line.endswith(b"\n"):
+        raise ValueError("raw envelope line must end with newline")
+    wire = decode_json(line[:-1])
+    if type(wire) is not dict:
+        raise ValueError("raw envelope line must contain one JSON object")
+    for field, enum_type in _ENUM_TYPES.items():
+        if wire.get(field) is not None:
+            wire[field] = enum_type(wire[field])
+    return RawEnvelope.model_validate(wire)
+
+
+__all__ = ["decode_envelope_jsonl", "encode_envelope"]

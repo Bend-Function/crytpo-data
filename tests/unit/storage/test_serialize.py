@@ -8,9 +8,15 @@ import pytest
 
 from crypto_collector.domain.envelope import RawEnvelope
 from crypto_collector.domain.json_codec import decode_json
-from crypto_collector.domain.types import Exchange, Market, Transport
+from crypto_collector.domain.types import (
+    CoverageMode,
+    Exchange,
+    IntegrityMode,
+    Market,
+    Transport,
+)
 from crypto_collector.storage.models import AcceptedRecord
-from crypto_collector.storage.serialize import encode_envelope
+from crypto_collector.storage.serialize import decode_envelope_jsonl, encode_envelope
 
 
 def make_envelope(**overrides: Any) -> RawEnvelope:
@@ -58,6 +64,38 @@ def test_decimal_is_encoded_as_a_json_number_and_round_trips() -> None:
     assert b'"ratio":0.100' in encoded
     assert b'"ratio":"0.100"' not in encoded
     assert decode_json(encoded)["payload"]["ratio"] == Decimal("0.100")
+
+
+def test_public_decoder_preserves_decimal_payload_and_strict_enums() -> None:
+    envelope = make_envelope(
+        integrity_mode=IntegrityMode.SEQUENCE_VERIFIED,
+        coverage=CoverageMode.COMPLETE,
+        payload={"ratio": Decimal("0.100")},
+    )
+
+    decoded = decode_envelope_jsonl(encode_envelope(envelope))
+
+    assert decoded == envelope
+    assert decoded.exchange is Exchange.OKX
+    assert decoded.market is Market.SPOT
+    assert decoded.transport is Transport.WEBSOCKET
+    assert decoded.integrity_mode is IntegrityMode.SEQUENCE_VERIFIED
+    assert decoded.coverage is CoverageMode.COMPLETE
+    assert decoded.payload["ratio"] == Decimal("0.100")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"{}",
+        b"[]\n",
+        b"{}\n{}\n",
+    ],
+    ids=["missing-newline", "not-object", "multiple-jsonl-rows"],
+)
+def test_public_decoder_rejects_non_single_jsonl_object(line: bytes) -> None:
+    with pytest.raises(ValueError):
+        decode_envelope_jsonl(line)
 
 
 @pytest.mark.parametrize("bad", [0.1, b"bytes", object()])

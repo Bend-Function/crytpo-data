@@ -460,6 +460,70 @@ after all owned jobs complete; no path uses the process default executor.
 
 ### Frozen public models and lifecycle
 
+#### Task 6 persisted-format closure (2026-08-01)
+
+The following rules close ambiguities found before Task 6 implementation and are
+normative for every recovery journal written by V1:
+
+- `planned_data_generation_id` is the lowercase canonical UUIDv5 of the exact
+  UTF-8 `planned_data_relative_path`, using namespace UUID
+  `54c28b47-77d8-5f40-a39d-486f57a98f44`. This rule applies to both newly allocated
+  recovered parts and retained closed orphans. Validation parses the canonical part
+  path, verifies its scope/hour/`part_start_ns`/sequence structure, and recomputes the
+  UUIDv5; the intent therefore needs no duplicate allocator fields. Live generations
+  and the service-owned recovery-control carrier remain separately allocated identities
+  frozen by their owning service/journal facts.
+- A whole-source quarantine destination is exactly
+  `quarantine/<source_relative_path>.whole`; a bad suffix accompanying a recovered
+  prefix is exactly `quarantine/<source_relative_path>.bad-tail`. Both are relative to
+  `data_root`, are published with no-replace, and are accepted on replay only after an
+  exact intent-bound size/hash check.
+- The production implementation is named `PosixRecoveryBackend`. Tests may inject the
+  `RecoveryBackend` protocol but runtime constructs this concrete backend by default.
+- Shared public storage exceptions live in `storage.errors`; `raw_writer`, `manifest`,
+  `recovery`, and the package root re-export the same class objects rather than defining
+  compatible-looking copies.
+- Same-process recovery control carriers close with the normal measured-manifest reason
+  `CloseReason.RECOVERY_CONTROL`; their durability trigger is independently
+  `DurabilityTrigger.RECOVERY`. A carrier reconstructed by fresh-process ownership
+  replay uses the frozen contingency manifest with `CloseReason.RECOVERY` and
+  unavailable durability fields.
+
+The exact recovery control payload is generated from this strict model and then passed
+to `NativeEventDraft` as `model_dump(mode="json")`; no `storage_association` member is
+embedded. The service constructs the optional association only from the journal-bound
+`PendingRecoveryControl.target` at acceptance.
+
+```python
+class RecoveryControlPayloadV1(FrozenStrictModel):
+    schema_version: Literal[1] = 1
+    kind: Literal["recovery_reconciled"] = "recovery_reconciled"
+    recovery_control_event_id: NonEmptyString
+    transaction_id: CanonicalUuid
+    source_state: RecoverySourceState
+    source_disposition: RecoverySourceDisposition
+    source_market: Market | None
+    source_instrument_key: NonEmptyString | None
+    source_logical_stream: NonEmptyString
+    source_relative_path: NormalizedDataRelativePath
+    source_sha256: Sha256
+    recovered_generation_id: NonEmptyString | None
+    recovered_relative_path: NormalizedDataRelativePath | None
+    recovered_sha256: Sha256 | None
+    quarantined_relative_path: NormalizedDataRelativePath | None
+    quarantined_sha256: Sha256 | None
+    informational_only: bool
+    affected_markets: tuple[Market, ...]
+```
+
+The recovered generation/path/SHA group is all present or all `None`; the quarantine
+path/SHA pair is likewise paired. `_control` source context requires null market and
+instrument with empty `affected_markets`; every other source requires a market and
+`affected_markets == (source_market,)`. Instrument nullability follows the existing
+market-scoped stream rule. `informational_only` is true exactly for
+`LEGITIMATELY_MISSING`. The payload fields, declared order, nulls, and arrays are part of
+the V1 wire contract; consumers use `recovery_control_event_id` as the idempotency key.
+
 Plan 02 owns these public contracts in their canonical modules. Later plans import
 them and do not redefine compatible-looking copies.
 
@@ -3508,9 +3572,13 @@ git commit -m "feat: close immutable raw manifests"
 ### Task 6: Crash Recovery, Orphan Reconciliation, and Source Leases
 
 **Files:**
+- Modify: `src/crypto_collector/domain/types.py`
 - Modify: `src/crypto_collector/storage/__init__.py`
+- Create: `src/crypto_collector/storage/errors.py`
+- Modify: `src/crypto_collector/storage/durability.py`
 - Modify: `src/crypto_collector/storage/serialize.py`
 - Modify: `src/crypto_collector/storage/manifest.py`
+- Modify: `src/crypto_collector/storage/raw_writer.py`
 - Create: `src/crypto_collector/storage/recovery.py`
 - Create: `src/crypto_collector/storage/lease.py`
 - Create: `src/crypto_collector/storage/service.py`

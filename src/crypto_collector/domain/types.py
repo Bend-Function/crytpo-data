@@ -44,3 +44,4 @@ class CloseReason(StrEnum):
     CONFIG_RELOAD = "config_reload"
     SHUTDOWN = "shutdown"
     RECOVERY = "recovery"
+    RECOVERY_CONTROL = "recovery_control"

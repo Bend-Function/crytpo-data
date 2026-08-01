@@ -29,6 +29,7 @@ from crypto_collector.storage.durability import (
     WriterCriticalError,
     WriterCriticalReason,
 )
+from crypto_collector.storage.errors import PublicationConflict
 from crypto_collector.storage.layout import raw_partial_path
 from crypto_collector.storage.manifest import RawManifestV1, manifest_path_for_data
 from crypto_collector.storage.models import (
@@ -47,13 +48,6 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _RENAME_NOREPLACE = 1
 _HASH_CHUNK_BYTES = 1024 * 1024
-
-
-class PublicationConflict(RuntimeError):
-    def __init__(self, source: Path, destination: Path, message: str) -> None:
-        self.source = source
-        self.destination = destination
-        super().__init__(message)
 
 
 class NoReplaceCapability(StrEnum):
@@ -549,6 +543,7 @@ _CLOSE_TRIGGER = {
     CloseReason.CONFIG_RELOAD: DurabilityTrigger.CONFIG,
     CloseReason.SHUTDOWN: DurabilityTrigger.SHUTDOWN,
     CloseReason.RECOVERY: DurabilityTrigger.RECOVERY,
+    CloseReason.RECOVERY_CONTROL: DurabilityTrigger.RECOVERY,
 }
 _CONTROL_KIND_COUNTER = {
     "gap_detected": "gap_count",

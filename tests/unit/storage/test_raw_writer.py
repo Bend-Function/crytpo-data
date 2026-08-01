@@ -63,6 +63,12 @@ _BASE_NS = int(datetime(2026, 7, 31, tzinfo=UTC).timestamp()) * 1_000_000_000
 _ResultT = TypeVar("_ResultT")
 
 
+def test_recovery_control_close_uses_recovery_durability_trigger() -> None:
+    assert raw_writer_module._CLOSE_TRIGGER[CloseReason.RECOVERY_CONTROL] is (
+        DurabilityTrigger.RECOVERY
+    )
+
+
 class QueueCompletionSink:
     def __init__(self, messages: asyncio.Queue[object]) -> None:
         self._messages = messages

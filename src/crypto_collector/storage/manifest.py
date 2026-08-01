@@ -1,25 +1,41 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self, TypeVar
+from typing import Annotated, BinaryIO, Literal, Protocol, Self, TypeVar, cast
 
+import zstandard
 from pydantic import BeforeValidator, Field, ValidationError, model_validator
 
-from crypto_collector.domain.envelope import MARKET_SCOPED_STREAMS, FrozenStrictModel
+from crypto_collector.domain.envelope import (
+    MARKET_SCOPED_STREAMS,
+    FrozenStrictModel,
+    RawEnvelope,
+)
 from crypto_collector.domain.json_codec import encode_json
 from crypto_collector.domain.paths import encode_instrument_key
 from crypto_collector.domain.types import CloseReason, Exchange, Market
+from crypto_collector.storage.errors import SourceUnavailable
+from crypto_collector.storage.lease import (
+    SourceLease,
+    _normalized_absolute_path,
+    _open_regular_no_follow,
+)
 from crypto_collector.storage.models import (
     CanonicalUuid,
     NonEmptyString,
     NormalizedDataRelativePath,
+    NormalizedStateRelativePath,
     Sha256,
 )
+from crypto_collector.storage.serialize import decode_envelope_jsonl
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveInt = Annotated[int, Field(gt=0)]
@@ -480,6 +496,58 @@ class ManifestValidationError(ValueError):
     pass
 
 
+class SourceDisposition(StrEnum):
+    PRESENT_VERIFIED = "present_verified"
+    CLEANUP_INTENT = "cleanup_intent"
+    CLEANUP_TOMBSTONE = "cleanup_tombstone"
+    MISSING_UNEXPLAINED = "missing_unexplained"
+
+
+class CleanupProofKind(StrEnum):
+    DURABLE_INTENT = "durable_intent"
+    FINAL_TOMBSTONE = "final_tombstone"
+
+
+class CleanupProofEvidenceV1(FrozenStrictModel):
+    schema_version: ManifestSchemaVersion1 = 1
+    kind: CleanupProofKind
+    proof_relative_path: NormalizedStateRelativePath
+    proof_size_bytes: PositiveInt
+    proof_sha256: Sha256
+    source_manifest_relative_path: NormalizedDataRelativePath
+    source_manifest_sha256: Sha256
+    source_data_relative_path: NormalizedDataRelativePath
+    source_data_size_bytes: PositiveInt
+    source_data_sha256: Sha256
+
+
+@dataclass(frozen=True, slots=True)
+class LocalSourceValidation:
+    disposition: SourceDisposition
+    cleanup_proof: CleanupProofEvidenceV1 | None
+
+    def __post_init__(self) -> None:
+        if type(self.disposition) is not SourceDisposition:
+            raise TypeError("source disposition must be SourceDisposition")
+        proof_expected = self.disposition in {
+            SourceDisposition.CLEANUP_INTENT,
+            SourceDisposition.CLEANUP_TOMBSTONE,
+        }
+        if proof_expected != (self.cleanup_proof is not None):
+            raise ValueError("cleanup proof presence does not match source disposition")
+
+
+class SourceDispositionResolver(Protocol):
+    def resolve_missing(
+        self,
+        *,
+        loaded: LoadedRawManifest,
+        data_path: Path,
+        expected_data_sha256: str,
+        expected_proof: CleanupProofEvidenceV1 | None = None,
+    ) -> CleanupProofEvidenceV1 | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class LoadedRawManifest:
     path: Path
@@ -499,10 +567,43 @@ class LoadedRawManifest:
             raise ValueError("loaded manifest SHA-256 does not match canonical bytes")
 
 
+def _read_fd_bytes(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(fd, 1024 * 1024)
+        except InterruptedError:
+            continue
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _hash_fd(fd: int) -> tuple[int, str]:
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        try:
+            chunk = os.read(fd, 1024 * 1024)
+        except InterruptedError:
+            continue
+        if not chunk:
+            os.lseek(fd, 0, os.SEEK_SET)
+            return size, digest.hexdigest()
+        size += len(chunk)
+        digest.update(chunk)
+
+
 def load_raw_manifest(path: Path) -> LoadedRawManifest:
     if not isinstance(path, Path):
         raise TypeError("manifest path must be Path")
-    source = path.read_bytes()
+    fd, absolute = _open_regular_no_follow(path)
+    try:
+        source = _read_fd_bytes(fd)
+    finally:
+        os.close(fd)
     try:
         manifest = RawManifestV1.model_validate_json(source)
     except UnsupportedManifestSchema:
@@ -513,21 +614,389 @@ def load_raw_manifest(path: Path) -> LoadedRawManifest:
     if source != canonical:
         raise ManifestValidationError("raw manifest bytes are not canonical")
     return LoadedRawManifest(
-        path=path,
+        path=absolute,
         manifest=manifest,
         canonical_bytes=canonical,
         sha256=hashlib.sha256(canonical).hexdigest(),
     )
 
 
+def _expected_manifest_path(loaded: LoadedRawManifest, data_root: Path) -> Path:
+    if not isinstance(data_root, Path):
+        raise TypeError("data_root must be Path")
+    root = _normalized_absolute_path(data_root / "root-sentinel").parent
+    expected = root / loaded.manifest.manifest_relative_path
+    if loaded.path != expected:
+        raise ManifestValidationError(
+            "loaded manifest path does not match manifest_relative_path"
+        )
+    return expected
+
+
+def _validate_cleanup_evidence(
+    evidence: CleanupProofEvidenceV1,
+    *,
+    loaded: LoadedRawManifest,
+    expected_proof: CleanupProofEvidenceV1 | None,
+) -> None:
+    if type(evidence) is not CleanupProofEvidenceV1:
+        raise ManifestValidationError("cleanup resolver returned invalid evidence")
+    manifest = loaded.manifest
+    observed_binding = (
+        evidence.source_manifest_relative_path,
+        evidence.source_manifest_sha256,
+        evidence.source_data_relative_path,
+        evidence.source_data_size_bytes,
+        evidence.source_data_sha256,
+    )
+    expected_binding = (
+        manifest.manifest_relative_path,
+        loaded.sha256,
+        manifest.data_relative_path,
+        manifest.file_size_bytes,
+        manifest.file_sha256,
+    )
+    if observed_binding != expected_binding:
+        raise ManifestValidationError("cleanup proof does not bind the exact source")
+    if expected_proof is not None and evidence != expected_proof:
+        raise ManifestValidationError("cleanup proof differs from frozen evidence")
+
+
+def validate_local_source(
+    loaded: LoadedRawManifest,
+    *,
+    data_root: Path,
+    resolver: SourceDispositionResolver,
+    lease: SourceLease,
+    expected_cleanup_proof: CleanupProofEvidenceV1 | None = None,
+) -> LocalSourceValidation:
+    if type(loaded) is not LoadedRawManifest:
+        raise TypeError("loaded must be LoadedRawManifest")
+    if not isinstance(lease, SourceLease):
+        raise TypeError("lease must be SourceLease")
+    _expected_manifest_path(loaded, data_root)
+    root = _normalized_absolute_path(data_root / "root-sentinel").parent
+    data_path = root / loaded.manifest.data_relative_path
+    expected_lease_path = lease_path_for_data(data_path)
+    try:
+        lease._assert_held_for(expected_lease_path)
+    except (RuntimeError, ValueError) as error:
+        raise ManifestValidationError(
+            "source lease does not bind this manifest"
+        ) from error
+
+    try:
+        fd, _ = _open_regular_no_follow(data_path)
+    except FileNotFoundError:
+        evidence = resolver.resolve_missing(
+            loaded=loaded,
+            data_path=data_path,
+            expected_data_sha256=loaded.manifest.file_sha256,
+            expected_proof=expected_cleanup_proof,
+        )
+        if evidence is None:
+            return LocalSourceValidation(
+                disposition=SourceDisposition.MISSING_UNEXPLAINED,
+                cleanup_proof=None,
+            )
+        _validate_cleanup_evidence(
+            evidence,
+            loaded=loaded,
+            expected_proof=expected_cleanup_proof,
+        )
+        disposition = (
+            SourceDisposition.CLEANUP_INTENT
+            if evidence.kind is CleanupProofKind.DURABLE_INTENT
+            else SourceDisposition.CLEANUP_TOMBSTONE
+        )
+        return LocalSourceValidation(
+            disposition=disposition,
+            cleanup_proof=evidence,
+        )
+
+    try:
+        size, sha256 = _hash_fd(fd)
+    finally:
+        os.close(fd)
+    if size != loaded.manifest.file_size_bytes:
+        raise ManifestValidationError("local source size does not match its manifest")
+    if sha256 != loaded.manifest.file_sha256:
+        raise ManifestValidationError(
+            "local source SHA-256 does not match its manifest"
+        )
+    return LocalSourceValidation(
+        disposition=SourceDisposition.PRESENT_VERIFIED,
+        cleanup_proof=None,
+    )
+
+
+class _NoCleanupProofResolver:
+    def resolve_missing(
+        self,
+        *,
+        loaded: LoadedRawManifest,
+        data_path: Path,
+        expected_data_sha256: str,
+        expected_proof: CleanupProofEvidenceV1 | None = None,
+    ) -> None:
+        return None
+
+
+class RawManifestReader:
+    def __init__(self, manifest_path: Path) -> None:
+        if not isinstance(manifest_path, Path):
+            raise TypeError("manifest_path must be Path")
+        self.manifest_path = _normalized_absolute_path(manifest_path)
+        self._loaded: LoadedRawManifest | None = None
+        self._lease: SourceLease | None = None
+        self._data_file: BinaryIO | None = None
+        self._zstd_reader: BinaryIO | None = None
+        self._reader: BinaryIO | None = None
+        self._done = False
+        self._rows: list[RawEnvelope] = []
+
+    @staticmethod
+    def _infer_data_root(loaded: LoadedRawManifest) -> Path:
+        suffix = Path(loaded.manifest.manifest_relative_path).parts
+        parts = loaded.path.parts
+        if len(parts) <= len(suffix) or tuple(parts[-len(suffix) :]) != suffix:
+            raise ManifestValidationError(
+                "manifest path does not end with manifest_relative_path"
+            )
+        return Path(*parts[: -len(suffix)])
+
+    def __enter__(self) -> Self:
+        if self._lease is not None:
+            raise RuntimeError("raw manifest reader is already entered")
+        loaded = load_raw_manifest(self.manifest_path)
+        data_root = self._infer_data_root(loaded)
+        data_path = data_root / loaded.manifest.data_relative_path
+        lease = SourceLease.shared(lease_path_for_data(data_path))
+        fd: int | None = None
+        data_file: BinaryIO | None = None
+        zstd_reader: BinaryIO | None = None
+        reader: BinaryIO | None = None
+        try:
+            validation = validate_local_source(
+                loaded,
+                data_root=data_root,
+                resolver=_NoCleanupProofResolver(),
+                lease=lease,
+            )
+            if validation.disposition is not SourceDisposition.PRESENT_VERIFIED:
+                raise SourceUnavailable(
+                    f"raw source is unavailable: {loaded.manifest.data_relative_path}"
+                )
+            fd, _ = _open_regular_no_follow(data_path)
+            size, sha256 = _hash_fd(fd)
+            if (
+                size != loaded.manifest.file_size_bytes
+                or sha256 != loaded.manifest.file_sha256
+            ):
+                raise ManifestValidationError(
+                    "local source changed after manifest validation"
+                )
+            data_file = os.fdopen(fd, "rb", closefd=True)
+            fd = None
+            zstd_reader_impl = zstandard.ZstdDecompressor().stream_reader(
+                data_file,
+                read_across_frames=True,
+            )
+            zstd_reader = cast(BinaryIO, zstd_reader_impl)
+            reader = io.BufferedReader(zstd_reader_impl)
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            for resource in (reader, zstd_reader, data_file):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    cleanup_errors.append(cleanup_error)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    cleanup_errors.append(cleanup_error)
+            try:
+                lease.release()
+            except BaseException as cleanup_error:  # noqa: BLE001
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                error.add_note(
+                    "reader cleanup also failed: "
+                    + ", ".join(type(item).__name__ for item in cleanup_errors)
+                )
+            raise
+        assert data_file is not None
+        assert zstd_reader is not None
+        assert reader is not None
+        self._loaded = loaded
+        self._lease = lease
+        self._data_file = data_file
+        self._zstd_reader = zstd_reader
+        self._reader = reader
+        self._done = False
+        self._rows = []
+        return self
+
+    def __iter__(self) -> Iterator[RawEnvelope]:
+        if self._reader is None:
+            raise RuntimeError("raw manifest reader is not entered")
+        return self
+
+    def __next__(self) -> RawEnvelope:
+        reader = self._reader
+        loaded = self._loaded
+        if reader is None or loaded is None:
+            raise RuntimeError("raw manifest reader is not entered")
+        if self._done:
+            raise StopIteration
+        try:
+            line = reader.readline()
+            if not line:
+                self._validate_complete_rows(loaded.manifest)
+                self._done = True
+                raise StopIteration
+            envelope = decode_envelope_jsonl(line)
+            self._validate_row_identity(envelope, loaded.manifest)
+        except StopIteration:
+            raise
+        except (OSError, ValueError, zstandard.ZstdError) as error:
+            raise ManifestValidationError("raw source rows are invalid") from error
+        self._rows.append(envelope)
+        if len(self._rows) > loaded.manifest.record_count:
+            raise ManifestValidationError("raw source has more rows than its manifest")
+        return envelope
+
+    def _validate_row_identity(
+        self,
+        envelope: RawEnvelope,
+        manifest: RawManifestV1,
+    ) -> None:
+        expected = (
+            manifest.exchange,
+            manifest.market,
+            manifest.instrument_key,
+            manifest.logical_stream,
+            manifest.worker_instance_id,
+            manifest.config_sha256,
+        )
+        observed = (
+            envelope.exchange,
+            envelope.market,
+            envelope.instrument_key,
+            envelope.logical_stream,
+            envelope.worker_instance_id,
+            envelope.config_sha256,
+        )
+        if observed != expected:
+            raise ManifestValidationError(
+                "raw row identity does not match its manifest"
+            )
+        if self._rows and envelope.writer_sequence <= self._rows[-1].writer_sequence:
+            raise ManifestValidationError("raw writer sequences are not increasing")
+
+    def _validate_complete_rows(self, manifest: RawManifestV1) -> None:
+        rows = self._rows
+        if len(rows) != manifest.record_count:
+            raise ManifestValidationError(
+                "raw source row count does not match manifest"
+            )
+        if not rows:
+            raise ManifestValidationError("raw source must contain at least one row")
+        event_times = [
+            row.event_time_ns for row in rows if row.event_time_ns is not None
+        ]
+        requested = {
+            row.rest_metadata.requested_interval_ns
+            for row in rows
+            if row.rest_metadata is not None
+            and row.rest_metadata.requested_interval_ns is not None
+        }
+        effective = {
+            row.rest_metadata.effective_interval_ns
+            for row in rows
+            if row.rest_metadata is not None
+            and row.rest_metadata.effective_interval_ns is not None
+        }
+        observed = (
+            rows[0].received_at_ns,
+            rows[-1].received_at_ns,
+            event_times[0] if event_times else None,
+            event_times[-1] if event_times else None,
+            rows[0].writer_sequence,
+            rows[-1].writer_sequence,
+            tuple(
+                sorted({row.wire_symbol for row in rows if row.wire_symbol is not None})
+            ),
+            tuple(
+                sorted(
+                    {
+                        row.connection_generation
+                        for row in rows
+                        if row.connection_generation is not None
+                    }
+                )
+            ),
+            tuple(sorted({row.egress_id for row in rows if row.egress_id is not None})),
+            tuple(sorted(requested)),
+            tuple(sorted(effective)),
+        )
+        expected = (
+            manifest.first_received_at_ns,
+            manifest.last_received_at_ns,
+            manifest.first_event_time_ns,
+            manifest.last_event_time_ns,
+            manifest.writer_sequence_first,
+            manifest.writer_sequence_last,
+            manifest.wire_symbols,
+            manifest.connection_generations,
+            manifest.egress_ids,
+            manifest.requested_intervals_ns,
+            manifest.effective_intervals_ns,
+        )
+        if observed != expected:
+            raise ManifestValidationError("raw row facts do not match their manifest")
+
+    def __exit__(self, *_exc: object) -> None:
+        reader = self._reader
+        zstd_reader = self._zstd_reader
+        data_file = self._data_file
+        lease = self._lease
+        self._reader = None
+        self._zstd_reader = None
+        self._data_file = None
+        self._lease = None
+        self._loaded = None
+        try:
+            if reader is not None:
+                reader.close()
+            elif zstd_reader is not None:
+                zstd_reader.close()
+            if data_file is not None and not data_file.closed:
+                data_file.close()
+        finally:
+            if lease is not None:
+                lease.release()
+
+
 __all__ = [
     "RECOVERY_UNAVAILABLE_FIELDS",
+    "CleanupProofEvidenceV1",
+    "CleanupProofKind",
     "LoadedRawManifest",
+    "LocalSourceValidation",
     "ManifestValidationError",
+    "RawManifestReader",
     "RawManifestV1",
     "RecoverySourceState",
+    "SourceDisposition",
+    "SourceDispositionResolver",
+    "SourceUnavailable",
     "UnsupportedManifestSchema",
     "lease_path_for_data",
     "load_raw_manifest",
     "manifest_path_for_data",
+    "validate_local_source",
 ]
