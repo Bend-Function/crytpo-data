@@ -208,8 +208,44 @@ class BooksConfig(StrictModel):
     )
 
 
+class DateGatedFeaturePolicy(StrictModel):
+    enabled: bool = True
+    required: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_disabled_policy(self) -> Self:
+        if not self.enabled and self.required is True:
+            raise ValueError("a disabled date-gated feature cannot be required")
+        return self
+
+
 class CapabilityPolicyConfig(StrictModel):
     date_gated_default_required: bool = False
+    date_gated_features: dict[
+        NonEmptyString,
+        dict[NonEmptyString, DateGatedFeaturePolicy],
+    ] = Field(default_factory=dict)
+
+    @field_validator("date_gated_features", mode="after")
+    @classmethod
+    def normalize_date_gated_features(
+        cls,
+        value: dict[str, dict[str, DateGatedFeaturePolicy]],
+    ) -> dict[str, dict[str, DateGatedFeaturePolicy]]:
+        for exchange_id, features in value.items():
+            if exchange_id != exchange_id.strip():
+                raise ValueError(
+                    "date-gated exchange IDs must not contain outer whitespace"
+                )
+            for feature_id in features:
+                if feature_id != feature_id.strip():
+                    raise ValueError(
+                        "date-gated feature IDs must not contain outer whitespace"
+                    )
+        return {
+            exchange_id: dict(sorted(features.items()))
+            for exchange_id, features in sorted(value.items())
+        }
 
 
 class WriterConfig(StrictModel):
@@ -521,6 +557,14 @@ class SymbolOverride(StrictModel):
         default_factory=lambda: SelectionOverride.model_validate({})
     )
     books: BooksOverride = Field(default_factory=BooksOverride)
+
+    @model_validator(mode="after")
+    def reject_symbol_fixed_pairs(self) -> Self:
+        if self.selection.fixed_pairs is not None:
+            raise ValueError(
+                "selection.fixed_pairs cannot be configured at symbol scope"
+            )
+        return self
 
 
 class MarketOverride(StrictModel):

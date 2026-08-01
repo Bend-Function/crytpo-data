@@ -9,6 +9,7 @@ from crypto_collector.config.models import (
     ConfigSecretError,
     SelectionConfig,
     SelectionOverride,
+    SymbolOverride,
     iter_secret_refs,
     validate_secret_snapshot,
 )
@@ -84,6 +85,38 @@ def test_runtime_safety_defaults_are_explicit() -> None:
     assert config.selection.turnover_max_age_ns == 900_000_000_000
 
 
+def test_date_gated_feature_policy_is_explicit_and_strict() -> None:
+    source = deepcopy(BASE)
+    source["capabilities"] = {
+        "date_gated_default_required": False,
+        "date_gated_features": {
+            "okx": {
+                "books_rpi": {"required": True},
+            }
+        },
+    }
+
+    config = CollectorConfig.model_validate(source)
+
+    policy = config.capabilities.date_gated_features["okx"]["books_rpi"]
+    assert policy.enabled is True
+    assert policy.required is True
+
+    source["capabilities"]["date_gated_features"]["okx"]["books_rpi"] = {
+        "required": True,
+        "typo": True,
+    }
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        CollectorConfig.model_validate(source)
+
+    source["capabilities"]["date_gated_features"]["okx"]["books_rpi"] = {
+        "enabled": False,
+        "required": True,
+    }
+    with pytest.raises(ValidationError, match="disabled.*cannot be required"):
+        CollectorConfig.model_validate(source)
+
+
 def test_selection_turnover_max_age_is_configurable() -> None:
     config = CollectorConfig.model_validate(
         BASE | {"selection": BASE["selection"] | {"turnover_max_age": "30m"}}
@@ -127,6 +160,11 @@ def test_selection_quote_assets_cannot_be_empty() -> None:
 def test_selection_override_quote_assets_cannot_be_empty() -> None:
     with pytest.raises(ValidationError, match="quote_assets.*empty"):
         SelectionOverride.model_validate({"quote_assets": []})
+
+
+def test_symbol_scope_rejects_fixed_pair_requests() -> None:
+    with pytest.raises(ValidationError, match="fixed_pairs.*symbol scope"):
+        SymbolOverride.model_validate({"selection": {"fixed_pairs": ["ETH/USDT"]}})
 
 
 @pytest.mark.parametrize(

@@ -85,6 +85,37 @@ def test_config_check_reports_static_capacity_without_live_claims(
     assert body["static_capacity"]["configured_egress_count"] == 2
     assert body["static_capacity"]["live_capacity_status"] == "unresolved"
     assert body["requested_intervals"]["deep_snapshot_ns"]["okx/spot"] > 0
+    assert body["capability_decisions"]["okx"]["date_gated_features"] == []
+
+
+def test_config_check_reports_only_explicit_date_gated_features(tmp_path: Path) -> None:
+    config_tree = _config_tree(tmp_path, socks=False)
+    root = config_tree / "config.yaml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + """\
+capabilities:
+  date_gated_features:
+    okx:
+      books_rpi:
+        required: true
+""",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["config", "check", str(config_tree), "--json"])
+
+    assert result.exit_code == 0, result.output
+    decisions = json.loads(result.stdout)["capability_decisions"]["okx"]
+    assert decisions["date_gated_features"] == [
+        {
+            "available_from": "2026-07-28",
+            "feature": "books_rpi",
+            "markets": ["spot", "perpetual"],
+            "required": True,
+            "status": "probe_unresolved",
+        }
+    ]
 
 
 def test_disabled_market_disables_nested_collection_decisions(tmp_path: Path) -> None:

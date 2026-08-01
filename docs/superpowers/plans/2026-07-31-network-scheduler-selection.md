@@ -997,19 +997,35 @@ git commit -m "feat: select fixed top and new symbols"
 - Test: `tests/unit/selection/test_fixed.py`
 - Test: `tests/unit/config/test_probe_contracts.py`
 
+#### Authoritative Task 6 Contract Clarification
+
+The following rules override the abbreviated examples below:
+
+- Fixed requests are an exact tuple contract. Resolution is market-local: an exact stable key wins, otherwise the canonical pair must have exactly one present, tradable match. Symbol-level `fixed_pairs` are invalid because fixed requests select symbols rather than configure an already selected symbol.
+- Every admission call requires the config SHA. Instrument keys are unique only inside a catalog scope. WS connections are physical exchange-wide resources: reserve fixed demand across all enabled markets first, then allocate whole connection chunks by fixed, new-listing, and Top-N priority. Physical shard indices are unique per egress.
+- REST work is independent of the live WS sticky assignment. Aggregate competing market workloads by logical endpoint and healthy quota group, without multiplying a shared quota-group budget by its egress count. Use exact arithmetic. Reserve the original cadence of deep-snapshot `overload_policy=fail` cohorts, then proportionally stretch flexible cohorts from the remaining budget. If the configured maximum interval is still infeasible, evict only candidates whose selection capacity policy permits degradation, in Top-N/new-listing eviction order, recompute WS and REST allocation, and never evict fixed or selection-capacity `fail` candidates. REST evictions are separate structured evidence with endpoint, depth, cost, requested/max interval, exact available/required rate fractions, reason, and config SHA; they are not represented as fictitious WS slot warnings.
+- A market report labels its repeated physical total as `exchange_capacity_ceiling`; `admission.available_slots` and shards are the scope's actual allocation. A per-market field must never present the full exchange capacity as if every market owned it independently.
+- Provider evidence is immutable, deterministic, and observed inside the request-start/completion window. Endpoint-work evidence carries its own observation time and raw reference. Reports preserve public-time, reachability, resolved date-gate requests, live date-gate evidence, capability-registry SHA, endpoint-budget, endpoint-work, every successful or failed market catalog, raw-reference, selection, admission, shard, and interval-cohort evidence. Provider-registry lookup, identity access, and execution are exchange-local isolation boundaries; failures expose neither provider text nor provider-controlled exception type names.
+- A selected and admitted symbol with deep snapshots enabled requires endpoint work whose kind and depth exactly match its effective symbol configuration. Disabled or capacity-rejected symbols create no deep workload. Different symbol cadences/depths remain separate auditable interval cohorts; the legacy endpoint summary is emitted only when all cohorts have the same requested/effective pair.
+- Date-gated features are disabled unless explicitly configured under `capabilities.date_gated_features.<exchange>.<feature>`. Each enabled request resolves its own `required` policy, applicable markets, archived `available_from`, and `requires_live_probe` into `ProbeRequest`. Availability requires the archived UTC date gate and, when required, an exact live evidence set. Missing or extra live gate evidence is a provider-contract failure; an explicit unavailable optional feature is disabled, while a required one fails the probe.
+- Symbol-level `enabled`, selection, capacity policy, deep depth, cadence, and overload policy are effective inputs. Selection is evaluated under each symbol's final policy and then combined into one scope/revision/config-bound result.
+- Any failed market is reported explicitly. Remaining markets are recomputed from their original selection over exchange-wide WS and REST resources, clearing earlier REST reductions whenever the active market set changes, so no successful report can retain stale admission, empty required intervals, or capacity previously reserved by a failed market. Connection indices are generated only for physical connections actually reserved, never by materializing configured capacity.
+- `ProbeEngine` imports no venue adapter, creates no network client, writes no file, and receives only dependency-injected providers. Plan 04 and Plan 05 own live provider construction.
+
 - [ ] **Step 1: Write failing resolution, admission, and provider-contract tests**
 
 ```python
 def test_capacity_trims_lowest_top_then_latest_new_but_never_fixed() -> None:
     result = admit(
-        candidates=[
+        candidates=(
             fixed("BTC"),
             top("ETH", rank=1),
             top("ALT", rank=20),
             new("NEW1", first_seen_ns=10),
             new("NEW2", first_seen_ns=20),
-        ],
+        ),
         slots=3,
+        config_sha256="c" * 64,
         policy="degrade_low_priority_with_warning",
     )
     assert result.admitted == ("BTC", "NEW1", "NEW2")
@@ -1019,8 +1035,9 @@ def test_capacity_trims_lowest_top_then_latest_new_but_never_fixed() -> None:
 def test_fixed_pairs_over_capacity_always_fail() -> None:
     with pytest.raises(CapacityError, match="fixed pairs"):
         admit(
-            [fixed("BTC"), fixed("ETH")],
+            (fixed("BTC"), fixed("ETH")),
             slots=1,
+            config_sha256="c" * 64,
             policy="degrade_low_priority_with_warning",
         )
 
@@ -1029,7 +1046,7 @@ def test_canonical_fixed_pair_resolves_to_one_stable_instrument_key() -> None:
     catalog = fake_catalog(
         instruments=[instrument("BTC-USDT", canonical_pair="BTC/USDT")]
     )
-    result = resolve_fixed_requests(["BTC/USDT"], catalog)
+    result = resolve_fixed_requests(("BTC/USDT",), catalog)
     assert result.instrument_keys == frozenset({"BTC-USDT"})
 
 
@@ -1038,7 +1055,7 @@ def test_unknown_or_ambiguous_canonical_fixed_pair_fails(
     request, catalog_with_ambiguity
 ) -> None:
     with pytest.raises(FixedPairResolutionError):
-        resolve_fixed_requests([request], catalog_with_ambiguity)
+        resolve_fixed_requests((request,), catalog_with_ambiguity)
 
 
 @pytest.mark.asyncio
@@ -1050,7 +1067,8 @@ async def test_probe_engine_is_provider_neutral_and_timestamped(
         providers={"okx": fake_probe_provider},
     )
     assert result.observed_at_ns == 123
-    assert result.exchanges["okx"].selection.fixed.instrument_keys == {"BTC-USDT"}
+    market = result.exchanges["okx"].markets["spot"]
+    assert market.fixed.instrument_keys == frozenset({"BTC-USDT"})
 ```
 
 - [ ] **Step 2: Run and verify resolution/capacity/probe contracts are missing**
@@ -1076,7 +1094,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/selection src/crypto_collector/config/probe_contracts.py tests/unit/selection tests/unit/config/test_probe_contracts.py
+git add src/crypto_collector/selection src/crypto_collector/config docs/superpowers/plans/2026-07-31-network-scheduler-selection.md tests/unit/selection tests/unit/config tests/cli/test_config_check.py
 git commit -m "feat: resolve fixed pairs and admit capacity"
 ```
 

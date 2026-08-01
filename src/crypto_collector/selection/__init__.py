@@ -1,3 +1,16 @@
+from crypto_collector.selection.capacity import (
+    CapacityAdmission,
+    CapacityCandidate,
+    CapacityPolicy,
+    CapacityWarning,
+    EgressCapacity,
+    ExchangeCapacityAdmission,
+    ScopedCapacityDemand,
+    ScopedCapacityError,
+    admit,
+    admit_exchange_capacity,
+    calculate_egress_capacity,
+)
 from crypto_collector.selection.catalog_store import (
     AnnouncementHintConflictError,
     CatalogRevisionConflictError,
@@ -8,6 +21,10 @@ from crypto_collector.selection.catalog_store import (
     StaleCatalogSnapshotError,
     StaleTurnoverSnapshotError,
     TurnoverSnapshotConflictError,
+)
+from crypto_collector.selection.fixed import (
+    FixedPairResolutionError,
+    resolve_fixed_requests,
 )
 from crypto_collector.selection.models import (
     AnnouncementHint,
@@ -48,6 +65,10 @@ __all__ = [
     "AdmissionPriority",
     "AnnouncementHint",
     "AnnouncementHintConflictError",
+    "CapacityAdmission",
+    "CapacityCandidate",
+    "CapacityPolicy",
+    "CapacityWarning",
     "CatalogChanges",
     "CatalogControlChange",
     "CatalogDelta",
@@ -61,10 +82,15 @@ __all__ = [
     "CatalogView",
     "CompleteCatalogSnapshot",
     "CompleteTurnoverSnapshot",
+    "EgressCapacity",
+    "ExchangeCapacityAdmission",
+    "FixedPairResolutionError",
     "InstrumentRecord",
     "LifecyclePhase",
     "ListingState",
     "ResolvedFixedSelection",
+    "ScopedCapacityDemand",
+    "ScopedCapacityError",
     "SelectionDelta",
     "SelectionEntry",
     "SelectionPolicy",
@@ -83,5 +109,9 @@ __all__ = [
     "TurnoverMethod",
     "TurnoverObservation",
     "TurnoverSnapshotConflictError",
+    "admit",
+    "admit_exchange_capacity",
+    "calculate_egress_capacity",
+    "resolve_fixed_requests",
     "select",
 ]
