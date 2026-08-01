@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from crypto_collector.config.models import (
     CollectorConfig,
     ConfigSecretError,
+    SelectionConfig,
+    SelectionOverride,
     iter_secret_refs,
     validate_secret_snapshot,
 )
@@ -79,6 +81,89 @@ def test_runtime_safety_defaults_are_explicit() -> None:
     assert config.network.scheduler.deep_snapshot_max_interval_ns == 900_000_000_000
     assert config.network.scheduler.max_pending_jobs == 10_000
     assert config.network.scheduler.event_history_limit == 1_024
+    assert config.selection.turnover_max_age_ns == 900_000_000_000
+
+
+def test_selection_turnover_max_age_is_configurable() -> None:
+    config = CollectorConfig.model_validate(
+        BASE | {"selection": BASE["selection"] | {"turnover_max_age": "30m"}}
+    )
+
+    assert config.selection.turnover_max_age_ns == 1_800_000_000_000
+
+
+@pytest.mark.parametrize("field", ["quote_assets", "fixed_pairs"])
+def test_selection_identifiers_are_trimmed_and_casefold_unique(field: str) -> None:
+    selection = deepcopy(BASE["selection"])
+    selection["quote_assets"] = [" USDT "]
+    selection["fixed_pairs"] = [" BTC/USDT "]
+    config = CollectorConfig.model_validate(BASE | {"selection": selection})
+
+    assert config.selection.quote_assets == ("USDT",)
+    assert config.selection.fixed_pairs == ("BTC/USDT",)
+
+    selection[field] = ["USDT", " usdt "]
+    with pytest.raises(ValidationError, match=f"{field}.*unique"):
+        CollectorConfig.model_validate(BASE | {"selection": selection})
+
+
+@pytest.mark.parametrize("field", ["quote_assets", "fixed_pairs"])
+def test_selection_identifiers_reject_blank_values(field: str) -> None:
+    selection = deepcopy(BASE["selection"])
+    selection[field] = ["  "]
+
+    with pytest.raises(ValidationError, match=field):
+        CollectorConfig.model_validate(BASE | {"selection": selection})
+
+
+def test_selection_quote_assets_cannot_be_empty() -> None:
+    selection = deepcopy(BASE["selection"])
+    selection["quote_assets"] = []
+
+    with pytest.raises(ValidationError, match="quote_assets.*empty"):
+        CollectorConfig.model_validate(BASE | {"selection": selection})
+
+
+def test_selection_override_quote_assets_cannot_be_empty() -> None:
+    with pytest.raises(ValidationError, match="quote_assets.*empty"):
+        SelectionOverride.model_validate({"quote_assets": []})
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (SelectionConfig, {"top_n": 2**63}),
+        (SelectionConfig, {"refresh_interval": "9223372037s"}),
+        (SelectionConfig, {"turnover_max_age": "9223372037s"}),
+        (SelectionConfig, {"exit_grace": "9223372037s"}),
+        (
+            SelectionConfig,
+            {"new_listings": {"capture_duration": "9223372037s"}},
+        ),
+        (
+            SelectionConfig,
+            {"new_listings": {"initial_lookback": "9223372037s"}},
+        ),
+        (SelectionOverride, {"top_n": 2**63}),
+        (SelectionOverride, {"refresh_interval": "9223372037s"}),
+        (SelectionOverride, {"turnover_max_age": "9223372037s"}),
+        (SelectionOverride, {"exit_grace": "9223372037s"}),
+        (
+            SelectionOverride,
+            {"new_listings": {"capture_duration": "9223372037s"}},
+        ),
+        (
+            SelectionOverride,
+            {"new_listings": {"initial_lookback": "9223372037s"}},
+        ),
+    ],
+)
+def test_selection_config_and_overrides_fit_signed_int64(
+    model: type[SelectionConfig | SelectionOverride],
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="less than or equal"):
+        model.model_validate(payload)
 
 
 @pytest.mark.parametrize("field", ["max_pending_jobs", "event_history_limit"])

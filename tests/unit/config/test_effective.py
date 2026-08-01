@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+from pydantic import ValidationError
 
 from crypto_collector.config.effective import effective_scope
 from crypto_collector.config.models import CollectorConfig
@@ -16,6 +17,7 @@ def _config() -> CollectorConfig:
         "fixed_pairs": ["BTC/USDT"],
         "top_n": 20,
         "refresh_interval": "5m",
+        "turnover_max_age": "15m",
     }
     source["exchanges"] = {
         "binance": {
@@ -32,7 +34,10 @@ def _config() -> CollectorConfig:
                     "selection": {"quote_assets": ["USD"], "top_n": 2},
                     "symbols": {
                         "BTCUSDT": {
-                            "selection": {"top_n": 1},
+                            "selection": {
+                                "top_n": 1,
+                                "turnover_max_age": "7m",
+                            },
                             "books": {"deep_snapshot": {"depth": 1000}},
                         }
                     },
@@ -52,6 +57,7 @@ def test_effective_scope_merges_only_explicit_overrides() -> None:
     assert resolved.selection.quote_assets == ("USD",)
     assert resolved.selection.fixed_pairs == ("ETH/USDT",)
     assert resolved.selection.refresh_interval_ns == 300_000_000_000
+    assert resolved.selection.turnover_max_age_ns == 420_000_000_000
     assert resolved.books.deep_snapshot.requested_interval_ns == 60_000_000_000
     assert resolved.books.deep_snapshot.depth == 1000
 
@@ -80,3 +86,22 @@ def test_effective_endpoints_are_immutable() -> None:
 
     with pytest.raises(TypeError):
         resolved.endpoints["rest"] = "https://changed.invalid"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("level", ["exchange", "market", "symbol"])
+def test_empty_quote_override_is_rejected_at_every_scope(level: str) -> None:
+    source = deepcopy(BASE)
+    symbol = {"selection": {"quote_assets": []}}
+    market = {
+        "selection": ({"quote_assets": []} if level == "market" else {}),
+        "symbols": {"BTCUSDT": symbol if level == "symbol" else {}},
+    }
+    source["exchanges"] = {
+        "binance": {
+            "selection": ({"quote_assets": []} if level == "exchange" else {}),
+            "markets": {"spot": market},
+        }
+    }
+
+    with pytest.raises(ValidationError, match="quote_assets.*empty"):
+        CollectorConfig.model_validate(source)

@@ -27,6 +27,7 @@ from crypto_collector.config.primitives import (
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MINUTE_NS = 60_000_000_000
 _HOUR_NS = 3_600_000_000_000
+_MAX_SIGNED_INT64 = 2**63 - 1
 _MAX_SCHEDULER_COLLECTION_ITEMS = 1_000_000
 
 
@@ -66,6 +67,20 @@ def _tuple(value: object) -> object:
     if isinstance(value, (list, tuple)):
         return tuple(value)
     return value
+
+
+def _normalized_unique_selection_strings(
+    value: tuple[str, ...],
+    *,
+    field: str,
+) -> tuple[str, ...]:
+    normalized = tuple(item.strip() for item in value)
+    if any(not item for item in normalized):
+        raise ValueError(f"selection {field} must not contain blank values")
+    folded = tuple(item.casefold() for item in normalized)
+    if len(set(folded)) != len(folded):
+        raise ValueError(f"selection {field} must be case-insensitively unique")
+    return normalized
 
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
@@ -119,27 +134,58 @@ class RuntimeConfig(StrictModel):
 class NewListingsConfig(StrictModel):
     enabled: bool = True
     capture_duration_ns: PositiveDurationNs = Field(
-        259_200_000_000_000, alias="capture_duration"
+        259_200_000_000_000,
+        alias="capture_duration",
+        le=_MAX_SIGNED_INT64,
     )
     initial_lookback_ns: DurationNs = Field(
-        259_200_000_000_000, alias="initial_lookback"
+        259_200_000_000_000,
+        alias="initial_lookback",
+        le=_MAX_SIGNED_INT64,
     )
 
 
 class SelectionConfig(StrictModel):
     quote_assets: StringTuple = ("USDT",)
     fixed_pairs: StringTuple = ()
-    top_n: Annotated[int, Field(ge=0)] = 20
+    top_n: Annotated[int, Field(ge=0, le=_MAX_SIGNED_INT64)] = 20
     refresh_interval_ns: PositiveDurationNs = Field(
-        300_000_000_000, alias="refresh_interval"
+        300_000_000_000,
+        alias="refresh_interval",
+        le=_MAX_SIGNED_INT64,
     )
-    exit_grace_ns: DurationNs = Field(1_800_000_000_000, alias="exit_grace")
+    turnover_max_age_ns: PositiveDurationNs = Field(
+        900_000_000_000,
+        alias="turnover_max_age",
+        le=_MAX_SIGNED_INT64,
+    )
+    exit_grace_ns: DurationNs = Field(
+        1_800_000_000_000,
+        alias="exit_grace",
+        le=_MAX_SIGNED_INT64,
+    )
     capacity_policy: Literal["degrade_low_priority_with_warning", "fail"] = (
         "degrade_low_priority_with_warning"
     )
     new_listings: NewListingsConfig = Field(
         default_factory=lambda: NewListingsConfig.model_validate({})
     )
+
+    @field_validator("quote_assets", "fixed_pairs", mode="after")
+    @classmethod
+    def normalize_selection_identifiers(
+        cls,
+        value: tuple[str, ...],
+        info: ValidationInfo,
+    ) -> tuple[str, ...]:
+        assert info.field_name is not None
+        normalized = _normalized_unique_selection_strings(
+            value,
+            field=info.field_name,
+        )
+        if info.field_name == "quote_assets" and not normalized:
+            raise ValueError("quote_assets must not be empty")
+        return normalized
 
 
 class LiveBookConfig(StrictModel):
@@ -403,21 +449,56 @@ class LocalCleanupConfig(StrictModel):
 class NewListingsOverride(StrictModel):
     enabled: bool | None = None
     capture_duration_ns: PositiveDurationNs | None = Field(
-        None, alias="capture_duration"
+        None,
+        alias="capture_duration",
+        le=_MAX_SIGNED_INT64,
     )
-    initial_lookback_ns: DurationNs | None = Field(None, alias="initial_lookback")
+    initial_lookback_ns: DurationNs | None = Field(
+        None,
+        alias="initial_lookback",
+        le=_MAX_SIGNED_INT64,
+    )
 
 
 class SelectionOverride(StrictModel):
     quote_assets: StringTuple | None = None
     fixed_pairs: StringTuple | None = None
-    top_n: Annotated[int, Field(ge=0)] | None = None
+    top_n: Annotated[int, Field(ge=0, le=_MAX_SIGNED_INT64)] | None = None
     refresh_interval_ns: PositiveDurationNs | None = Field(
-        None, alias="refresh_interval"
+        None,
+        alias="refresh_interval",
+        le=_MAX_SIGNED_INT64,
     )
-    exit_grace_ns: DurationNs | None = Field(None, alias="exit_grace")
+    turnover_max_age_ns: PositiveDurationNs | None = Field(
+        None,
+        alias="turnover_max_age",
+        le=_MAX_SIGNED_INT64,
+    )
+    exit_grace_ns: DurationNs | None = Field(
+        None,
+        alias="exit_grace",
+        le=_MAX_SIGNED_INT64,
+    )
     capacity_policy: Literal["degrade_low_priority_with_warning", "fail"] | None = None
     new_listings: NewListingsOverride | None = None
+
+    @field_validator("quote_assets", "fixed_pairs", mode="after")
+    @classmethod
+    def normalize_selection_identifiers(
+        cls,
+        value: tuple[str, ...] | None,
+        info: ValidationInfo,
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        assert info.field_name is not None
+        normalized = _normalized_unique_selection_strings(
+            value,
+            field=info.field_name,
+        )
+        if info.field_name == "quote_assets" and not normalized:
+            raise ValueError("quote_assets must not be empty")
+        return normalized
 
 
 class DeepSnapshotOverride(StrictModel):

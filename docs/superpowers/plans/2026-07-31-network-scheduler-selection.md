@@ -690,65 +690,258 @@ git commit -m "feat: schedule prioritized public rest jobs"
 ### Task 5: Catalog State and Fixed/Top-N/New-Listing Union
 
 **Files:**
+- Modify: `src/crypto_collector/config/models.py`
 - Create: `src/crypto_collector/selection/__init__.py`
 - Create: `src/crypto_collector/selection/models.py`
 - Create: `src/crypto_collector/selection/catalog_store.py`
 - Create: `src/crypto_collector/selection/selector.py`
 - Test: `tests/unit/selection/test_catalog_store.py`
 - Test: `tests/unit/selection/test_selector.py`
+- Test: `tests/unit/config/test_models.py`
+
+#### Authoritative Task 5 Contract Clarification
+
+This clarification is normative and overrides the abbreviated examples below. An
+`instrument_key` is stable only inside one `(exchange, market)` scope; it is never a
+globally unique identifier. Every catalog, fixed selection, selection policy/state, and
+selection result therefore carries the exact same `SelectionScope`. Catalog-dependent
+objects also carry the catalog revision that produced them, and a mismatched scope or
+revision is an error rather than an empty result or best-effort union.
+
+Only a provider-complete snapshot may mutate catalog presence. A
+`CompleteCatalogSnapshot` carries its scope, wall-clock observation time, stable
+snapshot ID, optional exchange-reported total, one record per stable instrument key,
+and an ordered tuple of `SnapshotPage(raw_reference, request_cursor, next_cursor)`.
+The first page has no request cursor, every next cursor equals the following request
+cursor, cursors advance without repetition, and the final page has `next_cursor=None`.
+The constructor rejects duplicate/cross-scope records, a non-terminal or discontinuous
+page chain, inconsistent reported counts, and an empty result unless the provider
+supplies an explicit authoritative-empty fact. The canonical digest binds every page
+triple, not merely its count or raw reference. One page from a multi-page response, a
+failed page, or an unproven empty response never reaches `CatalogStore`. The store uses
+one `BEGIN IMMEDIATE` transaction to compare and update the per-scope observed-time/
+revision/digest high-water, instruments, lifecycle episode state, announcement
+confirmations, and durable control-change outbox. It validates complete immutable
+`CatalogChanges` and `TurnoverChanges` results before commit, so a result-validation
+error also rolls back all writes. Older times fail; an equal time is idempotent only for
+the same canonical digest and otherwise conflicts. Missing instruments become
+non-present only after this complete-snapshot gate.
+
+Catalog metadata and 24-hour turnover have independent observation times and raw
+provenance. `CompleteTurnoverSnapshot` has the same completeness and high-water rules,
+binds the exact catalog revision against which it was fetched, and lists the complete
+set of instrument keys covered even when the venue omits a value for some of them. A
+catalog-revision mismatch or coverage outside that revision fails without mutation. It
+stores exact, finite, non-negative `Decimal` quote turnover, its method/currency,
+`turnover_observed_at_ns`, and the raw ticker reference. Contract counts are not a
+turnover method. A catalog correction that changes an instrument's quote asset clears
+its inherited turnover rather than blocking the catalog revision or relabeling the old
+currency. A computed value must explicitly identify the base-volume/reference-
+price conversion. A selection policy supplies `turnover_max_age_ns`; Top N ignores
+missing, uncovered by the latest complete turnover snapshot, stale, wrong-currency,
+non-present, or non-tradable observations. An exchange-reported snapshot item count
+matches the complete coverage count; observations remain a subset when covered ticker
+rows omit turnover. Ranking is independent for each quote and deterministic by
+`(-turnover, instrument_key)`. A turnover snapshot cannot predate the catalog
+observation to which it binds. When a view's turnover binding equals its current catalog
+revision, its coverage contains only present keys and its turnover observation is not
+earlier than the catalog observation; an older binding may retain historical coverage,
+but the selector rejects it for current Top N.
+
+New-listing eligibility is durable episode state, not a transient `new_listings`
+return value and not caller-supplied keys. The initial complete baseline suppresses all
+fallback-local episodes; an official continuous-trading/listing time may opt in only
+when `observed_at - initial_lookback <= tradable_at <= observed_at`. A pre-open record
+does not start a window. If it later becomes tradable without an eligible official
+time, the fallback is that first catalog-confirmed tradable observation
+(`first_tradable_seen`), not the earlier pre-open `first_seen`. The provider also maps
+native state to a canonical lifecycle phase while retaining the native fields. Missing
+from one complete snapshot is not delisting, reappearance alone is not relisting, and a
+pause/resume preserves the original episode/window. Only an explicit terminal/delisted
+phase followed by catalog-confirmed tradability establishes a persisted relisting
+episode. Every explicit terminal observation advances durable
+`last_terminal_seen_ns`; `relist_pending` and this timestamp survive missing, paused,
+pre-open, and process-restart boundaries until tradability consumes them. A relisting
+official time is eligible only when
+`last_terminal_seen_ns < official_tradable_at <= confirmation_observed_at`; otherwise
+the new episode starts at the catalog-confirmed tradable observation using
+`first_tradable_seen`. An active relisted episode retains the terminal timestamp as
+causal provenance.
+
+`ACTIVE_NEW` is the only state with `new_listing_eligible=True` and requires paired
+episode start/source fields. `BASELINE`, `PENDING`, and `PENDING_OFFICIAL` are ineligible
+and carry no episode fields. `PENDING`, `PENDING_OFFICIAL`, and `RELIST_PENDING` are
+necessarily non-tradable; a catalog-confirmed tradable observation consumes the pending
+state before publishing the row. `RELIST_PENDING` is ineligible, requires terminal
+evidence, and may retain the prior episode fields for history. Missing and paused active
+rows keep their episode state. A `DELISTED` row is always `RELIST_PENDING`, and its
+terminal timestamp equals that observation's `last_seen_ns`, including repeated
+terminal observations. The selector independently requires `ACTIVE_NEW`, present, and
+tradable. Initial paused/unknown rows and already-tradable rows with an ineligible future
+official time remain baseline rather than becoming delayed false new listings. The
+selector derives active episodes using the half-open interval
+`tradable_at <= now < tradable_at + capture_duration`; announcements remain hints until
+a complete catalog snapshot confirms tradability. If a hint supplies both a stable key
+and canonical pair, both must match the same current tradable instrument. Independent
+canonical-pair-only hints confirm only when exactly one current tradable instrument
+matches; zero or multiple matches remain pending. Confirmed announcement deltas and
+outbox events always carry that resolved target's real `instrument_key`. Independent
+hints for one instrument remain independent: announcement delta identity is the stable
+hint ID, while `instrument_key` is its target association.
+
+Top-N exit grace is persisted in a scope/policy-bound `SelectionState`. The first
+refresh where an instrument leaves Top N freezes `top_exit_started_at_ns`; repeated
+refreshes never move it. Re-entry clears it, and a later exit starts a new grace period.
+Grace is also half-open and ends exactly at `exit_started + exit_grace`. The store
+commits a result with compare-and-swap checks over catalog revision, turnover revision,
+policy ID, and prior state revision so restarts resume the same deadline and stale
+workers cannot overwrite a newer decision. Catalog and selection changes expose full
+previous/current values and are inserted into the durable outbox in the same
+transaction for later `_control` publication/acknowledgement. The selection checkpoint
+stores the complete immutable instrument snapshot for every entry; it never rebinds a
+historical previous value to the latest catalog row after restart. `CatalogChanges`
+exposes the same values as immutable `CatalogDelta` entries, in addition to its
+classification tuples.
+
+`SelectionConfig` adds strict positive `turnover_max_age_ns` (YAML alias
+`turnover_max_age`, default 15 minutes). The quote-asset collection must be non-empty;
+this holds for the root configuration and every exchange, market, or symbol override.
+Fixed requests may be empty. Elements in both collections are stripped, non-empty, and
+unique under Unicode case-folding; ambiguous duplicates fail config validation rather
+than being silently deduplicated. Selection ranks and durations fit signed 64-bit
+integers at both root and override validation boundaries. `SelectionPolicy.policy_id`
+is a canonical SHA-256 over its scope-independent values, including quote order, Top N,
+turnover freshness, new-listing duration, and exit grace.
+
+The public boundary is:
+
+```python
+class CatalogStore:
+    def apply_catalog_snapshot(
+        self,
+        snapshot: CompleteCatalogSnapshot,
+        *,
+        initial_lookback_ns: int = 0,
+    ) -> CatalogChanges: ...
+
+    def apply_turnover_snapshot(
+        self, snapshot: CompleteTurnoverSnapshot
+    ) -> TurnoverChanges: ...
+
+    def load_view(self, scope: SelectionScope) -> CatalogView: ...
+
+    def load_selection_state(
+        self, scope: SelectionScope, policy_id: str
+    ) -> SelectionState | None: ...
+
+    def commit_selection(
+        self,
+        result: SelectionResult,
+        *,
+        expected_catalog_revision: int,
+        expected_turnover_revision: int,
+        expected_state_revision: int | None,
+    ) -> SelectionState: ...
+
+    def pending_changes(
+        self, scope: SelectionScope
+    ) -> tuple[CatalogControlChange, ...]: ...
+
+    def ack_change(self, event_id: str) -> bool: ...
+
+
+def select(
+    catalog: CatalogView,
+    *,
+    fixed: ResolvedFixedSelection,
+    policy: SelectionPolicy,
+    previous: SelectionState | None,
+    now_ns: int,
+) -> SelectionResult: ...
+```
+
+`ResolvedFixedSelection` contains scope, exact catalog revision, and keys already
+resolved by Task 6. Fixed keys bypass only the quote filter: every key must still be
+present and tradable in that exact catalog revision. `SelectionReason` is a bitset with
+at least `FIXED`, `NEW_LISTING`, `TOP_N`, and `TOP_N_GRACE`; rank is quote-local and
+optional, and admission priority is the highest overlapping reason in the order fixed,
+new listing, then Top N/grace. Returned mappings and nested catalog JSON are recursively
+immutable. All integer/time fields reject booleans and floats.
 
 - [ ] **Step 1: Write failing first-run, turnover, and grace tests**
 
 ```python
 def test_first_catalog_is_baseline_not_mass_new_listing(tmp_path) -> None:
-    store = CatalogStore.open(tmp_path / "catalog.sqlite")
-    changes = store.apply_snapshot(
-        exchange="binance",
-        market="spot",
-        observed_at_ns=100,
-        instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")],
-    )
-    assert changes.new_listings == ()
+    scope = SelectionScope(Exchange.BINANCE, Market.SPOT)
+    with CatalogStore.open(tmp_path / "catalog.sqlite") as store:
+        changes = store.apply_catalog_snapshot(
+            complete_catalog_snapshot(
+                scope,
+                observed_at_ns=100,
+                instruments=[instrument("BTCUSDT"), instrument("NEWUSDT")],
+            ),
+            initial_lookback_ns=hours(72),
+        )
+        restarted_view = store.load_view(scope)
+    assert changes.new_listing_episodes == ()
+    assert all(not item.new_listing_eligible for item in restarted_view.instruments)
 
 
 def test_recent_official_tradable_time_can_enter_on_first_baseline(tmp_path) -> None:
-    store = CatalogStore.open(tmp_path / "catalog.sqlite")
-    changes = store.apply_snapshot(
-        exchange="bitget",
-        market="perpetual",
-        observed_at_ns=ns("2026-07-31T12:00:00Z"),
-        instruments=[
-            instrument(
-                "NEWUSDT",
-                tradable_at_ns=ns("2026-07-31T11:00:00Z"),
-                tradable_at_source="exchange",
-            )
-        ],
-        initial_lookback_ns=hours(72),
-    )
-    assert [item.instrument_key for item in changes.new_listings] == ["NEWUSDT"]
+    scope = SelectionScope(Exchange.BITGET, Market.PERPETUAL)
+    observed_at_ns = ns("2026-07-31T12:00:00Z")
+    with CatalogStore.open(tmp_path / "catalog.sqlite") as store:
+        changes = store.apply_catalog_snapshot(
+            complete_catalog_snapshot(
+                scope,
+                observed_at_ns=observed_at_ns,
+                instruments=[
+                    instrument(
+                        "NEWUSDT",
+                        tradable_at_ns=ns("2026-07-31T11:00:00Z"),
+                        tradable_at_source="exchange",
+                    )
+                ],
+            ),
+            initial_lookback_ns=hours(72),
+        )
+    assert [item.instrument_key for item in changes.new_listing_episodes] == [
+        "NEWUSDT"
+    ]
 
 
 def test_selection_is_union_with_fixed_priority_and_top_n_per_quote() -> None:
-    fixed = ResolvedFixedSelection(instrument_keys=frozenset({"PF_XBTUSD"}))
+    view = catalog_view_with_fresh_turnover_and_active_new_listing()
+    fixed = ResolvedFixedSelection(
+        scope=view.scope,
+        catalog_revision=view.catalog_revision,
+        instrument_keys=frozenset({"PF_XBTUSD"}),
+    )
     result = select(
-        catalog(),
+        view,
         fixed=fixed,
-        quotes=["USDT"],
-        top_n=2,
-        active_new=["NEWUSDT"],
+        policy=selection_policy(quotes=("USDT",), top_n=2),
+        previous=None,
         now_ns=1_000,
     )
-    assert result.selected == frozenset({"PF_XBTUSD", "BTCUSDT", "ETHUSDT", "NEWUSDT"})
+    assert result.selected == frozenset(
+        {"PF_XBTUSD", "BTCUSDT", "ETHUSDT", "NEWUSDT"}
+    )
     assert result.reason("PF_XBTUSD").fixed is True
 
 
 def test_top_n_exit_grace_prevents_boundary_churn() -> None:
-    previous = selected_top("ALTUSDT", last_selected_ns=100)
+    previous = state_with_top_exit("ALTUSDT", top_exit_started_at_ns=100)
     result = select(
-        updated_catalog_without_alt(), previous=previous, now_ns=120, exit_grace_ns=30
+        updated_catalog_without_alt(),
+        fixed=resolved_empty_fixed_for_current_revision(),
+        policy=selection_policy(exit_grace_ns=30),
+        previous=previous,
+        now_ns=129,
     )
     assert "ALTUSDT" in result.selected
+    assert result.next_state.entry("ALTUSDT").top_exit_started_at_ns == 100
+    assert "ALTUSDT" not in select_from_result_state(result, now_ns=130).selected
 ```
 
 - [ ] **Step 2: Run and verify selection modules are missing**
@@ -759,7 +952,27 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement persistent catalog provenance and selection reasons**
 
-Persist stable instrument key, all protocol wire symbols, canonical pair, quote/base/settlement, status, lifecycle fields, `tradable_at`, its source, first/last seen, turnover value/method/currency, and raw catalog reference. Compare Top N only within one exchange/market/quote. Never treat contract count as quote turnover. The selector accepts only `ResolvedFixedSelection`, never raw user strings; Task 6 resolves those against a current venue catalog. Fixed instrument keys bypass quote filters. New-listing expiry is `tradable_at + capture_duration`; announcements are hints until the catalog confirms tradability. Return a reason bitset plus rank and admission priority for every instrument.
+Persist stable instrument key, all protocol wire symbols, canonical pair,
+quote/base/settlement, status, lifecycle fields, first/last seen, independent catalog and
+turnover provenance, and the full durable listing-episode state described above. The
+store requires WAL and `synchronous=FULL`, validates its exact versioned schema, retries
+bounded first-open/write contention, and never partially applies a scope snapshot or
+selection checkpoint. Compare Top N only within one exchange/market/quote. Never treat
+contract count as quote turnover. The selector accepts only revision-bound
+`ResolvedFixedSelection`, never raw user strings; Task 6 resolves those against a
+current venue catalog. Fixed keys bypass quote filters but not presence/tradability.
+Return the reason bitset, quote-local rank, admission priority, immutable next state,
+and previous/current deltas for every affected instrument.
+
+Tests cover complete versus partial pagination, authoritative empty handling,
+cross-scope/revision rejection, baseline and relisting episodes across restart, pre-open
+to tradable fallback, repeated terminal evidence, future/old official times, exact
+listing/grace expiry, independent turnover freshness/high-waters, Decimal precision,
+deterministic ties, fixed status validation, repeated refresh without grace extension,
+re-entry/second exit, selection CAS conflicts across concurrent SQLite handles, schema
+tampering, and rollback after injected catalog-result or mid-outbox failures. They also
+prove announcement-only and partial-catalog inputs produce no catalog, selection, or
+outbox mutation.
 
 - [ ] **Step 4: Run selection tests**
 
@@ -770,7 +983,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/selection tests/unit/selection
+git add src/crypto_collector/config/models.py src/crypto_collector/selection tests/unit/config/test_models.py tests/unit/selection
 git commit -m "feat: select fixed top and new symbols"
 ```
 
