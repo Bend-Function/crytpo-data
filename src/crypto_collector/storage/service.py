@@ -62,6 +62,7 @@ from crypto_collector.storage.models import (
     WriterMetricsSnapshotV1,
     WriterStatus,
 )
+from crypto_collector.storage.phases import StoragePhaseHook
 from crypto_collector.storage.raw_writer import (
     NoReplaceCapability,
     _ActivePart,
@@ -275,6 +276,7 @@ class RawWriterService:
         initial_part_sequence: int,
         on_slo_transition: Callable[[DurabilitySloTransition], None] | None,
         on_critical: Callable[[WriterCriticalError], None] | None,
+        phase_hook: StoragePhaseHook | None,
     ) -> None:
         self._data_root = data_root
         self._state_root = state_root
@@ -311,6 +313,7 @@ class RawWriterService:
             rotate_interval_ns=writer_config.rotate_interval_ns,
             durability_slo_ns=writer_config.durability_slo_ns,
             initial_part_sequence=initial_part_sequence,
+            phase_hook=phase_hook,
         )
         self._ingress = RawIngress(
             config=ingress_config,
@@ -327,6 +330,7 @@ class RawWriterService:
             io_limiter=io_limiter,
             storage_executor=executor,
             no_replace_capability=NoReplaceCapability.HARDLINK,
+            phase_hook=phase_hook,
         )
         self._ledger = DurabilityLedger(clock=clock)
         self._histogram = CumulativeDurabilityHistogram()
@@ -397,6 +401,7 @@ class RawWriterService:
         source_disposition_resolver: SourceDispositionResolver | None = None,
         on_slo_transition: Callable[[DurabilitySloTransition], None] | None = None,
         on_critical: Callable[[WriterCriticalError], None] | None = None,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> RawWriterService:
         root = _normalized_root(data_root, field_name="data_root")
         state = _normalized_root(state_root, field_name="state_root")
@@ -444,6 +449,8 @@ class RawWriterService:
             raise TypeError("on_slo_transition must be callable or None")
         if on_critical is not None and not callable(on_critical):
             raise TypeError("on_critical must be callable or None")
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
 
         writer_lock: ExchangeWriterLock | None = None
         executor: ThreadPoolExecutor | None = None
@@ -524,6 +531,7 @@ class RawWriterService:
                 initial_part_sequence=initial_sequence,
                 on_slo_transition=on_slo_transition,
                 on_critical=on_critical,
+                phase_hook=phase_hook,
             )
             writer_lock = None
             executor = None

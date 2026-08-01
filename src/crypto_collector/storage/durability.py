@@ -429,6 +429,7 @@ class DurabilityCoordinator:
                 return _PersistenceFailure(WriterCriticalReason.WRITE_FAILED)
         try:
             self._sync_backend.sync(work.stream_file.fileno())
+            work.stream_file.notify_phase("after_data_sync")
             completed_ns = self._clock_ns(
                 field_name="sync_completed_monotonic_ns",
             )

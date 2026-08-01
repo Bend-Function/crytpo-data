@@ -9,6 +9,8 @@ from typing import Self
 
 import zstandard
 
+from crypto_collector.storage.phases import StoragePhaseHook, notify_storage_phase
+
 _MAX_SIGNED_INT64 = 2**63 - 1
 
 
@@ -195,6 +197,7 @@ class StreamFile:
         "_compressor",
         "_fd",
         "_generation_id",
+        "_phase_hook",
         "compressed_size",
         "max_plain_frame_bytes",
         "path",
@@ -210,13 +213,17 @@ class StreamFile:
         zstd_level: int,
         max_plain_frame_bytes: int,
         compressor: zstandard.ZstdCompressor,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> None:
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
         self.path = path
         self._generation_id = generation_id
         self._fd = fd
         self.zstd_level = zstd_level
         self.max_plain_frame_bytes = max_plain_frame_bytes
         self._compressor = compressor
+        self._phase_hook = phase_hook
         self._buffer: list[BufferedRow] = []
         self._buffer_plain_bytes = 0
         self.compressed_size = 0
@@ -233,7 +240,10 @@ class StreamFile:
         zstd_level: int,
         max_plain_frame_bytes: int,
         generation_id: str | None = None,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> StreamFile:
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
         level = _integer(zstd_level, field="zstd_level", minimum=1)
         if level > 22:
             raise ValueError("zstd_level must be at most 22")
@@ -270,7 +280,9 @@ class StreamFile:
                 | getattr(os, "O_NOFOLLOW", 0)
             )
             fd = os.open(absolute_path.name, flags, 0o640, dir_fd=parent_fd)
+            notify_storage_phase(phase_hook, "partial_create_before_parent_fsync")
             os.fsync(parent_fd)
+            notify_storage_phase(phase_hook, "partial_parent_fsync")
         except BaseException:
             if fd is not None:
                 _close_quietly(fd)
@@ -292,7 +304,11 @@ class StreamFile:
             zstd_level=level,
             max_plain_frame_bytes=frame_limit,
             compressor=compressor,
+            phase_hook=phase_hook,
         )
+
+    def notify_phase(self, phase: str) -> None:
+        notify_storage_phase(self._phase_hook, phase)
 
     @property
     def closed(self) -> bool:
@@ -377,6 +393,7 @@ class StreamFile:
             compressed_bytes=len(frame),
         )
         self.compressed_size += result.compressed_bytes
+        self.notify_phase("after_frame_write")
         return result
 
     def close_fd(self) -> None:

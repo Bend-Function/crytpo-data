@@ -3463,6 +3463,174 @@ def _discover_unbound_raw_sources(
     return tuple(sorted(discovered_set))
 
 
+def _load_bound_manifest_temporary(
+    *,
+    data_root: Path,
+    path: Path,
+    final_relative_path: str,
+    exchange: Exchange,
+) -> tuple[int, str, str]:
+    try:
+        loaded = load_raw_manifest(path)
+    except FileNotFoundError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise RecoveryBlocked("raw manifest temporary has invalid bytes") from error
+    manifest = loaded.manifest
+    if (
+        manifest.exchange is not exchange
+        or manifest.manifest_relative_path != final_relative_path
+    ):
+        raise RecoveryBlocked("raw manifest temporary has an invalid binding")
+    if not _artifact_exists_exactly(
+        data_root,
+        manifest.data_relative_path,
+        manifest.file_size_bytes,
+        manifest.file_sha256,
+    ):
+        raise RecoveryBlocked("raw manifest temporary has no bound data")
+    return (
+        len(loaded.canonical_bytes),
+        loaded.sha256,
+        manifest.data_relative_path,
+    )
+
+
+def _remove_exact_manifest_temporary(
+    path: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    try:
+        temporary_fd, _ = _open_regular_no_follow(path)
+    except OSError as error:
+        raise RecoveryBlocked("raw manifest temporary path is unsafe") from error
+    parent_fd: int | None = None
+    try:
+        if size_and_sha256_fd(temporary_fd) != (
+            expected_size,
+            expected_sha256,
+        ):
+            raise RecoveryBlocked("raw manifest temporary changed during recovery")
+        temporary_stat = os.fstat(temporary_fd)
+        parent_fd, name, _ = _open_parent_no_follow(path)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (
+            temporary_stat.st_dev,
+            temporary_stat.st_ino,
+        ):
+            raise RecoveryBlocked("raw manifest temporary identity changed")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except RecoveryBlocked:
+        raise
+    except OSError as error:
+        raise RecoveryBlocked("raw manifest temporary cleanup failed") from error
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(temporary_fd)
+
+
+def _settle_manifest_temporaries(data_root: Path, exchange: Exchange) -> None:
+    exchange_root = data_root / "raw" / exchange.value
+    try:
+        root_fd = _open_directory_path(exchange_root)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RecoveryBlocked("raw exchange directory is unsafe") from error
+    else:
+        os.close(root_fd)
+
+    temporaries: list[Path] = []
+
+    def walk(directory: Path) -> None:
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as error:
+            raise RecoveryBlocked("raw manifest temporary discovery failed") from error
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink():
+                raise RecoveryBlocked(
+                    "raw manifest temporary discovery found a symlink"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                walk(path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise RecoveryBlocked(
+                    "raw manifest temporary discovery found a non-regular entry"
+                )
+            if entry.name.endswith(".manifest.json.partial"):
+                temporaries.append(path)
+
+    walk(exchange_root)
+    for temporary in sorted(temporaries):
+        final = temporary.with_name(temporary.name.removesuffix(".partial"))
+        final_relative = final.relative_to(data_root).as_posix()
+        temporary_size, temporary_sha256, data_relative_path = (
+            _load_bound_manifest_temporary(
+                data_root=data_root,
+                path=temporary,
+                final_relative_path=final_relative,
+                exchange=exchange,
+            )
+        )
+        try:
+            final_binding = _load_bound_manifest_temporary(
+                data_root=data_root,
+                path=final,
+                final_relative_path=final_relative,
+                exchange=exchange,
+            )
+        except FileNotFoundError:
+            final_exists = False
+        else:
+            final_exists = True
+        if not final_exists:
+            fsync_directory((data_root / data_relative_path).parent)
+            try:
+                publish_no_replace(temporary, final)
+            except (OSError, PublicationConflict) as error:
+                raise RecoveryBlocked(
+                    "raw manifest temporary publication failed"
+                ) from error
+            _load_bound_manifest_temporary(
+                data_root=data_root,
+                path=final,
+                final_relative_path=final_relative,
+                exchange=exchange,
+            )
+            continue
+        temporary_binding = (
+            temporary_size,
+            temporary_sha256,
+            data_relative_path,
+        )
+        if final_binding != temporary_binding:
+            raise RecoveryBlocked(
+                "raw manifest temporary conflicts with the final manifest"
+            )
+        if (
+            _load_bound_manifest_temporary(
+                data_root=data_root,
+                path=final,
+                final_relative_path=final_relative,
+                exchange=exchange,
+            )
+            != final_binding
+        ):
+            raise RecoveryBlocked("raw final manifest changed during recovery")
+        _remove_exact_manifest_temporary(
+            temporary,
+            expected_size=temporary_size,
+            expected_sha256=temporary_sha256,
+        )
+
+
 def _discover_manifest_only_sources(
     data_root: Path,
     exchange: Exchange,
@@ -5212,6 +5380,13 @@ class PosixRecoveryBackend:
                 completed.append(_outcome_from_intent(intent))
             else:
                 completed.append(_outcome_from_intent(intent))
+        await run_storage(
+            context.io_limiter,
+            context.storage_executor,
+            _settle_manifest_temporaries,
+            context.data_root,
+            context.exchange,
+        )
         manifest_only_sources = await run_storage(
             context.io_limiter,
             context.storage_executor,

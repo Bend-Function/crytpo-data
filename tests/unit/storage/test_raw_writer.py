@@ -376,12 +376,16 @@ def test_hardlink_fallback_makes_destination_durable_before_source_unlink(
         source,
         destination,
         capability=NoReplaceCapability.HARDLINK,
+        phase_hook=events.append,
     )
 
     assert events == [
         "link",
+        "after_link",
         "directory_fsync",
+        "after_destination_directory_fsync",
         "unlink_source",
+        "after_source_unlink",
         "directory_fsync",
     ]
     assert not source.exists()

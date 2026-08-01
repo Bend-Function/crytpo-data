@@ -37,6 +37,7 @@ from crypto_collector.storage.models import (
     AcceptedRecordIdentityV1,
     StorageControlAssociationV1,
 )
+from crypto_collector.storage.phases import StoragePhaseHook, notify_storage_phase
 from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 from crypto_collector.storage.stream_file import (
     BufferedRow,
@@ -330,6 +331,7 @@ def _finish_hardlink_publication(
     source: Path,
     destination: Path,
     source_fd: int,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     destination_fd = _open_matching_destination(
         parent_fd,
@@ -339,7 +341,9 @@ def _finish_hardlink_publication(
     )
     _close_all_after((destination_fd,), None)
     os.fsync(parent_fd)
+    notify_storage_phase(phase_hook, "after_destination_directory_fsync")
     os.unlink(source.name, dir_fd=parent_fd)
+    notify_storage_phase(phase_hook, "after_source_unlink")
     os.fsync(parent_fd)
 
 
@@ -348,7 +352,9 @@ def _publish_hardlink(
     source: Path,
     destination: Path,
     source_fd: int,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
+    linked = False
     try:
         os.link(
             source.name,
@@ -357,13 +363,17 @@ def _publish_hardlink(
             dst_dir_fd=parent_fd,
             follow_symlinks=False,
         )
+        linked = True
     except FileExistsError:
         pass
+    if linked:
+        notify_storage_phase(phase_hook, "after_link")
     _finish_hardlink_publication(
         parent_fd=parent_fd,
         source=source,
         destination=destination,
         source_fd=source_fd,
+        phase_hook=phase_hook,
     )
 
 
@@ -403,7 +413,10 @@ def publish_no_replace(
     *,
     capability: NoReplaceCapability | None = None,
     expected_source_fd: int | None = None,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
+    if phase_hook is not None and not callable(phase_hook):
+        raise TypeError("phase_hook must be callable or None")
     source_path = _normalized_absolute_path(source, field_name="source")
     destination_path = _normalized_absolute_path(destination, field_name="destination")
     if source_path.parent != destination_path.parent:
@@ -460,6 +473,7 @@ def publish_no_replace(
                     source_path,
                     destination_path,
                     publication_source_fd,
+                    phase_hook,
                 )
         else:
             _publish_hardlink(
@@ -467,6 +481,7 @@ def publish_no_replace(
                 source_path,
                 destination_path,
                 publication_source_fd,
+                phase_hook,
             )
     except FileExistsError as error:
         primary_error = error
@@ -1039,6 +1054,7 @@ class _ActivePart:
         max_plain_frame_bytes: int,
         durability_slo_ns: int,
         created_at_ns: int | None = None,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> _ActivePart:
         root = Path(os.path.abspath(os.fspath(data_root)))
         generation = _nonempty(generation_id, field_name="generation_id")
@@ -1053,6 +1069,7 @@ class _ActivePart:
             generation_id=generation,
             zstd_level=zstd_level,
             max_plain_frame_bytes=max_plain_frame_bytes,
+            phase_hook=phase_hook,
         )
         try:
             accumulator = _PartAccumulator(
@@ -1091,6 +1108,7 @@ class _ActivePart:
         max_plain_frame_bytes: int,
         durability_slo_ns: int,
         created_at_ns: int,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> _ActivePart:
         if type(current) is not _ActivePart:
             raise TypeError("current must be _ActivePart")
@@ -1101,6 +1119,7 @@ class _ActivePart:
             generation_id=_nonempty(generation_id, field_name="generation_id"),
             zstd_level=zstd_level,
             max_plain_frame_bytes=max_plain_frame_bytes,
+            phase_hook=phase_hook,
         )
         try:
             return cls(
@@ -1512,9 +1531,12 @@ class _ActivePartSet:
         rotate_interval_ns: int,
         durability_slo_ns: int,
         initial_part_sequence: int = 0,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> None:
         if type(exchange) is not Exchange:
             raise TypeError("exchange must be Exchange")
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
         self._data_root = Path(os.path.abspath(os.fspath(data_root)))
         self._exchange = exchange
         self._config_sha256 = _sha256(config_sha256, field_name="config_sha256")
@@ -1539,6 +1561,7 @@ class _ActivePartSet:
             durability_slo_ns,
             field_name="durability_slo_ns",
         )
+        self._phase_hook = phase_hook
         if any(
             value == 0
             for value in (
@@ -1679,6 +1702,7 @@ class _ActivePartSet:
             max_plain_frame_bytes=self._max_plain_frame_bytes,
             durability_slo_ns=self._durability_slo_ns,
             created_at_ns=plan.reservation.created_at_ns,
+            phase_hook=self._phase_hook,
         )
 
     def commit_rotations(
@@ -1750,6 +1774,7 @@ class _ActivePartSet:
             max_plain_frame_bytes=self._max_plain_frame_bytes,
             durability_slo_ns=self._durability_slo_ns,
             created_at_ns=created_at_ns,
+            phase_hook=self._phase_hook,
         )
 
     def install_reserved(
@@ -2238,6 +2263,7 @@ class _FinalBarrierController:
         storage_executor: Executor,
         no_replace_capability: NoReplaceCapability,
         publication_function: _PublishNoReplace = publish_no_replace,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> None:
         if not callable(getattr(durability_coordinator, "sync_batch", None)):
             raise TypeError("durability_coordinator must implement sync_batch")
@@ -2253,6 +2279,15 @@ class _FinalBarrierController:
             raise TypeError("no_replace_capability must be NoReplaceCapability")
         if not callable(publication_function):
             raise TypeError("publication_function must be callable")
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
+        if phase_hook is not None:
+            if publication_function is not publish_no_replace:
+                raise ValueError("phase_hook requires the production publisher")
+            publication_function = partial(
+                publish_no_replace,
+                phase_hook=phase_hook,
+            )
         self._coordinator = durability_coordinator
         self._io_limiter = io_limiter
         self._storage_executor = storage_executor
@@ -2285,6 +2320,7 @@ class _FinalBarrierController:
                 capability=self._no_replace_capability,
                 expected_source_fd=verification_fd,
             )
+            part.stream_file.notify_phase("after_data_publish")
             await run_storage(
                 self._io_limiter,
                 self._storage_executor,
@@ -2326,6 +2362,7 @@ class _FinalBarrierController:
         )
         primary_error: BaseException | None = None
         try:
+            part.stream_file.notify_phase("after_manifest_temp_sync")
             await run_storage(
                 self._io_limiter,
                 self._storage_executor,
@@ -2335,6 +2372,7 @@ class _FinalBarrierController:
                 capability=self._no_replace_capability,
                 expected_source_fd=manifest_fd,
             )
+            part.stream_file.notify_phase("after_manifest_publish")
         except BaseException as error:
             primary_error = error
             raise
