@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import signal
+import stat
 from pathlib import Path
 
 import zstandard
@@ -18,13 +21,23 @@ from crypto_collector.domain.envelope import (
     SourceContext,
 )
 from crypto_collector.domain.types import CloseReason, Exchange, Market, Transport
+from crypto_collector.storage.durability import (
+    WriterCriticalError,
+    WriterCriticalReason,
+)
 from crypto_collector.storage.manifest import load_raw_manifest
+from crypto_collector.storage.raw_writer import (
+    NoReplaceCapability,
+    publish_no_replace,
+)
 from crypto_collector.storage.recovery import (
     RecoveryControlOwnershipV1,
     load_recovery_chain,
 )
 from crypto_collector.storage.serialize import decode_envelope_jsonl, encode_envelope
 from crypto_collector.storage.service import RawWriterService
+
+_DARWIN_F_GETPATH = 50
 from crypto_collector.storage.stream_file import StreamFile
 
 _PART_RELATIVE_PATH = Path(
@@ -63,6 +76,108 @@ class _PipePhaseHalt:
 class _NeverSleeper:
     async def sleep_ns(self, _delay_ns: int) -> None:
         await asyncio.Future()
+
+
+class _IoFailureHook:
+    def __init__(self, *, target: str, error_number: int) -> None:
+        self.target = target
+        self.error_number = error_number
+        self.triggered = False
+        self.trace: list[str] = []
+        self._original_data_sync = getattr(os, "fdatasync", os.fsync)
+        self._original_fsync = os.fsync
+        self._original_write = os.write
+
+    def __call__(self, phase: str) -> None:
+        self.trace.append(phase)
+
+    def _fail(self) -> None:
+        self.trace.append(f"attempt:{self.target}")
+        self.triggered = True
+        raise OSError(self.error_number, f"injected {self.target} failure")
+
+    @staticmethod
+    def _fd_path(fd: int) -> Path | None:
+        try:
+            return Path(os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:
+            pass
+        try:
+            raw_path = fcntl.fcntl(fd, _DARWIN_F_GETPATH, bytes(1024))
+        except OSError:
+            return None
+        if type(raw_path) is not bytes:
+            return None
+        encoded = raw_path.split(b"\0", 1)[0]
+        return None if not encoded else Path(os.fsdecode(encoded))
+
+    @staticmethod
+    def _directory_has_coexistence(fd: int, *, suffix: str) -> bool:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            return False
+        names = frozenset(os.listdir(fd))
+        return any(
+            name.endswith(suffix + ".partial")
+            and name.removesuffix(".partial") in names
+            for name in names
+        )
+
+    def _write(
+        self,
+        fd: int,
+        data: bytes | bytearray | memoryview,
+    ) -> int:
+        path = self._fd_path(fd)
+        if path is not None and (
+            (self.target == "frame_write" and path.name.endswith(".jsonl.zst.partial"))
+            or (
+                self.target == "manifest_temp_write"
+                and path.name.endswith(".manifest.json.partial")
+            )
+        ):
+            self._fail()
+        return self._original_write(fd, data)
+
+    def _fsync(self, fd: int) -> None:
+        path = self._fd_path(fd)
+        if (
+            self.target == "manifest_temp_sync"
+            and path is not None
+            and path.name.endswith(".manifest.json.partial")
+        ):
+            self._fail()
+        if self.target == "data_directory_sync" and self._directory_has_coexistence(
+            fd,
+            suffix=".jsonl.zst",
+        ):
+            self._fail()
+        if (
+            self.target == "manifest_directory_fsync"
+            and self._directory_has_coexistence(fd, suffix=".manifest.json")
+        ):
+            self._fail()
+        self._original_fsync(fd)
+
+    def _data_sync(self, fd: int) -> None:
+        path = self._fd_path(fd)
+        if path is not None and path.name.endswith(".jsonl.zst.partial"):
+            self._fail()
+        self._original_data_sync(fd)
+
+    def install(self) -> None:
+        if self.target in {"frame_write", "manifest_temp_write"}:
+            os.write = self._write
+        if self.target in {
+            "data_directory_sync",
+            "manifest_temp_sync",
+            "manifest_directory_fsync",
+        }:
+            os.fsync = self._fsync
+        if self.target == "data_sync":
+            if hasattr(os, "fdatasync"):
+                os.fdatasync = self._data_sync
+            else:
+                os.fsync = self._data_sync
 
 
 def _allocation(root: Path, *, phase: str, pipe_fd: int) -> None:
@@ -155,14 +270,14 @@ def _seed_recovery_partial(
             os.close(parent_fd)
 
 
-def _trade_draft() -> NativeEventDraft:
+def _trade_draft(*, instrument_key: str = "BTC-USDT") -> NativeEventDraft:
     return NativeEventDraft.model_validate(
         {
             "exchange": Exchange.OKX,
             "market": Market.SPOT,
-            "instrument_key": "BTC-USDT",
+            "instrument_key": instrument_key,
             "logical_stream": "trade",
-            "wire_symbol": "BTC-USDT",
+            "wire_symbol": instrument_key,
             "native_channel": "trades",
             "transport": Transport.WEBSOCKET,
             "event_time_ns": 1_785_456_000_000_000_000,
@@ -201,6 +316,161 @@ async def _writer_close(root: Path, *, phase: str, pipe_fd: int) -> None:
         raise RuntimeError("writer crash child did not accept its trade")
     await service.close_all(CloseReason.SHUTDOWN, deadline_ns=10**18)
     raise RuntimeError("writer close crash phase was not reached")
+
+
+async def _group_publication_failure(root: Path) -> None:
+    clock = _Clock()
+    service = await RawWriterService.open(
+        data_root=root / "data",
+        state_root=root / "state",
+        exchange=Exchange.OKX,
+        worker_instance_id="group-failure-worker",
+        config_sha256="a" * 64,
+        config_generation=0,
+        writer_config=WriterConfig.model_validate({}),
+        ingress_config=IngressConfig.model_validate({}),
+        metric_stream_allowlist=("_control", "trade"),
+        clock=clock,
+        sleeper=_NeverSleeper(),
+    )
+    publication_count = 0
+
+    def fail_second_data(
+        source: Path,
+        destination: Path,
+        *,
+        capability: NoReplaceCapability | None = None,
+        expected_source_fd: int | None = None,
+    ) -> None:
+        nonlocal publication_count
+        if destination.name.endswith(".jsonl.zst"):
+            publication_count += 1
+            if publication_count == 2:
+                raise OSError(errno.EIO, "injected group publication failure")
+        publish_no_replace(
+            source,
+            destination,
+            capability=capability,
+            expected_source_fd=expected_source_fd,
+        )
+
+    service._barrier._publication_function = fail_second_data
+    for instrument in ("BTC-USDT", "ETH-USDT", "SOL-USDT"):
+        accepted = service.try_accept(
+            _trade_draft(instrument_key=instrument),
+            source=SourceContext(
+                connection_id="group-failure-connection",
+                connection_generation=1,
+                egress_id="direct",
+            ),
+            shard=f"{instrument}-trade",
+        )
+        if not accepted.accepted:
+            raise RuntimeError("group failure child did not accept its trade")
+    try:
+        await service.close_all(CloseReason.SHUTDOWN, deadline_ns=10**18)
+    except WriterCriticalError as error:
+        if error.reason is not WriterCriticalReason.PUBLICATION_FAILED:
+            raise
+    else:
+        raise RuntimeError("group publication failure was not injected")
+
+    status = service.status()
+    metrics = service.metrics_snapshot()
+    manifests = sorted((root / "data").rglob("*.manifest.json"))
+    if len(manifests) != 1:
+        raise RuntimeError("group failure must publish exactly one prefix manifest")
+    first_manifest = load_raw_manifest(manifests[0])
+    sources = sorted(
+        path.relative_to(root / "data").as_posix()
+        for path in (root / "data").rglob("*.jsonl.zst*")
+        if not path.name.endswith(".manifest.json")
+    )
+    print(
+        json.dumps(
+            {
+                "first_manifest_relative_path": manifests[0]
+                .relative_to(root / "data")
+                .as_posix(),
+                "first_manifest_sha256": first_manifest.sha256,
+                "durability_sample_count": metrics.durability_sample_count,
+                "durable_record_count": status.durable_record_count,
+                "source_relative_paths": sources,
+                "uncertain_record_count": status.uncertain_record_count,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
+async def _io_failure(root: Path, *, phase: str, error_number: int) -> None:
+    clock = _Clock()
+    hook = _IoFailureHook(target=phase, error_number=error_number)
+    service = await RawWriterService.open(
+        data_root=root / "data",
+        state_root=root / "state",
+        exchange=Exchange.OKX,
+        worker_instance_id="io-failure-worker",
+        config_sha256="a" * 64,
+        config_generation=0,
+        writer_config=WriterConfig.model_validate({}),
+        ingress_config=IngressConfig.model_validate({}),
+        metric_stream_allowlist=("_control", "trade"),
+        clock=clock,
+        sleeper=_NeverSleeper(),
+        phase_hook=hook,
+    )
+    hook.install()
+
+    accepted = service.try_accept(
+        _trade_draft(),
+        source=SourceContext(
+            connection_id="io-failure-connection",
+            connection_generation=1,
+            egress_id="direct",
+        ),
+        shard="trade-0",
+    )
+    if not accepted.accepted:
+        raise RuntimeError("I/O failure child did not accept its trade")
+    try:
+        await service.close_all(CloseReason.SHUTDOWN, deadline_ns=10**18)
+    except WriterCriticalError as error:
+        critical = error
+    else:
+        raise RuntimeError(
+            "configured I/O failure was not injected: "
+            f"trace={hook.trace!r}, status={service.status()!r}"
+        )
+    if not hook.triggered:
+        raise RuntimeError(
+            "configured I/O failure phase was not reached: "
+            f"critical={critical!r}, trace={hook.trace!r}"
+        )
+    status = service.status()
+    print(
+        json.dumps(
+            {
+                "critical_reason": critical.reason.value,
+                "durable_record_count": status.durable_record_count,
+                "incomplete": status.incomplete,
+                "incomplete_reason": status.incomplete_reason,
+                "last_attempted_phase": phase,
+                "lifecycle": status.lifecycle.value,
+                "normal_manifest_paths": sorted(
+                    path.relative_to(root / "data").as_posix()
+                    for path in (root / "data").rglob("*.manifest.json")
+                ),
+                "trace": hook.trace,
+                "uncertain_record_count": status.uncertain_record_count,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
 
 async def _recovery_edge(root: Path, *, phase: str, pipe_fd: int) -> None:
@@ -325,6 +595,7 @@ async def _recover(root: Path) -> None:
                 "envelopes": [
                     {
                         "exchange": envelope.exchange.value,
+                        "instrument_key": envelope.instrument_key,
                         "logical_stream": envelope.logical_stream,
                         "writer_sequence": envelope.writer_sequence,
                         "payload": envelope.payload,
@@ -367,6 +638,12 @@ async def _recover(root: Path) -> None:
                 for path in (root / "data").rglob("*.partial")
             )
         ),
+        "recovery_temporary_paths": tuple(
+            sorted(
+                path.relative_to(root / "data").as_posix()
+                for path in (root / "data").rglob(".*.tmp-*")
+            )
+        ),
         "transaction_ids": transaction_ids,
         "quarantine": quarantine,
     }
@@ -383,6 +660,8 @@ def main() -> None:
             "recovery-edge",
             "replay-edge",
             "owned-prefix",
+            "group-failure",
+            "io-error",
             "recover",
         ),
     )
@@ -390,6 +669,7 @@ def main() -> None:
     parser.add_argument("--phase")
     parser.add_argument("--pipe-fd", type=int)
     parser.add_argument("--fraction", type=float)
+    parser.add_argument("--errno", type=int)
     args = parser.parse_args()
     root = args.root.resolve()
     if args.mode == "allocation":
@@ -423,6 +703,14 @@ def main() -> None:
             phase=args.phase,
             pipe_fd=args.pipe_fd,
         )
+        return
+    if args.mode == "group-failure":
+        asyncio.run(_group_publication_failure(root))
+        return
+    if args.mode == "io-error":
+        if args.phase is None or args.errno not in {errno.ENOSPC, errno.EIO}:
+            parser.error("io-error requires --phase and --errno ENOSPC/EIO")
+        asyncio.run(_io_failure(root, phase=args.phase, error_number=args.errno))
         return
     asyncio.run(_recover(root))
 

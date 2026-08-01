@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from decimal import Decimal
@@ -872,6 +874,7 @@ def _recovery_context(
     *,
     tmp_path: Path,
     executor: ThreadPoolExecutor,
+    phase_hook: Callable[[str], None] | None = None,
 ) -> RecoveryContext:
     data_root = tmp_path / "data"
     state_root = tmp_path / "state"
@@ -899,6 +902,7 @@ def _recovery_context(
         recovery_coordinator=coordinator,
         storage_executor=executor,
         source_disposition_resolver=_NoCleanupResolver(),
+        phase_hook=phase_hook,
     )
 
 
@@ -1324,6 +1328,162 @@ async def test_posix_backend_preserves_exact_normal_owned_control_manifest(
         assert len(reconciliation.completed_outcomes) == 1
         assert len(journal.load_chain(TRANSACTION_ID)) == 6
         assert carrier_manifest.read_bytes() == normal_manifest_bytes
+
+
+@pytest.mark.asyncio
+async def test_posix_backend_settles_valid_normal_temp_beside_contingency_manifest(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        context = _recovery_context(tmp_path=tmp_path, executor=executor)
+        (
+            _backend,
+            journal,
+            _pending,
+            admission,
+            ownership,
+        ) = await _bind_owned_control_transaction(context)
+        carrier_data = context.data_root / admission.control_data_relative_path
+        carrier_manifest = context.data_root / admission.control_manifest_relative_path
+        carrier_data.parent.mkdir(parents=True, exist_ok=True)
+        carrier_data.write_bytes(admission.control_frame_bytes)
+        contingency_manifest_bytes = base64.b64decode(
+            ownership.control_recovery_manifest_base64,
+            validate=True,
+        )
+        carrier_manifest.write_bytes(contingency_manifest_bytes)
+        transaction_temporary = carrier_manifest.with_name(
+            f".{carrier_manifest.name}.tmp-{TRANSACTION_ID}"
+        )
+        os.link(carrier_manifest, transaction_temporary)
+        normal_temporary = carrier_manifest.with_name(
+            carrier_manifest.name + ".partial"
+        )
+        normal_temporary.write_bytes(
+            _normal_owned_control_manifest(ownership).canonical_bytes()
+        )
+
+        reconciliation = await PosixRecoveryBackend().reconcile(context)
+
+        assert len(reconciliation.completed_outcomes) == 1
+        assert len(journal.load_chain(TRANSACTION_ID)) == 6
+        assert carrier_manifest.read_bytes() == contingency_manifest_bytes
+        assert not normal_temporary.exists()
+        assert not transaction_temporary.exists()
+
+
+@pytest.mark.asyncio
+async def test_posix_backend_settles_normal_and_recovery_manifest_temporaries(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        context = _recovery_context(tmp_path=tmp_path, executor=executor)
+        (
+            _backend,
+            journal,
+            _pending,
+            admission,
+            ownership,
+        ) = await _bind_owned_control_transaction(context)
+        carrier_data = context.data_root / admission.control_data_relative_path
+        carrier_manifest = context.data_root / admission.control_manifest_relative_path
+        carrier_data.parent.mkdir(parents=True, exist_ok=True)
+        carrier_data.write_bytes(admission.control_frame_bytes)
+        normal_manifest_bytes = _normal_owned_control_manifest(
+            ownership
+        ).canonical_bytes()
+        normal_temporary = carrier_manifest.with_name(
+            carrier_manifest.name + ".partial"
+        )
+        normal_temporary.write_bytes(normal_manifest_bytes)
+        transaction_temporary = carrier_manifest.with_name(
+            f".{carrier_manifest.name}.tmp-{TRANSACTION_ID}"
+        )
+        transaction_temporary.write_bytes(
+            base64.b64decode(
+                ownership.control_recovery_manifest_base64,
+                validate=True,
+            )
+        )
+
+        reconciliation = await PosixRecoveryBackend().reconcile(context)
+
+        assert len(reconciliation.completed_outcomes) == 1
+        assert len(journal.load_chain(TRANSACTION_ID)) == 6
+        assert carrier_manifest.read_bytes() == normal_manifest_bytes
+        assert not normal_temporary.exists()
+        assert not transaction_temporary.exists()
+
+
+@pytest.mark.asyncio
+async def test_posix_backend_compensates_absent_recovery_manifest_temporary(
+    tmp_path: Path,
+) -> None:
+    phases: list[str] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        context = _recovery_context(
+            tmp_path=tmp_path,
+            executor=executor,
+            phase_hook=phases.append,
+        )
+        (
+            _backend,
+            journal,
+            _pending,
+            admission,
+            ownership,
+        ) = await _bind_owned_control_transaction(context)
+        carrier_data = context.data_root / admission.control_data_relative_path
+        carrier_manifest = context.data_root / admission.control_manifest_relative_path
+        carrier_data.parent.mkdir(parents=True, exist_ok=True)
+        carrier_data.write_bytes(admission.control_frame_bytes)
+        normal_temporary = carrier_manifest.with_name(
+            carrier_manifest.name + ".partial"
+        )
+        normal_temporary.write_bytes(
+            _normal_owned_control_manifest(ownership).canonical_bytes()
+        )
+
+        reconciliation = await PosixRecoveryBackend().reconcile(context)
+
+        assert len(reconciliation.completed_outcomes) == 1
+        assert len(journal.load_chain(TRANSACTION_ID)) == 6
+        assert "owned_control_recovery_manifest_compensation_parent_fsync" in phases
+
+
+@pytest.mark.asyncio
+async def test_posix_backend_blocks_distinct_normal_manifest_coexistence(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        context = _recovery_context(tmp_path=tmp_path, executor=executor)
+        (
+            _backend,
+            _journal,
+            _pending,
+            admission,
+            ownership,
+        ) = await _bind_owned_control_transaction(context)
+        carrier_data = context.data_root / admission.control_data_relative_path
+        carrier_manifest = context.data_root / admission.control_manifest_relative_path
+        carrier_data.parent.mkdir(parents=True, exist_ok=True)
+        carrier_data.write_bytes(admission.control_frame_bytes)
+        normal_manifest = _normal_owned_control_manifest(ownership)
+        carrier_manifest.write_bytes(normal_manifest.canonical_bytes())
+        normal_temporary = carrier_manifest.with_name(
+            carrier_manifest.name + ".partial"
+        )
+        normal_temporary.write_bytes(
+            normal_manifest.model_copy(
+                update={"sync_duration_total_ns": 5}
+            ).canonical_bytes()
+        )
+
+        with pytest.raises(RecoveryBlocked, match="conflict|temporary"):
+            await PosixRecoveryBackend().reconcile(context)
+
+        assert carrier_manifest.exists()
+        assert normal_temporary.exists()
 
 
 @pytest.mark.asyncio

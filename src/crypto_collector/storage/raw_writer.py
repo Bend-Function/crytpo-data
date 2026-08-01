@@ -551,6 +551,31 @@ def _atomic_write_and_sync_json_exclusive_open(
         if phase_prefix is not None:
             notify_storage_phase(phase_hook, f"{phase_prefix}_file_fsync")
     except BaseException as error:
+        if file_fd is not None:
+            try:
+                created = os.fstat(file_fd)
+                current = os.stat(
+                    candidate.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != (
+                    created.st_dev,
+                    created.st_ino,
+                ):
+                    raise OSError(
+                        errno.EEXIST,
+                        "manifest temporary identity changed during cleanup",
+                    )
+                os.unlink(candidate.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:  # noqa: BLE001 - retain primary I/O
+                error.add_note(
+                    "manifest temporary cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
         descriptors = (parent_fd,) if file_fd is None else (file_fd, parent_fd)
         _close_all_after(descriptors, error)
         raise

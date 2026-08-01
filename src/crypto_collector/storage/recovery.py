@@ -2096,7 +2096,7 @@ def _create_child_directories(
     segments: tuple[str, ...],
     *,
     phase_hook: StoragePhaseHook | None = None,
-    creation_phases: tuple[tuple[str, str] | None, ...] | None = None,
+    creation_phases: tuple[tuple[str, str, str] | None, ...] | None = None,
 ) -> None:
     if phase_hook is not None and not callable(phase_hook):
         raise TypeError("phase_hook must be callable or None")
@@ -2128,6 +2128,8 @@ def _create_child_directories(
                 )
             else:
                 os.fsync(current_fd)
+                if segment_phases is not None:
+                    notify_storage_phase(phase_hook, segment_phases[2])
             os.close(current_fd)
             current_fd = next_fd
     finally:
@@ -2174,10 +2176,15 @@ class _RecoveryJournal:
                 ("raw-recovery", self._exchange.value),
                 phase_hook=self._phase_hook,
                 creation_phases=(
-                    ("recovery_root_mkdir", "recovery_root_parent_fsync"),
+                    (
+                        "recovery_root_mkdir",
+                        "recovery_root_parent_fsync",
+                        "recovery_root_compensation_parent_fsync",
+                    ),
                     (
                         "exchange_journal_mkdir",
                         "exchange_journal_parent_fsync",
+                        "exchange_journal_compensation_parent_fsync",
                     ),
                 ),
             )
@@ -2193,12 +2200,21 @@ class _RecoveryJournal:
                 ("raw-recovery", self._exchange.value, normalized),
                 phase_hook=self._phase_hook,
                 creation_phases=(
-                    ("recovery_root_mkdir", "recovery_root_parent_fsync"),
+                    (
+                        "recovery_root_mkdir",
+                        "recovery_root_parent_fsync",
+                        "recovery_root_compensation_parent_fsync",
+                    ),
                     (
                         "exchange_journal_mkdir",
                         "exchange_journal_parent_fsync",
+                        "exchange_journal_compensation_parent_fsync",
                     ),
-                    ("transaction_mkdir", "transaction_parent_fsync"),
+                    (
+                        "transaction_mkdir",
+                        "transaction_parent_fsync",
+                        "transaction_compensation_parent_fsync",
+                    ),
                 ),
             )
         except (OSError, TypeError, ValueError) as error:
@@ -3580,9 +3596,35 @@ def _remove_exact_manifest_temporary(
     *,
     expected_size: int,
     expected_sha256: str,
-) -> None:
+    missing_ok: bool = False,
+    phase_hook: StoragePhaseHook | None = None,
+    parent_fsync_phase: str | None = None,
+) -> bool:
     try:
         temporary_fd, _ = _open_regular_no_follow(path)
+    except FileNotFoundError:
+        if not missing_ok:
+            raise RecoveryBlocked("raw manifest temporary path is missing") from None
+        compensation_parent_fd: int | None = None
+        try:
+            compensation_parent_fd, name, _ = _open_parent_no_follow(path)
+            try:
+                os.stat(name, dir_fd=compensation_parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.fsync(compensation_parent_fd)
+                if parent_fsync_phase is not None:
+                    notify_storage_phase(phase_hook, parent_fsync_phase)
+                return False
+            raise RecoveryBlocked("raw manifest temporary appeared during compensation")
+        except RecoveryBlocked:
+            raise
+        except OSError as error:
+            raise RecoveryBlocked(
+                "raw manifest temporary compensation failed"
+            ) from error
+        finally:
+            if compensation_parent_fd is not None:
+                os.close(compensation_parent_fd)
     except OSError as error:
         raise RecoveryBlocked("raw manifest temporary path is unsafe") from error
     parent_fd: int | None = None
@@ -3602,6 +3644,8 @@ def _remove_exact_manifest_temporary(
             raise RecoveryBlocked("raw manifest temporary identity changed")
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
+        if parent_fsync_phase is not None:
+            notify_storage_phase(phase_hook, parent_fsync_phase)
     except RecoveryBlocked:
         raise
     except OSError as error:
@@ -3610,6 +3654,7 @@ def _remove_exact_manifest_temporary(
         if parent_fd is not None:
             os.close(parent_fd)
         os.close(temporary_fd)
+    return True
 
 
 def _settle_manifest_temporaries(data_root: Path, exchange: Exchange) -> None:
@@ -3996,6 +4041,8 @@ def _accept_exact_publication(
     temporary: Path | None,
     expected_size: int,
     expected_sha256: str,
+    phase_hook: StoragePhaseHook | None = None,
+    parent_fsync_phase: str | None = None,
 ) -> bool:
     try:
         destination_fd, _ = _open_regular_no_follow(destination)
@@ -4059,6 +4106,8 @@ def _accept_exact_publication(
                 finally:
                     os.close(temporary_fd)
         os.fsync(parent_fd)
+        if parent_fsync_phase is not None:
+            notify_storage_phase(phase_hook, parent_fsync_phase)
     except RecoveryBlocked:
         raise
     except OSError as error:
@@ -4663,6 +4712,10 @@ def _settle_discovered_source(
                     os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 except FileNotFoundError:
                     os.fsync(parent_fd)
+                    notify_storage_phase(
+                        phase_hook,
+                        "source_settlement_compensation_parent_fsync",
+                    )
                     return
                 raise RecoveryBlocked("recovery source reappeared during settlement")
             finally:
@@ -5361,6 +5414,104 @@ def _settle_owned_control_publication_coexistence(
         raise RecoveryBlocked("owned control partial remains after replay")
 
 
+def _settle_owned_control_normal_manifest_temporary(
+    *,
+    data_root: Path,
+    ownership: RecoveryControlOwnershipV1,
+    carrier_ready: bool,
+    final_manifest_bytes: bytes | None,
+    phase_hook: StoragePhaseHook | None = None,
+) -> bool:
+    manifest_path = data_root / ownership.control_manifest_relative_path
+    temporary_path = manifest_path.with_name(manifest_path.name + ".partial")
+    try:
+        temporary_bytes = _read_regular_bytes(temporary_path)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise RecoveryBlocked("owned control manifest temporary is unsafe") from error
+    _validate_normal_owned_control_manifest(temporary_bytes, ownership)
+    if not carrier_ready:
+        raise RecoveryBlocked(
+            "owned control manifest temporary lacks its exact carrier"
+        )
+
+    if final_manifest_bytes is not None:
+        _verify_owned_control_carrier(data_root, ownership)
+        recovery_manifest_bytes = base64.b64decode(
+            ownership.control_recovery_manifest_base64,
+            validate=True,
+        )
+        if final_manifest_bytes == recovery_manifest_bytes:
+            _remove_exact_manifest_temporary(
+                temporary_path,
+                expected_size=len(temporary_bytes),
+                expected_sha256=hashlib.sha256(temporary_bytes).hexdigest(),
+            )
+        else:
+            accepted = _accept_exact_publication(
+                destination=manifest_path,
+                temporary=temporary_path,
+                expected_size=len(final_manifest_bytes),
+                expected_sha256=hashlib.sha256(final_manifest_bytes).hexdigest(),
+                phase_hook=phase_hook,
+                parent_fsync_phase=(
+                    "owned_control_normal_manifest_compensation_parent_fsync"
+                ),
+            )
+            if not accepted:
+                raise RecoveryBlocked(
+                    "owned control normal manifest disappeared during settlement"
+                )
+    else:
+        temporary_fd: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            temporary_fd, _ = _open_regular_no_follow(temporary_path)
+            expected_temporary = (
+                len(temporary_bytes),
+                hashlib.sha256(temporary_bytes).hexdigest(),
+            )
+            if size_and_sha256_fd(temporary_fd) != expected_temporary:
+                raise RecoveryBlocked("owned control normal manifest temporary changed")
+            publish_no_replace(
+                temporary_path,
+                manifest_path,
+                expected_source_fd=temporary_fd,
+                phase_hook=_project_phase_hook(
+                    phase_hook,
+                    {
+                        "after_namespace_publish": (
+                            "owned_control_normal_manifest_publish"
+                        ),
+                        "after_publication_parent_fsync": (
+                            "owned_control_normal_manifest_parent_fsync"
+                        ),
+                    },
+                ),
+            )
+        except RecoveryBlocked as error:
+            primary_error = error
+            raise
+        except (OSError, PublicationConflict) as error:
+            primary_error = error
+            raise RecoveryBlocked(
+                "owned control normal manifest publication failed"
+            ) from error
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if temporary_fd is not None:
+                try:
+                    os.close(temporary_fd)
+                except BaseException:
+                    if primary_error is None:
+                        raise
+    _verify_owned_control_carrier(data_root, ownership)
+    return True
+
+
 async def _restore_owned_control_carrier(
     context: RecoveryContext,
     ownership: RecoveryControlOwnershipV1,
@@ -5418,6 +5569,35 @@ async def _restore_owned_control_carrier(
         ownership.control_recovery_manifest_base64,
         validate=True,
     )
+    normal_manifest_settled = await run_storage(
+        context.io_limiter,
+        context.storage_executor,
+        _settle_owned_control_normal_manifest_temporary,
+        data_root=context.data_root,
+        ownership=ownership,
+        carrier_ready=final_exists and not partial_exists,
+        final_manifest_bytes=manifest_bytes,
+        phase_hook=context.phase_hook,
+    )
+    if normal_manifest_settled:
+        transaction_temporary = manifest_path.with_name(
+            f".{manifest_path.name}.tmp-{ownership.transaction_id}"
+        )
+        await run_storage(
+            context.io_limiter,
+            context.storage_executor,
+            _remove_exact_manifest_temporary,
+            transaction_temporary,
+            expected_size=len(expected_manifest),
+            expected_sha256=hashlib.sha256(expected_manifest).hexdigest(),
+            missing_ok=True,
+            phase_hook=context.phase_hook,
+            parent_fsync_phase=(
+                "owned_control_recovery_manifest_compensation_parent_fsync"
+            ),
+        )
+        return
+
     if manifest_bytes is not None:
         if not final_exists or partial_exists:
             raise RecoveryBlocked("owned control manifest lacks its exact carrier")
@@ -5428,6 +5608,26 @@ async def _restore_owned_control_carrier(
             context.data_root,
             ownership,
         )
+        transaction_temporary = manifest_path.with_name(
+            f".{manifest_path.name}.tmp-{ownership.transaction_id}"
+        )
+        accepted = await run_storage(
+            context.io_limiter,
+            context.storage_executor,
+            _accept_exact_publication,
+            destination=manifest_path,
+            temporary=transaction_temporary,
+            expected_size=len(manifest_bytes),
+            expected_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            phase_hook=context.phase_hook,
+            parent_fsync_phase=(
+                "owned_control_recovery_manifest_compensation_parent_fsync"
+            ),
+        )
+        if not accepted:
+            raise RecoveryBlocked(
+                "owned control manifest disappeared during settlement"
+            )
         return
 
     if not final_exists:

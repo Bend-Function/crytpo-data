@@ -380,6 +380,7 @@ class RawWriterService:
         self._close_future: asyncio.Future[object] | None = None
         self._active_close_deadline_ns: int | None = None
         self._pending_oldest_error: WriterCriticalError | None = None
+        self._terminal_error: BaseException | None = None
         self._critical_draining = False
         self._closed_manifests: tuple[object, ...] | None = None
         self._metrics_cache = self._build_metrics_snapshot()
@@ -670,6 +671,13 @@ class RawWriterService:
 
     def _enqueue_command(self, kind: str, *args: object) -> asyncio.Future[object]:
         future: asyncio.Future[object] = self._owner_loop.create_future()
+        if self._stopping:
+            future.set_exception(
+                self._terminal_error
+                if self._terminal_error is not None
+                else RuntimeError("raw writer service has stopped")
+            )
+            return future
         self._commands.put_nowait(
             _ServiceCommand(
                 kind,
@@ -744,6 +752,9 @@ class RawWriterService:
         )
         if generation <= self._config_generation:
             raise ValueError("config_generation must be strictly greater")
+        if self._stopping:
+            future = self._enqueue_command("rotate_config", config_sha256, generation)
+            return cast(tuple[object, ...], await asyncio.shield(future))
         if self._lifecycle is not WriterLifecycle.ACCEPTING:
             raise RuntimeError("config rotation requires an accepting writer")
         if self._admission_state is AdmissionState.OPEN:
@@ -776,7 +787,11 @@ class RawWriterService:
     async def mark_incomplete(self, reason: str) -> None:
         self._assert_affinity()
         normalized = _nonempty(reason, field_name="reason")
-        self._admission_state = AdmissionState.CLOSED
+        if not self._stopping:
+            self._admission_state = AdmissionState.CLOSED
+            if self._lifecycle is WriterLifecycle.ACCEPTING:
+                self._lifecycle = WriterLifecycle.CLOSING
+            self._refresh_metrics_cache()
         future = self._enqueue_command("incomplete", normalized)
         await asyncio.shield(future)
 
@@ -946,6 +961,9 @@ class RawWriterService:
         return _nonnegative(self._clock.time_ns(), field_name="clock.time_ns()")
 
     def _build_metrics_snapshot(self) -> WriterMetricsSnapshotV1:
+        return self._assemble_metrics_snapshot()
+
+    def _assemble_metrics_snapshot(self) -> WriterMetricsSnapshotV1:
         status = self._build_status()
         ingress = self._ingress.snapshot_for_test()
         resident = self._resident_budget.snapshot()
@@ -1751,6 +1769,9 @@ class RawWriterService:
                         "partial_parent_fsync": ("owned_control_partial_parent_fsync"),
                         "after_frame_write": "owned_control_frame_write",
                         "after_data_sync": "recovery_control_sync",
+                        "after_manifest_temp_sync": (
+                            "owned_control_normal_manifest_temp_fsync"
+                        ),
                     },
                 ),
             )
@@ -1920,7 +1941,7 @@ class RawWriterService:
                             await self._drain_ingress(watermark=command.watermark)
                         result = await self._execute_command(command)
                     except BaseException as error:  # noqa: BLE001 - terminalize actor
-                        terminal_error = await self._enter_terminal_error(error)
+                        terminal_error = await self._capture_terminal_error(error)
                         self._stopping = True
                         break
                     finally:
@@ -1946,10 +1967,21 @@ class RawWriterService:
                     await self._rotate_due_parts()
                     self._evaluate_slo(observed_monotonic_ns=self._sample_monotonic())
         except BaseException as error:  # noqa: BLE001 - terminalize every actor path
-            terminal_error = await self._enter_terminal_error(error)
+            terminal_error = await self._capture_terminal_error(error)
             self._stopping = True
         finally:
-            await self._release_resources()
+            try:
+                await self._release_resources()
+            except BaseException as release_error:  # noqa: BLE001 - settle all futures
+                if terminal_error is None:
+                    terminal_error = release_error
+                else:
+                    terminal_error.add_note(
+                        "raw writer resource release also failed: "
+                        f"{type(release_error).__name__}"
+                    )
+            if terminal_error is not None:
+                self._terminal_error = terminal_error
             if terminal_command is not None and not terminal_command.future.done():
                 if terminal_error is None:
                     terminal_command.future.set_result(terminal_result)
@@ -1967,6 +1999,25 @@ class RawWriterService:
                         if terminal_error is not None
                         else RuntimeError("raw writer service has stopped")
                     )
+
+    async def _capture_terminal_error(self, error: BaseException) -> BaseException:
+        try:
+            terminal_error = await self._enter_terminal_error(error)
+        except BaseException as capture_error:  # noqa: BLE001 - fail the owned command
+            capture_error.add_note(
+                "raw writer terminal accounting also failed while handling "
+                f"{type(error).__name__}"
+            )
+            try:
+                self._metrics_cache = self._assemble_metrics_snapshot()
+            except BaseException as snapshot_error:  # noqa: BLE001 - freeze terminal state
+                capture_error.add_note(
+                    "raw writer terminal metrics snapshot also failed: "
+                    f"{type(snapshot_error).__name__}"
+                )
+            terminal_error = capture_error
+        self._terminal_error = terminal_error
+        return terminal_error
 
     async def _enter_terminal_error(self, error: BaseException) -> BaseException:
         if isinstance(error, RecoveryBlocked) and self._ledger.accepted_count == 0:
@@ -2018,26 +2069,44 @@ class RawWriterService:
     async def _release_resources(self) -> None:
         if self._resources_released:
             return
-        self._resources_released = True
-        if self._ticker_task is not None:
-            self._ticker_task.cancel()
-            try:
-                await self._ticker_task
-            except asyncio.CancelledError:
-                pass
-        self._executor.shutdown(wait=True, cancel_futures=False)
-        first_error: BaseException | None = None
+        errors: list[BaseException] = []
         try:
-            for part in (*self._parts.active_parts(), *self._retiring.values()):
+            if self._ticker_task is not None:
+                try:
+                    self._ticker_task.cancel()
+                    await self._ticker_task
+                except asyncio.CancelledError:
+                    pass
+                except BaseException as error:  # noqa: BLE001 - release remaining resources
+                    errors.append(error)
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=False)
+            except BaseException as error:  # noqa: BLE001 - release remaining resources
+                errors.append(error)
+            try:
+                parts = (*self._parts.active_parts(), *self._retiring.values())
+            except BaseException as error:  # noqa: BLE001 - still release writer lock
+                errors.append(error)
+                parts = ()
+            for part in parts:
                 try:
                     part.close_fd_for_test()
                 except BaseException as error:  # noqa: BLE001 - close every owned FD
-                    if first_error is None:
-                        first_error = error
+                    errors.append(error)
         finally:
-            self._writer_lock.release()
-        if first_error is not None:
-            raise first_error
+            try:
+                self._writer_lock.release()
+            except BaseException as error:  # noqa: BLE001 - retain earlier failures
+                errors.append(error)
+            self._resources_released = True
+        if errors:
+            primary = errors[0]
+            for secondary in errors[1:]:
+                primary.add_note(
+                    "raw writer resource release also failed: "
+                    f"{type(secondary).__name__}"
+                )
+            raise primary
 
 
 __all__ = ["AsyncSleeper", "AsyncioSleeper", "RawWriterService"]

@@ -15,6 +15,7 @@ from crypto_collector.config.models import IngressConfig, WriterConfig
 from crypto_collector.domain.envelope import NativeEventDraft, SourceContext
 from crypto_collector.domain.types import CloseReason, Exchange, Market, Transport
 from crypto_collector.storage.durability import (
+    AsyncSleeper,
     DurabilitySloState,
     DurabilitySloTransition,
     SyncBackend,
@@ -110,6 +111,15 @@ class ManualSleeper:
         waiter = await self._waiters.get()
         self._waiters.task_done()
         waiter.set()
+
+
+class FailingSleeper:
+    def __init__(self) -> None:
+        self.failed = asyncio.Event()
+
+    async def sleep_ns(self, _delay_ns: int) -> None:
+        self.failed.set()
+        raise RuntimeError("injected ticker failure")
 
 
 class BlockingSyncBackend:
@@ -341,7 +351,7 @@ async def open_service(
     tmp_path: Path,
     *,
     recovery_backend: EmptyRecoveryBackend | None = None,
-    sleeper: ManualSleeper | None = None,
+    sleeper: AsyncSleeper | None = None,
     sync_backend: SyncBackend | None = None,
     writer_config: WriterConfig | None = None,
     metric_stream_allowlist: tuple[str, ...] = ("_control", "trade"),
@@ -1135,6 +1145,159 @@ async def test_part_allocation_failure_terminalizes_actor_and_releases_lock(
     assert service.status().uncertain_record_count == 1
     with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
         pass
+
+
+@pytest.mark.asyncio
+async def test_terminal_accounting_failure_cannot_resolve_command_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _clock = await open_service(tmp_path)
+    original_refresh = service._refresh_metrics_cache
+
+    def fail_terminal_refresh() -> None:
+        if service._lifecycle is WriterLifecycle.CRITICAL:
+            raise RuntimeError("injected terminal cache failure")
+        original_refresh()
+
+    monkeypatch.setattr(service, "_refresh_metrics_cache", fail_terminal_refresh)
+
+    with pytest.raises(RuntimeError, match="injected terminal cache failure"):
+        await service.mark_incomplete("injected incomplete state")
+    snapshot = service.metrics_snapshot()
+    assert snapshot.lifecycle is WriterLifecycle.CRITICAL
+    assert snapshot.admission_state is AdmissionState.CLOSED
+    assert snapshot.critical_reason is WriterCriticalReason.MARKED_INCOMPLETE
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_terminal_snapshot_fallback_rebuilds_conserved_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _clock = await open_service(tmp_path)
+    assert service.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    ).accepted
+    previous = service.metrics_snapshot()
+    original_build = service._build_metrics_snapshot
+    original_enter = service._enter_terminal_error
+    terminal_inputs: list[BaseException] = []
+
+    async def trace_terminal(error: BaseException) -> BaseException:
+        terminal_inputs.append(error)
+        return await original_enter(error)
+
+    def fail_terminal_build() -> object:
+        if service._lifecycle is WriterLifecycle.CRITICAL:
+            raise RuntimeError("injected terminal snapshot failure")
+        return original_build()
+
+    monkeypatch.setattr(service, "_build_metrics_snapshot", fail_terminal_build)
+    monkeypatch.setattr(service, "_enter_terminal_error", trace_terminal)
+
+    with pytest.raises(RuntimeError, match="injected terminal snapshot failure"):
+        await service.mark_incomplete("injected incomplete state")
+
+    assert len(terminal_inputs) == 1
+    assert isinstance(terminal_inputs[0], WriterCriticalError)
+    assert terminal_inputs[0].reason is WriterCriticalReason.MARKED_INCOMPLETE
+    snapshot = service.metrics_snapshot()
+    assert snapshot.observed_monotonic_ns > previous.observed_monotonic_ns
+    assert snapshot.lifecycle is WriterLifecycle.CRITICAL
+    assert snapshot.admission_state is AdmissionState.CLOSED
+    assert snapshot.critical_reason is WriterCriticalReason.MARKED_INCOMPLETE
+    assert snapshot.accepted_record_count == 1
+    assert snapshot.durable_record_count == 0
+    assert snapshot.unpersisted_record_count == 0
+    assert snapshot.uncertain_record_count == 1
+    assert snapshot.queued_records == 0
+    assert snapshot.buffered_records == 0
+    assert snapshot.in_flight_records == 0
+    assert snapshot.resident_record_bytes == 0
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_resource_release_failure_cannot_leave_close_future_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, clock = await open_service(tmp_path)
+    original_release = service._release_resources
+
+    async def release_then_fail() -> None:
+        await original_release()
+        raise RuntimeError("injected resource release failure")
+
+    monkeypatch.setattr(service, "_release_resources", release_then_fail)
+
+    with pytest.raises(RuntimeError, match="injected resource release failure"):
+        await asyncio.wait_for(
+            service.close_all(
+                CloseReason.SHUTDOWN,
+                deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+            ),
+            timeout=1,
+        )
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_ticker_failure_still_releases_every_owned_resource(
+    tmp_path: Path,
+) -> None:
+    sleeper = FailingSleeper()
+    service, clock = await open_service(tmp_path, sleeper=sleeper)
+    await asyncio.wait_for(sleeper.failed.wait(), timeout=1)
+
+    with pytest.raises(RuntimeError, match="injected ticker failure"):
+        await asyncio.wait_for(
+            service.close_all(
+                CloseReason.SHUTDOWN,
+                deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+            ),
+            timeout=1,
+        )
+
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("sync", "rotate_due", "rotate_config", "close", "incomplete"),
+)
+@pytest.mark.asyncio
+async def test_command_after_terminal_error_fails_without_reentering_stopped_actor(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    service, clock = await open_service(tmp_path)
+    with pytest.raises(WriterCriticalError) as terminal:
+        await service.mark_incomplete("injected terminal state")
+    assert terminal.value.reason is WriterCriticalReason.MARKED_INCOMPLETE
+
+    if command == "sync":
+        pending = service.sync_now()
+    elif command == "rotate_due":
+        pending = service.rotate_due_files()
+    elif command == "rotate_config":
+        pending = service.rotate_for_config("b" * 64, 1)
+    elif command == "incomplete":
+        pending = service.mark_incomplete("repeated incomplete state")
+    else:
+        pending = service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+    with pytest.raises(WriterCriticalError) as repeated:
+        await asyncio.wait_for(pending, timeout=1)
+    assert repeated.value.reason is WriterCriticalReason.MARKED_INCOMPLETE
 
 
 @pytest.mark.asyncio
