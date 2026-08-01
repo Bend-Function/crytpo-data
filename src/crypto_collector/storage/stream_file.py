@@ -298,6 +298,11 @@ class StreamFile:
     def closed(self) -> bool:
         return self._fd < 0
 
+    def fileno(self) -> int:
+        if self.closed:
+            raise ValueError("stream file is closed")
+        return self._fd
+
     @property
     def pending_plain_bytes(self) -> int:
         return self._buffer_plain_bytes

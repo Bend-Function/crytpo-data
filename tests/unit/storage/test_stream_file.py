@@ -393,6 +393,19 @@ def test_generation_id_is_immutable_after_sealing(tmp_path: Path) -> None:
     stream.close_fd()
 
 
+def test_fileno_does_not_transfer_ownership_and_rejects_closed_stream(
+    tmp_path: Path,
+) -> None:
+    stream = allocate(tmp_path / "part.jsonl.zst.partial")
+    fd = stream.fileno()
+    assert os.fstat(fd).st_size == 0
+
+    stream.close_fd()
+
+    with pytest.raises(ValueError, match="closed"):
+        stream.fileno()
+
+
 def test_pending_rows_reject_mismatched_bytes_and_decreasing_time() -> None:
     first = BufferedRow(b'{"a":1}\n', accepted_monotonic_ns=20)
     second = BufferedRow(b'{"b":2}\n', accepted_monotonic_ns=10)
