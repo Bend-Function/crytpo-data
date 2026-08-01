@@ -3247,31 +3247,70 @@ The service loop submits the group and immediately returns to its message pump; 
 not await the batch and does not read coordinator statistics:
 
 ```python
-due_files = seal_and_detach_all_due_files(reason)
-due_work = tuple(
-    stream_file.seal_for_sync(force_sync=True) for stream_file in due_files
-)
+due_files, associated_controls = preflight_close_group(reason)
+work_files = due_files + associated_controls
+prerequisites = {}
+prerequisite_batches = {}
+for stream_file in work_files:
+    claim = stream_file.in_flight_claim()
+    if claim is None:
+        continue
+    batch_task = stream_file.claim_batch_task(claim)
+    if batch_task is None:
+        raise UntrackedInFlightClaim(stream_file.generation_id)
+    prerequisites[stream_file.generation_id] = claim
+    prerequisite_batches.setdefault(batch_task, []).append(
+        stream_file.generation_id
+    )
+for generation_id in (item.generation_id for item in work_files):
+    if generation_id in self._final_barrier_by_generation_id:
+        raise DuplicateFileGeneration(generation_id)
+retire_and_detach(due_files, reason)
+
 command = FinalBarrierCommandState(
     command_id=uuid.uuid4(),
     due_files=due_files,
-    remaining_generation_ids={item.generation_id for item in due_work},
+    work_files=work_files,
+    prerequisites=prerequisites,
+    prerequisite_batches=prerequisite_batches,
+    remaining_prerequisite_generation_ids=set(prerequisites),
+    remaining_generation_ids=set(),
     batch_settled=False,
     result_future=loop.create_future(),
 )
 self._owned_commands[command.command_id] = command
-for generation_id in command.remaining_generation_ids:
-    if generation_id in self._final_barrier_by_generation_id:
-        raise DuplicateFileGeneration(generation_id)
+for generation_id in (item.generation_id for item in work_files):
     self._final_barrier_by_generation_id[generation_id] = command.command_id
-command.batch_task = asyncio.create_task(
-    durability_coordinator.sync_batch(
-        due_work,
-        trigger=_CLOSE_TRIGGER[reason],
+for batch_task in prerequisite_batches:
+    batch_task.add_done_callback(
+        lambda task: self._post_prerequisite_batch_settled(
+            command.command_id, task
+        )
     )
-)
-command.batch_task.add_done_callback(
-    lambda task: self._post_batch_settled(command.command_id, task)
-)
+if not prerequisites:
+    self._submit_final_batch(command)
+
+def _submit_final_batch(command: FinalBarrierCommandState) -> None:
+    # An in-flight associated control that completed successfully has already been
+    # folded. A still-pending associated control joins this batch even when it is not
+    # itself due to close.
+    final_files = command.due_files + command.pending_associated_controls()
+    due_work = tuple(
+        stream_file.seal_for_sync(force_sync=True)
+        for stream_file in final_files
+    )
+    command.remaining_generation_ids = {
+        item.generation_id for item in due_work
+    }
+    command.batch_task = asyncio.create_task(
+        durability_coordinator.sync_batch(
+            due_work,
+            trigger=command.trigger,
+        )
+    )
+    command.batch_task.add_done_callback(
+        lambda task: self._post_batch_settled(command.command_id, task)
+    )
 
 # These cases run in ordinary service-loop FIFO turns. This helper is also used by
 # periodic/frame-cap/barrier completions and is the sole ledger/statistics writer.
@@ -3284,20 +3323,35 @@ match message:
         self._apply_file_failure(generation_id, error)
         self._note_final_barrier_file_settled(generation_id, failure=error)
 
+    case FinalBarrierPrerequisiteBatchSettled(command_id=command_id, task=task):
+        command = self._owned_commands.get(command_id)
+        if command is not None:
+            # A settled originating batch must have emitted one per-file completion.
+            # Missing notifications terminalize those prerequisite claims; inherit an
+            # explicit WRITE_FAILED/SYNC_FAILED reason for affected generations.
+            self._fail_missing_prerequisite_completions(command, task)
+            self._try_advance_prerequisites(command)
+
     case FinalBarrierBatchSettled(command_id=command_id, outcome=outcome):
         command = self._owned_commands[command_id]
         command.batch_settled = True
         command.batch_outcome = outcome
+        self._fail_missing_final_completions(command)
         self._try_finish_final_barrier(command)
 
 def _note_final_barrier_file_settled(
     generation_id: str, *, failure: BaseException | None
 ) -> None:
-    command_id = self._final_barrier_by_generation_id.pop(generation_id, None)
+    command_id = self._final_barrier_by_generation_id.get(generation_id)
     if command_id is None:
         # Periodic, frame-cap flush, and explicit sync work has no final-barrier state.
         return
     command = self._owned_commands[command_id]
+    if generation_id in command.remaining_prerequisite_generation_ids:
+        self._settle_prerequisite(command, generation_id, failure=failure)
+        self._try_advance_prerequisites(command)
+        return
+    self._final_barrier_by_generation_id.pop(generation_id)
     command.remaining_generation_ids.remove(generation_id)
     if failure is not None:
         command.file_errors[generation_id] = failure
@@ -3325,12 +3379,19 @@ def _try_finish_final_barrier(command: FinalBarrierCommandState) -> None:
 
 Completion accounting is unconditional, but final-barrier bookkeeping is conditional
 on the explicit generation-to-command index installed when the close command is
-created. Periodic, non-closing plaintext frame-cap, and `sync_now` generations
-legitimately have no `FinalBarrierCommandState`; this does not include
-`CloseReason.ROTATE_SIZE`. Their successful or failed completion is fully applied
-and returns from `_note_final_barrier_file_settled` without lookup failure. Conversely,
-every generation in a final command must remove exactly one index entry before the
-command can publish, and command cleanup asserts no entry remains.
+created. Periodic, non-closing plaintext frame-cap, and `sync_now` generations initially
+have no `FinalBarrierCommandState`; this does not include `CloseReason.ROTATE_SIZE`.
+If a close command encounters one of those claims still in flight, it adopts the exact
+claim and its tracked originating batch task as a prerequisite, then reserves every
+closing and associated-control generation before returning to the message pump. A
+settled prerequisite keeps its reservation when it must join the final batch; a durable
+non-closing control may release its reservation after its association is folded. Failed
+prerequisite reservations are released together only after every prerequisite settles.
+Untracked in-flight claims are rejected before retirement. Ordinary completions with no
+adopting command are fully applied and return from
+`_note_final_barrier_file_settled` without lookup failure. Conversely, every generation
+reserved by a final command must release exactly its own index entry before the command
+can publish or fail, and command cleanup asserts no entry owned by that command remains.
 
 `_publish_group_io` receives only immutable service-owned summary snapshots and performs
 sequential filesystem work through `run_storage`; it cannot mutate the ledger,
