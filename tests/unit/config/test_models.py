@@ -77,6 +77,26 @@ def test_runtime_safety_defaults_are_explicit() -> None:
     assert runtime.worker_restart.max_attempts == 10
     assert config.network.retry.rest_max_attempts == 5
     assert config.network.scheduler.deep_snapshot_max_interval_ns == 900_000_000_000
+    assert config.network.scheduler.max_pending_jobs == 10_000
+    assert config.network.scheduler.event_history_limit == 1_024
+
+
+@pytest.mark.parametrize("field", ["max_pending_jobs", "event_history_limit"])
+def test_scheduler_bounds_must_be_positive(field: str) -> None:
+    invalid = deepcopy(BASE)
+    invalid["network"]["scheduler"] = {field: 0}
+
+    with pytest.raises(ValidationError, match=field):
+        CollectorConfig.model_validate(invalid)
+
+
+@pytest.mark.parametrize("field", ["max_pending_jobs", "event_history_limit"])
+def test_scheduler_bounds_reject_unallocatable_values(field: str) -> None:
+    invalid = deepcopy(BASE)
+    invalid["network"]["scheduler"] = {field: 10**100}
+
+    with pytest.raises(ValidationError, match=field):
+        CollectorConfig.model_validate(invalid)
 
 
 def test_materializer_intervals_fit_hourly_revision_partitions() -> None:

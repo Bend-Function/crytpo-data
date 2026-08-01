@@ -27,6 +27,7 @@ from crypto_collector.config.primitives import (
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MINUTE_NS = 60_000_000_000
 _HOUR_NS = 3_600_000_000_000
+_MAX_SCHEDULER_COLLECTION_ITEMS = 1_000_000
 
 
 def _duration_ns(value: object) -> int:
@@ -286,6 +287,14 @@ class SchedulerConfig(StrictModel):
     )
     recovery_step_ratio: Annotated[float, Field(gt=0, le=1)] = 0.20
     healthy_refreshes_before_step_down: Annotated[int, Field(gt=0)] = 3
+    max_pending_jobs: Annotated[
+        int,
+        Field(gt=0, le=_MAX_SCHEDULER_COLLECTION_ITEMS),
+    ] = 10_000
+    event_history_limit: Annotated[
+        int,
+        Field(gt=0, le=_MAX_SCHEDULER_COLLECTION_ITEMS),
+    ] = 1_024
 
 
 def _default_egress_pool() -> tuple[EgressConfig, ...]:

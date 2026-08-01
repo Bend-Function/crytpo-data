@@ -203,3 +203,53 @@ def test_registry_rejects_duplicate_budget_key() -> None:
 
     with pytest.raises(ValueError, match="already exists"):
         budgets.add(key, capacity=10, refill_per_second=1)
+
+
+def test_quote_reports_exact_ready_time_without_consuming_tokens() -> None:
+    clock = FakeClock()
+    bucket = TokenBucket(capacity=10, refill_per_second=2, clock=clock)
+    assert bucket.try_acquire(10)
+
+    assert bucket.ready_at_ns(3) == 1_500_000_000
+    assert bucket.tokens == 0
+
+    clock.advance(1_500_000_000)
+    assert bucket.ready_at_ns(3) == 1_500_000_000
+    assert bucket.tokens == 3
+
+
+def test_quote_subtraction_ignores_ambient_decimal_precision() -> None:
+    clock = FakeClock()
+    bucket = TokenBucket(capacity=1, refill_per_second=1, clock=clock)
+    assert bucket.try_acquire(Decimal("0.876543211"))
+
+    with localcontext() as context:
+        context.prec = 2
+        assert bucket.ready_at_ns(1) == 876_543_211
+
+
+def test_registry_atomically_acquires_first_ready_distinct_candidate() -> None:
+    clock = FakeClock()
+    budgets = BudgetRegistry(clock)
+    blocked = ("okx", "nat-a", "depth")
+    ready = ("okx", "nat-b", "depth")
+    budgets.add(blocked, capacity=1, refill_per_second=1)
+    budgets.add(ready, capacity=1, refill_per_second=1)
+    assert budgets.try_acquire(blocked, cost=1)
+
+    selected = budgets.try_acquire_one((blocked, blocked, ready), cost=1)
+
+    assert selected == ready
+    assert budgets.bucket(blocked).tokens == 0
+    assert budgets.bucket(ready).tokens == 0
+
+
+def test_registry_quote_uses_current_throttled_rate() -> None:
+    clock = FakeClock()
+    budgets = BudgetRegistry(clock)
+    key = ("okx", "nat-a", "depth")
+    budgets.add(key, capacity=10, refill_per_second=4)
+    assert budgets.try_acquire(key, cost=10)
+    budgets.set_refill_multiplier(key, Decimal("0.5"), floor=0)
+
+    assert budgets.ready_at_ns(key, cost=3) == 1_500_000_000

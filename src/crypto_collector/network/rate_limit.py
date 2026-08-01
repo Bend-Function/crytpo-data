@@ -121,11 +121,14 @@ class TokenBucket:
         self._refill()
         return self._tokens
 
-    def _refill(self) -> None:
-        now_ns = _nonnegative_nanoseconds(
-            self._clock.monotonic_ns(),
-            field="clock.monotonic_ns()",
-        )
+    def _refill(self, now_ns: int | None = None) -> None:
+        if now_ns is None:
+            now_ns = _nonnegative_nanoseconds(
+                self._clock.monotonic_ns(),
+                field="clock.monotonic_ns()",
+            )
+        else:
+            now_ns = _nonnegative_nanoseconds(now_ns, field="now_ns")
         if now_ns <= self._last_refill_ns:
             return
         elapsed_ns = now_ns - self._last_refill_ns
@@ -143,7 +146,12 @@ class TokenBucket:
             self._tokens = min(self._capacity, self._tokens + replenished)
         self._last_refill_ns = now_ns
 
-    def try_acquire(self, cost: DecimalInput) -> bool:
+    def try_acquire(
+        self,
+        cost: DecimalInput,
+        *,
+        now_ns: int | None = None,
+    ) -> bool:
         normalized_cost = _decimal_input(
             cost,
             field="cost",
@@ -151,13 +159,44 @@ class TokenBucket:
         )
         if normalized_cost > self._hard_capacity:
             raise ValueError("cost cannot exceed the bucket hard capacity")
-        self._refill()
+        self._refill(now_ns)
         if normalized_cost > self._tokens:
             return False
         with localcontext() as context:
             context.prec = _calculation_precision(self._tokens, normalized_cost)
             self._tokens -= normalized_cost
         return True
+
+    def ready_at_ns(
+        self,
+        cost: DecimalInput,
+        *,
+        now_ns: int | None = None,
+    ) -> int | None:
+        normalized_cost = _decimal_input(
+            cost,
+            field="cost",
+            allow_zero=False,
+        )
+        if normalized_cost > self._hard_capacity:
+            raise ValueError("cost cannot exceed the bucket hard capacity")
+        self._refill(now_ns)
+        if normalized_cost <= self._tokens:
+            return self._last_refill_ns
+        if self._refill_per_second == 0:
+            return None
+
+        cost_numerator, cost_denominator = normalized_cost.as_integer_ratio()
+        token_numerator, token_denominator = self._tokens.as_integer_ratio()
+        missing_numerator = (
+            cost_numerator * token_denominator - token_numerator * cost_denominator
+        )
+        missing_denominator = cost_denominator * token_denominator
+        rate_numerator, rate_denominator = self._refill_per_second.as_integer_ratio()
+        wait_numerator = missing_numerator * rate_denominator * 1_000_000_000
+        wait_denominator = missing_denominator * rate_numerator
+        wait_ns = (wait_numerator + wait_denominator - 1) // wait_denominator
+        return self._last_refill_ns + wait_ns
 
     def observe_available(self, raw_available: str) -> bool:
         if type(raw_available) is not str or not _NONNEGATIVE_DECIMAL_TEXT.fullmatch(
@@ -242,6 +281,10 @@ class BudgetRegistry:
         self._clock = clock
         self._buckets: dict[BudgetKey, TokenBucket] = {}
 
+    @property
+    def clock(self) -> Clock:
+        return self._clock
+
     def add(
         self,
         key: BudgetKey,
@@ -270,6 +313,7 @@ class BudgetRegistry:
         cost: DecimalInput,
         default_capacity: DecimalInput | None = None,
         default_refill_per_second: DecimalInput | None = None,
+        now_ns: int | None = None,
     ) -> bool:
         validated_key = _validate_key(key)
         bucket = self._buckets.get(validated_key)
@@ -285,7 +329,35 @@ class BudgetRegistry:
                     else default_refill_per_second
                 ),
             )
-        return bucket.try_acquire(cost)
+        return bucket.try_acquire(cost, now_ns=now_ns)
+
+    def ready_at_ns(
+        self,
+        key: BudgetKey,
+        *,
+        cost: DecimalInput,
+        now_ns: int | None = None,
+    ) -> int | None:
+        return self.bucket(key).ready_at_ns(cost, now_ns=now_ns)
+
+    def try_acquire_one(
+        self,
+        keys: tuple[BudgetKey, ...],
+        *,
+        cost: DecimalInput,
+        now_ns: int | None = None,
+    ) -> BudgetKey | None:
+        if type(keys) is not tuple or not keys:
+            raise ValueError("keys must be a non-empty tuple of budget keys")
+        seen: set[BudgetKey] = set()
+        for key in keys:
+            validated = _validate_key(key)
+            if validated in seen:
+                continue
+            seen.add(validated)
+            if self.bucket(validated).try_acquire(cost, now_ns=now_ns):
+                return validated
+        return None
 
     def observe_available(self, key: BudgetKey, raw_available: str) -> bool:
         return self.bucket(key).observe_available(raw_available)

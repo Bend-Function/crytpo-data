@@ -479,8 +479,14 @@ git commit -m "feat: enforce per-quota-group request budgets"
 - Create: `src/crypto_collector/scheduler/models.py`
 - Create: `src/crypto_collector/scheduler/rest.py`
 - Create: `src/crypto_collector/scheduler/interval_observability.py`
+- Modify: `src/crypto_collector/network/rate_limit.py`
+- Modify: `src/crypto_collector/domain/envelope.py`
+- Modify: `src/crypto_collector/config/models.py`
 - Test: `tests/unit/scheduler/test_rest.py`
 - Test: `tests/unit/scheduler/test_interval_observability.py`
+- Test: `tests/unit/network/test_rate_limit.py`
+- Test: `tests/unit/domain/test_envelope.py`
+- Test: `tests/unit/config/test_models.py`
 
 - [ ] **Step 1: Write failing priority and hysteresis tests**
 
@@ -540,9 +546,13 @@ def test_capacity_recovery_steps_down_without_request_spike() -> None:
     controller = IntervalController(
         current_ns=120_000_000_000, recovery_step=0.20, healthy_refreshes_required=3
     )
-    assert controller.recover_toward(30_000_000_000) == 120_000_000_000
-    assert controller.recover_toward(30_000_000_000) == 120_000_000_000
-    assert controller.recover_toward(30_000_000_000) == 96_000_000_000
+    first = controller.propose_toward(30_000_000_000, refresh_id=1)
+    controller.commit(first)
+    second = controller.propose_toward(30_000_000_000, refresh_id=2)
+    controller.commit(second)
+    third = controller.propose_toward(30_000_000_000, refresh_id=3)
+    assert third.effective_ns == 96_000_000_000
+    assert controller.current_ns == 120_000_000_000
 
 
 def test_periodic_replaceable_jobs_coalesce_instead_of_backlogging() -> None:
@@ -580,7 +590,10 @@ def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() ->
         cause="capacity_shortfall",
         direction="stretch",
     )
-    published = IntervalChangePublisher(sinks).publish(change)
+    published = IntervalChangePublisher(
+        sinks,
+        allowed_metric_series=frozenset({(Exchange.OKX, "books-full")}),
+    ).publish(change)
     expected_context = {
         "event_id": published.event_id,
         "requested_interval_ns": seconds(30),
@@ -637,8 +650,8 @@ def test_interval_change_is_visible_in_log_metric_control_and_rest_metadata() ->
     )
     assert sinks.metrics.label_names == {"exchange", "endpoint", "direction"}
     assert sinks.controls.one().logical_stream == "_control"
-    assert published.rest_metadata.requested_interval_ns == seconds(30)
-    assert published.rest_metadata.effective_interval_ns == minutes(2)
+    assert published.rest_intervals.requested_interval_ns == seconds(30)
+    assert published.rest_intervals.effective_interval_ns == minutes(2)
     assert "config_sha256" not in sinks.metrics.label_names
     assert "instrument" not in sinks.metrics.label_names
 ```
@@ -651,20 +664,26 @@ Expected: FAIL during import.
 
 - [ ] **Step 3: Implement the five priority classes**
 
-Keep two bounded heaps plus a logical-key index: future jobs use `(ready_monotonic_ns, insertion_sequence)`, while currently dispatchable jobs use `(priority, insertion_sequence)`. Before each dispatch, move every now-ready future job into the ready heap and discard/report jobs whose monotonic deadline has passed; sleep until the earliest future readiness only when the ready heap is empty. This prevents a future high-priority job from idling capacity while lower-priority work is ready. Priorities are live bootstrap/gap recovery, catalog/status/time, core derivative REST, deep snapshot, then replaceable reference data. A job carries requested/effective interval, endpoint cost, eligible egress IDs, generation-stickiness requirement, deadline, attempt, logical coalescing key, and control context. High priorities are strict among currently ready jobs; periodic deep/reference jobs are replaceable and coalesce by logical key across both heaps so throttling cannot create stale backlog. Stretching is deterministic from admitted symbols and healthy quota-group budgets, capped by the configured 15m default. Fixed/required work above that cap is a capacity error; other symbols return to admission policy. Require three healthy refreshes, then shorten by 20% per refresh.
+Keep two physically bounded heaps plus a logical-key index: future jobs use `(ready_monotonic_ns, insertion_sequence)`, while currently dispatchable jobs use `(priority, insertion_sequence)`. `SchedulerConfig.max_pending_jobs` is the hard live-job/combined-heap bound and `event_history_limit` bounds expired and evicted history; both accept only `1..1_000_000`, and the direct scheduler constructor enforces the same limit before constructing a collection. Replacement physically removes the prior entry before insertion; an older occurrence is `STALE_IGNORED`, an exact repeat is idempotent, and a conflicting equal occurrence fails. Compare that logical occurrence before sweeping expired incumbents, then sweep them before applying the capacity limit so dead work cannot reject fresh work. An already-expired newer occurrence supersedes its older logical occurrence but never evicts unrelated live work. Replacement remains atomic at capacity. If the queue is full, higher-priority fixed work may evict the lowest-priority replaceable job; replaceable incoming work never triggers eviction, and every other submission fails explicitly. `RestJob.control_context` is recursively immutable after validation, including nested objects and arrays, so queued identity and idempotency cannot be changed through an alias. Periodic deep/reference jobs use `StableCadence`: a stable anchor plus SHA-256-derived instrument phase, latest-due-only missed-slot handling, and a future first slot after an interval change, so recovery never creates a synchronized catch-up burst.
 
-Every effective-interval change creates one immutable `IntervalChange` with a generated event ID and publishes it synchronously to three injected sinks before the new schedule becomes active: a structured JSON warning, bounded-cardinality Prometheus counter/gauges, and a reserved `_control` `NativeEventDraft`. The log and control payload include requested/effective interval, endpoint, healthy-egress count, affected instrument keys, config SHA, cause, and direction. Metrics expose requested/effective seconds, healthy-egress count, affected-instrument count, and change count as numeric values; their only labels are the bounded `exchange`, `endpoint`, and where applicable `direction`. Config hashes and instrument keys are never metric labels. Failure to enqueue the reserved control record rejects the schedule change and enters the writer-critical path rather than creating a silent stretch. The same requested/effective values are attached to every resulting REST envelope through `RestMetadata`. Startup calculation, periodic stretch/recovery, and reload all use this publisher; unchanged intervals emit nothing.
+Before each dispatch, promote every now-ready future job and scan the bounded live index to expire all jobs whose monotonic deadline has passed. The inclusive deadline contract is shared with Task 3: dispatch at `now == deadline` is allowed and expiry begins one nanosecond later. Deadline validation, token refill/acquisition, readiness quotation, and the returned dispatch stamp use one scheduler-sampled `now_ns`; a later budget clock read cannot admit an already-expired request. A future high-priority job cannot idle ready lower-priority work. A budget-blocked high-priority job blocks lower-priority work only on overlapping `BudgetKey` values; independent budgets remain work-conserving. `TokenBucket.ready_at_ns()` quotes exact availability without consuming tokens and derives missing-token ratios without ambient Decimal arithmetic, while `BudgetRegistry.try_acquire_one()` atomically selects and consumes one distinct candidate. `RestJob` carries ordered `RestBudgetRoute` values and an optional exact generation `SourceContext`; `LIVE_BOOTSTRAP` requires that exact connection generation before admission. `RestScheduler` returns `RestDispatch`, binding the selected egress, consumed budget, monotonic admission time, and source context. Shared quota keys are deduplicated. The scheduler and budgets must share one injected clock. `next_ready()` waits through an injected `MonotonicWaiter` for the minimum future readiness, budget-ready time, or expiry wake and is interruptible by submit, resource change, close, fake-clock advance, or cancellation. A representable finite deadline is scheduled once without a fixed cap; an integer deadline beyond float representation waits for an explicit resource/submit/close wake rather than overflowing or polling daily.
+
+`solve_interval()` uses integer ratios from exact `Decimal` values and computes `ceil(jobs * cost * 1e9 / admitted_rate)`. Its scalar rate is a pre-reserved, quota-group-deduplicated rate for the already admitted endpoint cohort, not a raw per-egress sum or an independently reusable venue total; Task 6 owns competing-workload allocation and required-versus-candidate admission before calling this primitive. The configured 15-minute cap is inclusive. Fixed/admitted work beyond it is a capacity error. Require three distinct committed healthy refreshes, then shorten by 20% on every subsequent healthy refresh using an exact integer-ratio complement and ceiling; when nanosecond rounding would otherwise stall above the target, advance by one nanosecond. Unhealthy or stretch observations reset the streak. `propose_interval()` permits only unchanged or stretched values. Every recovery proposal freezes its target and refresh identity, and commit/activation recomputes the only legal transition from controller state, so callers cannot forge or bypass the streak. Recovery is `propose_toward -> publish -> commit`; changed proposals cannot use the no-publication `commit()` path, publication failure changes neither interval, streak, revision, jobs, nor REST metadata, and controller mutation is rejected while synchronous publication is in progress.
+
+Every effective-interval change creates one immutable `IntervalChange` with a generated event ID. The publisher validates `(Exchange, logical_endpoint)` against a finite metric-series allowlist before any side effect, then uses the reserved control writer boundary `try_emit(draft, SourceContext.internal(), shard="_control")` as the commit gate. The isolated Task 4 enum remains a test adapter; `ControlEnqueueResultLike` structurally consumes Plan 02's canonical result through its `StrEnum status` and exact boolean `accepted` properties without redefining the storage model. `ACCEPTED` and `ACCEPTED_HIGH_WATER` permit activation; overflow, non-accepting results, inconsistent or malformed results, and exceptions reject activation and enter writer-critical. After control acceptance, structured logging and fixed-label Prometheus updates are independently attempted; a secondary failure returns a degraded receipt and enters critical but does not reject activation or invite duplicate control retry. The log and control payload include previous/requested/effective interval, endpoint, healthy-egress count, sorted affected instrument keys, config SHA, cause, and direction. Counter labels are exactly `exchange, endpoint, direction`; gauge labels are exactly `exchange, endpoint`. Event IDs, causes, hashes, paths, params, and instruments are never labels.
+
+The publisher returns a validated `RestIntervalContext`, not an incomplete `RestMetadata`. `RestDispatch.build_rest_metadata()` is the only scheduler builder: it defensively copies request params/headers and takes attempt plus requested/effective interval only from the frozen job. Canonical `RestMetadata` requires both interval fields together and `effective >= requested`; attaching context rejects pre-existing mismatches rather than silently overwriting them. Startup calculation, periodic stretch/recovery, and reload all use this publisher; unchanged intervals emit nothing.
 
 - [ ] **Step 4: Run scheduler tests**
 
-Run: `.venv/bin/python -m pytest tests/unit/scheduler/test_rest.py tests/unit/scheduler/test_interval_observability.py -q`
+Run: `.venv/bin/python -m pytest tests/unit/scheduler tests/unit/network/test_rate_limit.py tests/unit/domain/test_envelope.py tests/unit/config/test_models.py -q`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/crypto_collector/scheduler tests/unit/scheduler
+git add src/crypto_collector/scheduler src/crypto_collector/network/rate_limit.py src/crypto_collector/domain/envelope.py src/crypto_collector/config/models.py tests/unit/scheduler tests/unit/network/test_rate_limit.py tests/unit/domain/test_envelope.py tests/unit/config/test_models.py docs/superpowers/plans/2026-07-31-network-scheduler-selection.md
 git commit -m "feat: schedule prioritized public rest jobs"
 ```
 
