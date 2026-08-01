@@ -187,6 +187,11 @@ def test_file_persistence_error_accepts_only_file_io_reasons() -> None:
             reason=WriterCriticalReason.WRITE_FAILED,
             original=object(),  # type: ignore[arg-type]
         )
+    sanitized = FilePersistenceError(
+        reason=WriterCriticalReason.WRITE_FAILED,
+        original=RuntimeError("must not be retained"),
+    )
+    assert not hasattr(sanitized, "original")
 
 
 def test_histogram_uses_disjoint_versioned_buckets_and_exact_max() -> None:
@@ -549,6 +554,10 @@ async def test_recovery_coordinator_is_unmeasured_and_shares_limiter(
     )
     try:
         await sync.wait_until_started()
+        await asyncio.wait_for(
+            loop.run_in_executor(executor, lambda: None),
+            timeout=2,
+        )
         assert sync.max_active == sync.active == 2
         sync.release_all()
         live_batch, recovery_batch = await asyncio.gather(live_task, recovery_task)
@@ -592,6 +601,10 @@ async def test_sync_concurrency_is_global_across_overlapping_batches(
     )
     try:
         await sync.wait_until_started()
+        await asyncio.wait_for(
+            loop.run_in_executor(executor, lambda: None),
+            timeout=2,
+        )
         assert sync.max_active == sync.active == 2
         sync.release_all()
         await asyncio.gather(first, second)
@@ -723,6 +736,220 @@ async def test_task_creation_failure_rolls_back_generation_registration(
         stream.close_fd()
 
     assert batch.record_count == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_batch_cancellation_keeps_thread_and_generation_owned(
+    tmp_path: Path,
+) -> None:
+    loop = asyncio.get_running_loop()
+    clock = FakeClock(now_ns=100)
+    stream, work = make_work(tmp_path, "owned-after-internal-cancel")
+    executor = ThreadPoolExecutor(max_workers=1)
+    sync = BlockingSync(loop, expected_starts=1)
+    completions: list[object] = []
+    coordinator = make_coordinator(
+        clock=clock,
+        sync_backend=sync,
+        executor=executor,
+        completion_sink=completions.append,
+    )
+    public = asyncio.create_task(
+        coordinator.sync_batch([work], trigger=DurabilityTrigger.PERIODIC)
+    )
+    try:
+        await sync.wait_until_started()
+        internal = next(iter(coordinator._owned_batches))
+        internal.cancel("supervisor requested cancellation")
+        await asyncio.sleep(0)
+        internal.cancel("supervisor repeated cancellation")
+        await asyncio.sleep(0)
+
+        assert not public.done()
+        assert sync.active == 1
+        assert completions == []
+        with pytest.raises(DuplicateFileGeneration):
+            await coordinator.sync_batch(
+                [work],
+                trigger=DurabilityTrigger.BARRIER,
+            )
+
+        sync.release_all()
+        batch = await public
+    finally:
+        sync.release_all()
+        await asyncio.gather(public, return_exceptions=True)
+        executor.shutdown(wait=True)
+        stream.close_fd()
+
+    assert batch.record_count == 1
+    assert len(completions) == 1
+    assert isinstance(completions[0], FileSyncCompleted)
+
+
+@pytest.mark.asyncio
+async def test_internal_batch_cancellation_before_start_accounts_and_releases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(now_ns=100)
+    stream, work = make_work(tmp_path, "cancelled-before-start")
+    executor = ThreadPoolExecutor(max_workers=1)
+    completions: list[object] = []
+    coordinator = make_coordinator(
+        clock=clock,
+        sync_backend=NoopSync(),
+        executor=executor,
+        completion_sink=completions.append,
+    )
+    real_create_task = durability_module.asyncio.create_task
+    cancelled_once = False
+
+    def create_cancelled_task(coroutine):  # type: ignore[no-untyped-def]
+        nonlocal cancelled_once
+        task = real_create_task(coroutine)
+        if not cancelled_once:
+            cancelled_once = True
+            task.cancel("cancel before first coroutine step")
+        return task
+
+    monkeypatch.setattr(
+        durability_module.asyncio,
+        "create_task",
+        create_cancelled_task,
+    )
+    try:
+        with pytest.raises(WriterCriticalError) as captured:
+            await coordinator.sync_batch(
+                [work],
+                trigger=DurabilityTrigger.PERIODIC,
+            )
+        monkeypatch.setattr(
+            durability_module.asyncio,
+            "create_task",
+            real_create_task,
+        )
+        retry = await coordinator.sync_batch(
+            [work],
+            trigger=DurabilityTrigger.PERIODIC,
+        )
+    finally:
+        executor.shutdown(wait=True)
+        stream.close_fd()
+
+    assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
+    assert retry.record_count == 1
+    assert len(completions) == 2
+    assert isinstance(completions[0], FileSyncFailed)
+    assert isinstance(completions[1], FileSyncCompleted)
+
+
+@pytest.mark.asyncio
+async def test_partial_file_task_creation_failure_accounts_every_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(now_ns=100)
+    first_stream, first_work = make_work(tmp_path, "task-created")
+    second_stream, second_work = make_work(tmp_path, "task-not-created")
+    executor = ThreadPoolExecutor(max_workers=2)
+    completions: list[object] = []
+    coordinator = make_coordinator(
+        clock=clock,
+        sync_backend=NoopSync(),
+        executor=executor,
+        completion_sink=completions.append,
+    )
+    real_create_task = durability_module.asyncio.create_task
+    call_count = 0
+
+    def fail_second_file_task(coroutine):  # type: ignore[no-untyped-def]
+        nonlocal call_count
+        call_count += 1
+        if call_count == 3:
+            raise RuntimeError("injected partial task creation failure")
+        return real_create_task(coroutine)
+
+    monkeypatch.setattr(
+        durability_module.asyncio,
+        "create_task",
+        fail_second_file_task,
+    )
+    try:
+        with pytest.raises(WriterCriticalError) as captured:
+            await coordinator.sync_batch(
+                [first_work, second_work],
+                trigger=DurabilityTrigger.PERIODIC,
+            )
+    finally:
+        executor.shutdown(wait=True)
+        first_stream.close_fd()
+        second_stream.close_fd()
+
+    assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
+    assert captured.value.affected_generation_ids == (second_work.generation_id,)
+    assert len(completions) == 2
+    assert sum(isinstance(item, FileSyncCompleted) for item in completions) == 1
+    assert sum(isinstance(item, FileSyncFailed) for item in completions) == 1
+    assert coordinator._inflight_generations == set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_executor_future_emits_failure_and_releases_claim(
+    tmp_path: Path,
+) -> None:
+    class TrackingExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self.submission_count = 0
+            self.second_submission = asyncio.Event()
+
+        def submit(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            future = super().submit(*args, **kwargs)
+            self.submission_count += 1
+            if self.submission_count == 2:
+                self.second_submission.set()
+            return future
+
+    blocker_release = threading.Event()
+    blocker_started = threading.Event()
+
+    def occupy_worker() -> None:
+        blocker_started.set()
+        if not blocker_release.wait(timeout=5):
+            raise TimeoutError("executor blocker was not released")
+
+    clock = FakeClock(now_ns=100)
+    stream, work = make_work(tmp_path, "cancelled-executor-future")
+    executor = TrackingExecutor()
+    blocker = executor.submit(occupy_worker)
+    assert blocker_started.wait(timeout=2)
+    completions: list[object] = []
+    coordinator = make_coordinator(
+        clock=clock,
+        sync_backend=NoopSync(),
+        executor=executor,
+        completion_sink=completions.append,
+    )
+    task = asyncio.create_task(
+        coordinator.sync_batch([work], trigger=DurabilityTrigger.PERIODIC)
+    )
+    try:
+        await asyncio.wait_for(executor.second_submission.wait(), timeout=2)
+        executor.shutdown(wait=False, cancel_futures=True)
+        with pytest.raises(WriterCriticalError) as captured:
+            await task
+    finally:
+        blocker_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wrap_future(blocker)
+        executor.shutdown(wait=True)
+        stream.close_fd()
+
+    assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
+    assert len(completions) == 1
+    assert isinstance(completions[0], FileSyncFailed)
+    assert coordinator._inflight_generations == set()
 
 
 @pytest.mark.asyncio
@@ -867,6 +1094,9 @@ async def test_write_error_is_classified_before_sync(
     assert isinstance(public_failure, FilePersistenceError)
     assert captured.value.__cause__ is public_failure
     assert public_failure.__cause__ is None
+    assert public_failure.__context__ is None
+    assert public_failure.__traceback__ is None
+    assert not hasattr(public_failure, "original")
     assert "injected" not in str(public_failure)
 
 

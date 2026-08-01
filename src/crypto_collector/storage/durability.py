@@ -269,23 +269,38 @@ class FilePersistenceError(RuntimeError):
         self,
         *,
         reason: WriterCriticalReason,
-        original: Exception,
+        original: BaseException | None = None,
     ) -> None:
         if reason not in {
             WriterCriticalReason.WRITE_FAILED,
             WriterCriticalReason.SYNC_FAILED,
         }:
             raise ValueError("file persistence reason must be write or sync failure")
-        if not isinstance(original, Exception):
-            raise TypeError("original must be an Exception")
+        if original is not None and not isinstance(original, BaseException):
+            raise TypeError("original must be a BaseException or None")
         self.reason = reason
-        self.original = original
         message = (
             "raw frame write failed"
             if reason is WriterCriticalReason.WRITE_FAILED
             else "raw file synchronization failed"
         )
         super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistenceFailure:
+    reason: WriterCriticalReason
+
+
+@dataclass(frozen=True, slots=True)
+class _FileFailure:
+    generation_id: str
+    error: FilePersistenceError
+
+
+@dataclass(slots=True)
+class _OwnedBatchState:
+    started: bool = False
 
 
 class DurabilityCoordinator:
@@ -356,25 +371,19 @@ class DurabilityCoordinator:
     def _clock_ns(self, *, field_name: str) -> int:
         return _integer(self._clock.monotonic_ns(), field_name=field_name)
 
-    def _persist_blocking(self, work: SealedFileWork) -> FileDurabilityResult:
+    def _persist_blocking(
+        self,
+        work: SealedFileWork,
+    ) -> FileDurabilityResult | _PersistenceFailure:
         started_ns = self._clock_ns(field_name="sync_started_monotonic_ns")
         pending = work.pending
         if pending is not None:
             try:
                 written = work.stream_file.write_frame(pending)
-            except Exception as error:  # noqa: BLE001 - every write failure is terminal
-                failure = FilePersistenceError(
-                    reason=WriterCriticalReason.WRITE_FAILED,
-                    original=error,
-                )
-                raise failure from None
+            except BaseException:  # noqa: BLE001 - every write failure is terminal
+                return _PersistenceFailure(WriterCriticalReason.WRITE_FAILED)
             if written.record_count != len(pending.rows):
-                mismatch = RuntimeError("written frame record count mismatch")
-                failure = FilePersistenceError(
-                    reason=WriterCriticalReason.WRITE_FAILED,
-                    original=mismatch,
-                )
-                raise failure from None
+                return _PersistenceFailure(WriterCriticalReason.WRITE_FAILED)
         try:
             self._sync_backend.sync(work.stream_file.fileno())
             completed_ns = self._clock_ns(
@@ -382,14 +391,8 @@ class DurabilityCoordinator:
             )
             if completed_ns < started_ns:
                 raise RuntimeError("monotonic clock moved backward during sync")
-        except Exception as error:
-            if isinstance(error, FilePersistenceError):
-                raise
-            failure = FilePersistenceError(
-                reason=WriterCriticalReason.SYNC_FAILED,
-                original=error,
-            )
-            raise failure from None
+        except BaseException:  # noqa: BLE001 - every sync failure is terminal
+            return _PersistenceFailure(WriterCriticalReason.SYNC_FAILED)
 
         if pending is None:
             snapshot = None
@@ -400,14 +403,7 @@ class DurabilityCoordinator:
                 histogram = CumulativeDurabilityHistogram()
                 for row in pending.rows:
                     if completed_ns < row.accepted_monotonic_ns:
-                        clock_error = RuntimeError(
-                            "sync completion precedes record acceptance"
-                        )
-                        failure = FilePersistenceError(
-                            reason=WriterCriticalReason.SYNC_FAILED,
-                            original=clock_error,
-                        )
-                        raise failure from None
+                        return _PersistenceFailure(WriterCriticalReason.SYNC_FAILED)
                     histogram.add(completed_ns - row.accepted_monotonic_ns)
                 snapshot = histogram.snapshot()
             else:
@@ -424,22 +420,84 @@ class DurabilityCoordinator:
             lag_max_ns=None if snapshot is None else snapshot.lag_max_ns,
         )
 
-    async def _persist_one(self, work: SealedFileWork) -> FileDurabilityResult:
+    async def _await_blocking_outcome(
+        self,
+        work: SealedFileWork,
+    ) -> FileDurabilityResult | _PersistenceFailure:
+        future = asyncio.get_running_loop().run_in_executor(
+            self._storage_executor,
+            self._persist_blocking,
+            work,
+        )
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Cancellation of this asyncio task does not stop a running storage
+                # thread. Keep ownership until the executor future is terminal.
+                continue
+        try:
+            outcome = future.result()
+        except BaseException:  # noqa: BLE001 - executor cancellation is terminal
+            return _PersistenceFailure(WriterCriticalReason.SYNC_FAILED)
+        if type(outcome) not in {FileDurabilityResult, _PersistenceFailure}:
+            return _PersistenceFailure(WriterCriticalReason.SYNC_FAILED)
+        return outcome
+
+    @staticmethod
+    def _public_failure(reason: WriterCriticalReason) -> FilePersistenceError:
+        return FilePersistenceError(reason=reason)
+
+    def _emit_failure(
+        self,
+        *,
+        generation_id: str,
+        reason: WriterCriticalReason,
+    ) -> _FileFailure:
+        error = self._public_failure(reason)
+        try:
+            self._completion_sink(FileSyncFailed(generation_id, error))
+        except BaseException:  # noqa: BLE001 - sink contract violations are terminal
+            # The sink is required to be non-raising. Its one attempted emission must
+            # never be caught and re-emitted as a second file completion.
+            return _FileFailure(generation_id=generation_id, error=error)
+        return _FileFailure(generation_id=generation_id, error=error)
+
+    def _fail_unstarted(self, work: SealedFileWork) -> _FileFailure:
+        failure = self._emit_failure(
+            generation_id=work.generation_id,
+            reason=WriterCriticalReason.SYNC_FAILED,
+        )
+        self._inflight_generations.discard(work.generation_id)
+        return failure
+
+    async def _persist_one(
+        self,
+        work: SealedFileWork,
+    ) -> FileDurabilityResult | _FileFailure:
         try:
             async with self._io_limiter.slot():
-                result = await asyncio.get_running_loop().run_in_executor(
-                    self._storage_executor,
-                    self._persist_blocking,
-                    work,
+                outcome = await self._await_blocking_outcome(work)
+        except BaseException:  # noqa: BLE001 - cancellation before submission is owned
+            outcome = _PersistenceFailure(WriterCriticalReason.SYNC_FAILED)
+
+        try:
+            if type(outcome) is _PersistenceFailure:
+                return self._emit_failure(
+                    generation_id=work.generation_id,
+                    reason=outcome.reason,
                 )
-        except Exception as error:
-            self._completion_sink(FileSyncFailed(work.generation_id, error))
-            raise
-        else:
-            self._completion_sink(FileSyncCompleted(result))
+            result = cast(FileDurabilityResult, outcome)
+            try:
+                self._completion_sink(FileSyncCompleted(result))
+            except BaseException:  # noqa: BLE001 - sink may raise cancellation
+                return _FileFailure(
+                    generation_id=work.generation_id,
+                    error=self._public_failure(WriterCriticalReason.SYNC_FAILED),
+                )
             return result
         finally:
-            self._inflight_generations.remove(work.generation_id)
+            self._inflight_generations.discard(work.generation_id)
 
     def _register_work(
         self,
@@ -474,27 +532,71 @@ class DurabilityCoordinator:
         batch_sequence: int,
         trigger: DurabilityTrigger,
         started_ns: int,
+        state: _OwnedBatchState,
     ) -> DurabilityBatch:
-        outcomes = await asyncio.gather(
-            *(self._persist_one(item) for item in work_items),
-            return_exceptions=True,
+        state.started = True
+        outcomes: list[FileDurabilityResult | _FileFailure | None] = [None] * len(
+            work_items
+        )
+        tasks: list[asyncio.Task[FileDurabilityResult | _FileFailure]] = []
+        task_indexes: list[int] = []
+        for index, work in enumerate(work_items):
+            coroutine = self._persist_one(work)
+            try:
+                task = asyncio.create_task(coroutine)
+            except BaseException:  # noqa: BLE001 - every claim needs rollback
+                coroutine.close()
+                for unstarted_index in range(index, len(work_items)):
+                    outcomes[unstarted_index] = self._fail_unstarted(
+                        work_items[unstarted_index]
+                    )
+                break
+            tasks.append(task)
+            task_indexes.append(index)
+
+        if tasks:
+            settlement = asyncio.gather(*tasks, return_exceptions=True)
+            while not settlement.done():
+                try:
+                    await asyncio.shield(settlement)
+                except asyncio.CancelledError:
+                    # Direct cancellation of the internal batch must not propagate
+                    # into per-file tasks or release an FD still used by a thread.
+                    continue
+            settled = settlement.result()
+            for index, outcome in zip(task_indexes, settled, strict=True):
+                if isinstance(outcome, BaseException):
+                    work = work_items[index]
+                    if work.generation_id in self._inflight_generations:
+                        outcomes[index] = self._fail_unstarted(work)
+                    else:
+                        outcomes[index] = _FileFailure(
+                            generation_id=work.generation_id,
+                            error=self._public_failure(
+                                WriterCriticalReason.SYNC_FAILED
+                            ),
+                        )
+                else:
+                    outcomes[index] = outcome
+
+        if any(outcome is None for outcome in outcomes):
+            raise AssertionError("durability batch left an unaccounted file")
+        finalized = cast(
+            list[FileDurabilityResult | _FileFailure],
+            outcomes,
         )
         failures = tuple(
             (work, outcome)
-            for work, outcome in zip(work_items, outcomes, strict=True)
-            if isinstance(outcome, BaseException)
+            for work, outcome in zip(work_items, finalized, strict=True)
+            if type(outcome) is _FileFailure
         )
         if failures:
-            persistence_failures = tuple(
-                outcome
-                for _work, outcome in failures
-                if isinstance(outcome, FilePersistenceError)
-            )
             reason = (
                 WriterCriticalReason.WRITE_FAILED
                 if any(
-                    item.reason is WriterCriticalReason.WRITE_FAILED
-                    for item in persistence_failures
+                    cast(_FileFailure, item).error.reason
+                    is WriterCriticalReason.WRITE_FAILED
+                    for _work, item in failures
                 )
                 else WriterCriticalReason.SYNC_FAILED
             )
@@ -512,17 +614,16 @@ class DurabilityCoordinator:
             )
             cause = next(
                 (
-                    outcome
+                    cast(_FileFailure, outcome).error
                     for _work, outcome in failures
-                    if isinstance(outcome, FilePersistenceError)
-                    and outcome.reason is reason
+                    if cast(_FileFailure, outcome).error.reason is reason
                 ),
-                failures[0][1],
+                cast(_FileFailure, failures[0][1]).error,
             )
             raise critical from cause
-        if any(type(item) is not FileDurabilityResult for item in outcomes):
+        if any(type(item) is not FileDurabilityResult for item in finalized):
             raise AssertionError("durability batch produced an invalid result")
-        results = tuple(cast(FileDurabilityResult, item) for item in outcomes)
+        results = tuple(cast(FileDurabilityResult, item) for item in finalized)
         completed_ns = max(
             started_ns,
             self._clock_ns(field_name="batch_completed_monotonic_ns"),
@@ -544,11 +645,13 @@ class DurabilityCoordinator:
         if type(trigger) is not DurabilityTrigger:
             raise TypeError("trigger must be DurabilityTrigger")
         owned, batch_sequence, started_ns = self._register_work(work_items)
+        state = _OwnedBatchState()
         batch_coroutine = self._run_owned_batch(
             owned,
             batch_sequence=batch_sequence,
             trigger=trigger,
             started_ns=started_ns,
+            state=state,
         )
         try:
             internal = asyncio.create_task(batch_coroutine)
@@ -567,10 +670,25 @@ class DurabilityCoordinator:
             try:
                 await asyncio.shield(internal)
             except asyncio.CancelledError as error:
-                if cancellation is None:
+                if not internal.cancelled() and cancellation is None:
                     cancellation = error
             except WriterCriticalError:
                 pass
+
+        if internal.cancelled():
+            if state.started:
+                raise AssertionError("started durability batch leaked cancellation")
+            failures = tuple(self._fail_unstarted(item) for item in owned)
+            critical = WriterCriticalError(
+                reason=WriterCriticalReason.SYNC_FAILED,
+                affected_generation_ids=tuple(item.generation_id for item in owned),
+                completed_batches=(),
+                message="raw durability sync failed",
+            )
+            cause = failures[0].error
+            if cancellation is not None:
+                raise critical from cancellation
+            raise critical from cause
 
         try:
             batch = internal.result()
