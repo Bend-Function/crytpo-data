@@ -188,7 +188,7 @@ def test_date_gated_features_capture_known_release_constraints() -> None:
         for feature in bybit.date_gated_features
         if feature.id == "perpetual_full_order_book"
     )
-    assert perpetual_full.available_from is None
+    assert perpetual_full.available_from == "2026-08-11"
     assert perpetual_full.requires_live_probe is True
 
 
