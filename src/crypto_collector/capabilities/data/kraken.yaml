@@ -13,7 +13,11 @@ markets:
       recommended_depth: 100
       update_interval_ms: event_driven
       bootstrap: none
-      max_rest_depth: 1000
+      max_rest_depth: 500
+      rest_book_variants:
+        - id: grouped_book
+          max_depth: 1000
+          aggregated: true
     connection_limits:
       connection_attempts:
         limit: 150
@@ -37,5 +41,5 @@ markets:
       subscription_requests:
         limit: 100
         window_seconds: 1
-        scope: client
+        scope: connection
 date_gated_features: []

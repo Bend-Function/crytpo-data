@@ -37,14 +37,26 @@ def _tuple_from_list(value: object) -> object:
 
 
 def _is_public_base_url(value: str, *, scheme: str) -> bool:
+    if any(
+        character.isspace()
+        or ord(character) < 0x20
+        or 0x7F <= ord(character) < 0xA0
+        or character == "\\"
+        for character in value
+    ):
+        return False
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
+        port = parsed.port
     except ValueError:
         return False
     return (
         parsed.scheme == scheme
         and hostname is not None
+        and (port is None or 0 < port <= 65535)
+        and "%" not in parsed.netloc
+        and not parsed.netloc.endswith(":")
         and parsed.username is None
         and parsed.password is None
         and not parsed.query
@@ -92,6 +104,18 @@ class ConnectionLimits(FrozenStrictModel):
     connection_lifetime_seconds: PositiveInt | None = None
 
 
+class RestBookVariant(FrozenStrictModel):
+    id: NonEmptyString
+    max_depth: RestDepth
+    aggregated: bool = False
+
+
+RestBookVariantTuple = Annotated[
+    tuple[RestBookVariant, ...],
+    BeforeValidator(_tuple_from_list),
+]
+
+
 class BookCapability(FrozenStrictModel):
     channel: NonEmptyString
     supported_depths: DepthTuple
@@ -99,11 +123,20 @@ class BookCapability(FrozenStrictModel):
     update_interval_ms: UpdateIntervalMs
     bootstrap: BootstrapKind
     max_rest_depth: RestDepth
+    rest_book_variants: RestBookVariantTuple = ()
 
     @model_validator(mode="after")
     def validate_recommended_depth(self) -> Self:
         if self.recommended_depth not in self.supported_depths:
             raise ValueError("recommended depth must be one of supported_depths")
+        variant_ids = [variant.id for variant in self.rest_book_variants]
+        if len(set(variant_ids)) != len(variant_ids):
+            raise ValueError("REST book variant IDs must be unique")
+        ordered_variants = tuple(
+            sorted(self.rest_book_variants, key=lambda variant: variant.id)
+        )
+        if ordered_variants != self.rest_book_variants:
+            return self.model_copy(update={"rest_book_variants": ordered_variants})
         return self
 
 
