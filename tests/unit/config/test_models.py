@@ -7,9 +7,11 @@ from pydantic import ValidationError
 from crypto_collector.config.models import (
     CollectorConfig,
     ConfigSecretError,
+    IngressConfig,
     SelectionConfig,
     SelectionOverride,
     SymbolOverride,
+    WriterConfig,
     iter_secret_refs,
     validate_secret_snapshot,
 )
@@ -57,6 +59,63 @@ def test_flush_interval_must_leave_half_the_slo_as_budget() -> None:
     invalid = BASE | {"writer": BASE["writer"] | {"flush_interval": "750ms"}}
     with pytest.raises(ValidationError, match="flush_interval"):
         CollectorConfig.model_validate(invalid)
+
+
+def test_writer_config_owns_frame_codec_limits() -> None:
+    config = WriterConfig.model_validate(
+        {"zstd_level": 7, "max_plain_frame_bytes": "2MiB"}
+    )
+
+    assert config.zstd_level == 7
+    assert config.max_plain_frame_bytes == 2 * 1024**2
+
+
+@pytest.mark.parametrize("level", [0, 23, True, 3.0])
+def test_writer_config_rejects_unsupported_zstd_level(level: object) -> None:
+    with pytest.raises(ValidationError):
+        WriterConfig.model_validate({"zstd_level": level})
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"shard_max_records": 1, "control_reserve_records": 2}, "records"),
+        ({"shard_max_bytes": "1KiB", "control_reserve_bytes": "2KiB"}, "bytes"),
+        ({"shard_max_bytes": "2KiB", "worker_max_bytes": "1KiB"}, "worker"),
+        (
+            {
+                "shard_max_bytes": "2KiB",
+                "worker_max_bytes": "2KiB",
+                "control_reserve_bytes": "2KiB",
+            },
+            "worker",
+        ),
+    ],
+)
+def test_control_reserve_must_fit_ingress_ceilings(
+    override: dict[str, object],
+    message: str,
+) -> None:
+    invalid = deepcopy(BASE["ingress"])
+    invalid.update(override)
+
+    with pytest.raises(ValidationError, match=message):
+        IngressConfig.model_validate(invalid)
+
+
+def test_control_reserve_may_equal_its_shard_ceiling() -> None:
+    source = deepcopy(BASE["ingress"])
+    source.update(
+        {
+            "control_reserve_records": source["shard_max_records"],
+            "control_reserve_bytes": source["shard_max_bytes"],
+        }
+    )
+
+    value = IngressConfig.model_validate(source)
+
+    assert value.control_reserve_records == value.shard_max_records
+    assert value.control_reserve_bytes == value.shard_max_bytes
 
 
 def test_unknown_key_is_rejected() -> None:
