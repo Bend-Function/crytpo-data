@@ -660,6 +660,20 @@ class RawIngress:
         self._queued_bytes[normalized_shard] = remaining
         return result
 
+    def peek_one(self, shard: str) -> EnqueueResult | None:
+        normalized_shard = self._validate_shard(shard)
+        queue = self._queues.get(normalized_shard)
+        if queue is None or queue.empty():
+            return None
+        return queue._queue[0]  # type: ignore[attr-defined]
+
+    def acceptance_ordinal_high_water(self) -> int | None:
+        return (
+            None
+            if self._next_acceptance_ordinal == 0
+            else self._next_acceptance_ordinal - 1
+        )
+
     def queued_records(self, shard: str) -> int:
         normalized_shard = self._validate_shard(shard)
         queue = self._queues.get(normalized_shard)

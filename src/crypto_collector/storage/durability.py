@@ -43,6 +43,49 @@ class DurabilityTrigger(StrEnum):
     BARRIER = "barrier"
 
 
+class AsyncSleeper(Protocol):
+    async def sleep_ns(self, delay_ns: int) -> None: ...
+
+
+class AsyncioSleeper:
+    async def sleep_ns(self, delay_ns: int) -> None:
+        delay = _integer(delay_ns, field_name="delay_ns")
+        await asyncio.sleep(delay / 1_000_000_000)
+
+
+class DurabilitySloState(StrEnum):
+    BREACHED = "breached"
+    RECOVERED = "recovered"
+
+
+@dataclass(frozen=True, slots=True)
+class DurabilitySloTransition:
+    state: DurabilitySloState
+    observed_monotonic_ns: int
+    rolling_p99_ns: int | None
+    rolling_max_ns: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.state) is not DurabilitySloState:
+            raise TypeError("state must be DurabilitySloState")
+        object.__setattr__(
+            self,
+            "observed_monotonic_ns",
+            _integer(
+                self.observed_monotonic_ns,
+                field_name="observed_monotonic_ns",
+            ),
+        )
+        for field_name in ("rolling_p99_ns", "rolling_max_ns"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _integer(value, field_name=field_name),
+                )
+
+
 class RecoveryAccountingMode(StrEnum):
     UNMEASURED = "unmeasured"
 
@@ -742,9 +785,13 @@ class RecoveryDurabilityCoordinator(DurabilityCoordinator):
 
 
 __all__ = [
+    "AsyncSleeper",
+    "AsyncioSleeper",
     "DuplicateFileGeneration",
     "DurabilityBatch",
     "DurabilityCoordinator",
+    "DurabilitySloState",
+    "DurabilitySloTransition",
     "DurabilityTrigger",
     "FileDurabilityResult",
     "FilePersistenceError",

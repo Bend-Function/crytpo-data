@@ -1214,6 +1214,54 @@ def test_configured_interval_and_exact_size_threshold_are_independent(
         interval_part.close_fd_for_test()
 
 
+def test_due_rotation_installs_reserved_control_target_at_seal(
+    tmp_path: Path,
+) -> None:
+    manager = _ActivePartSet(
+        data_root=tmp_path,
+        exchange=Exchange.OKX,
+        config_sha256="a" * 64,
+        config_generation=0,
+        zstd_level=3,
+        max_plain_frame_bytes=4096,
+        max_compressed_size_bytes=1,
+        rotate_interval_ns=5_000_000_000,
+        durability_slo_ns=1_000_000_000,
+    )
+    record, identity = make_record()
+    manager.append_accepted(record, identity)
+    current = manager.active_part_for(record)
+    assert current is not None
+    current.stream_file.compressed_size = 1
+
+    plans = manager.plan_due_rotations(
+        now_ns=_BASE_NS + 2,
+        seal_acceptance_ordinal=identity.acceptance_ordinal,
+    )
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan.seal_acceptance_ordinal == identity.acceptance_ordinal
+
+    manager.begin_rotations(plans)
+    reserved = manager.active_part_for_logical_identity(
+        market=record.envelope.market,
+        instrument_key=record.envelope.instrument_key,
+        logical_stream=record.envelope.logical_stream,
+    )
+    assert reserved is plan.reservation
+    assert current.close_reason is CloseReason.ROTATE_SIZE
+
+    replacement = manager.materialize_rotation(plan)
+    try:
+        size_due, interval_due = manager.commit_rotations(((plan, replacement),))
+        assert size_due == (current,)
+        assert interval_due == ()
+        assert manager.active_part_for(record) is replacement
+    finally:
+        current.close_fd_for_test()
+        replacement.close_fd_for_test()
+
+
 @pytest.mark.asyncio
 async def test_final_barrier_duplicate_preflight_leaves_part_retryable(
     tmp_path: Path,

@@ -67,6 +67,7 @@ from crypto_collector.storage.recovery import (
     whole_source_quarantine_relative_path,
 )
 from crypto_collector.storage.serialize import encode_envelope
+from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 
 TRANSACTION_ID = "123e4567-e89b-42d3-a456-426614174000"
 SOURCE_RELATIVE_PATH = (
@@ -984,6 +985,9 @@ def _normal_owned_control_manifest(
     ownership: RecoveryControlOwnershipV1,
 ) -> RawManifestV1:
     envelope = ownership.control_envelope
+    histogram = CumulativeDurabilityHistogram()
+    histogram.add(5)
+    durability = histogram.snapshot()
     return RawManifestV1(
         schema_version=1,
         exchange=envelope.exchange,
@@ -1024,10 +1028,10 @@ def _normal_owned_control_manifest(
         control_event_ids=(),
         durability_measurement="measured",
         durability_sample_count=1,
-        durability_lag_p50_ns=5,
-        durability_lag_p95_ns=5,
-        durability_lag_p99_ns=5,
-        durability_lag_max_ns=5,
+        durability_lag_p50_ns=durability.lag_p50_ns,
+        durability_lag_p95_ns=durability.lag_p95_ns,
+        durability_lag_p99_ns=durability.lag_p99_ns,
+        durability_lag_max_ns=durability.lag_max_ns,
         sync_count=2,
         sync_duration_total_ns=4,
         sync_duration_max_ns=3,

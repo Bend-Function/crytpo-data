@@ -75,6 +75,7 @@ from crypto_collector.storage.raw_writer import (
     size_and_sha256_fd,
 )
 from crypto_collector.storage.serialize import decode_envelope_jsonl, encode_envelope
+from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 from crypto_collector.storage.stream_file import StreamFile, write_all
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
@@ -3334,12 +3335,22 @@ def _validate_normal_owned_control_manifest(
         manifest.durability_lag_p99_ns,
         manifest.durability_lag_max_ns,
     )
+    expected_lag_values: tuple[int | None, ...] | None = None
+    if manifest.durability_lag_max_ns is not None:
+        expected_histogram = CumulativeDurabilityHistogram()
+        expected_histogram.add(manifest.durability_lag_max_ns)
+        expected_snapshot = expected_histogram.snapshot()
+        expected_lag_values = (
+            expected_snapshot.lag_p50_ns,
+            expected_snapshot.lag_p95_ns,
+            expected_snapshot.lag_p99_ns,
+            expected_snapshot.lag_max_ns,
+        )
     if (
         manifest.close_reason is not CloseReason.RECOVERY_CONTROL
         or manifest.durability_measurement != "measured"
         or manifest.durability_sample_count != 1
-        or len(set(lag_values)) != 1
-        or lag_values[0] is None
+        or lag_values != expected_lag_values
         or manifest.sync_count is None
         or manifest.sync_count < 1
         or manifest.sync_duration_total_ns is None

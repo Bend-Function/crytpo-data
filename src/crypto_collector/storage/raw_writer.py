@@ -39,6 +39,8 @@ from crypto_collector.storage.models import (
 )
 from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 from crypto_collector.storage.stream_file import (
+    BufferedRow,
+    PendingRows,
     SealedFileWork,
     StreamFile,
     write_all,
@@ -630,6 +632,17 @@ class _PartSummary:
     sync_failure_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _PartIdentitySeed:
+    exchange: Exchange
+    market: Market | None
+    instrument_key: str | None
+    logical_stream: str
+    worker_instance_id: str
+    config_sha256: str
+    config_generation: int
+
+
 class _PartAccumulator:
     def __init__(
         self,
@@ -640,13 +653,46 @@ class _PartAccumulator:
     ) -> None:
         self._validate_pair(first_record, first_identity)
         envelope = first_record.envelope
-        self._exchange = envelope.exchange
-        self._market = envelope.market
-        self._instrument_key = envelope.instrument_key
-        self._logical_stream = envelope.logical_stream
-        self._worker_instance_id = envelope.worker_instance_id
-        self._config_sha256 = envelope.config_sha256
-        self._config_generation = first_identity.config_generation
+        self._initialize(
+            _PartIdentitySeed(
+                exchange=envelope.exchange,
+                market=envelope.market,
+                instrument_key=envelope.instrument_key,
+                logical_stream=envelope.logical_stream,
+                worker_instance_id=envelope.worker_instance_id,
+                config_sha256=envelope.config_sha256,
+                config_generation=first_identity.config_generation,
+            ),
+            durability_slo_ns=durability_slo_ns,
+        )
+
+    @classmethod
+    def from_seed(
+        cls,
+        seed: _PartIdentitySeed,
+        *,
+        durability_slo_ns: int,
+    ) -> _PartAccumulator:
+        if type(seed) is not _PartIdentitySeed:
+            raise TypeError("seed must be _PartIdentitySeed")
+        accumulator = cls.__new__(cls)
+        accumulator._initialize(seed, durability_slo_ns=durability_slo_ns)
+        return accumulator
+
+    def _initialize(
+        self,
+        seed: _PartIdentitySeed,
+        *,
+        durability_slo_ns: int,
+    ) -> None:
+        self._seed = seed
+        self._exchange = seed.exchange
+        self._market = seed.market
+        self._instrument_key = seed.instrument_key
+        self._logical_stream = seed.logical_stream
+        self._worker_instance_id = seed.worker_instance_id
+        self._config_sha256 = seed.config_sha256
+        self._config_generation = seed.config_generation
         self._durability_slo_ns = _nonnegative(
             durability_slo_ns,
             field_name="durability_slo_ns",
@@ -679,6 +725,10 @@ class _PartAccumulator:
         self._queue_overflow_count = 0
         self._control_event_ids: set[str] = set()
         self._frozen = False
+
+    @property
+    def identity_seed(self) -> _PartIdentitySeed:
+        return self._seed
 
     @staticmethod
     def _validate_pair(
@@ -940,11 +990,11 @@ class _ActivePart:
         *,
         data_root: Path,
         stream_file: StreamFile,
-        first_record: AcceptedRecord,
-        first_identity: AcceptedRecordIdentityV1,
+        accumulator: _PartAccumulator,
         part_start_ns: int,
         part_sequence: int,
-        durability_slo_ns: int,
+        received_hour: int,
+        created_at_ns: int,
     ) -> None:
         self.data_root = data_root
         self.stream_file = stream_file
@@ -960,15 +1010,11 @@ class _ActivePart:
         ).as_posix()
         self.part_start_ns = part_start_ns
         self.part_sequence = part_sequence
-        self.created_at_ns = first_record.envelope.received_at_ns
-        self.received_hour = first_record.envelope.received_at_ns // _HOUR_NS
-        self.config_sha256 = first_record.envelope.config_sha256
-        self.config_generation = first_identity.config_generation
-        self._accumulator = _PartAccumulator(
-            first_record,
-            first_identity,
-            durability_slo_ns=durability_slo_ns,
-        )
+        self.created_at_ns = _nonnegative(created_at_ns, field_name="created_at_ns")
+        self.received_hour = _nonnegative(received_hour, field_name="received_hour")
+        self.config_sha256 = accumulator.identity_seed.config_sha256
+        self.config_generation = accumulator.identity_seed.config_generation
+        self._accumulator = accumulator
         self._pending_claims: list[_RecordClaim] = []
         self._claimed: dict[int, _ClaimedSealedWork] = {}
         self._batch_task_by_claim_id: dict[
@@ -992,6 +1038,7 @@ class _ActivePart:
         zstd_level: int,
         max_plain_frame_bytes: int,
         durability_slo_ns: int,
+        created_at_ns: int | None = None,
     ) -> _ActivePart:
         root = Path(os.path.abspath(os.fspath(data_root)))
         generation = _nonempty(generation_id, field_name="generation_id")
@@ -1008,14 +1055,65 @@ class _ActivePart:
             max_plain_frame_bytes=max_plain_frame_bytes,
         )
         try:
+            accumulator = _PartAccumulator(
+                first_record,
+                first_identity,
+                durability_slo_ns=durability_slo_ns,
+            )
             return cls(
                 data_root=root,
                 stream_file=stream,
-                first_record=first_record,
-                first_identity=first_identity,
+                accumulator=accumulator,
                 part_start_ns=part_start_ns,
                 part_sequence=part_sequence,
-                durability_slo_ns=durability_slo_ns,
+                received_hour=first_record.envelope.received_at_ns // _HOUR_NS,
+                created_at_ns=(
+                    first_record.envelope.received_at_ns
+                    if created_at_ns is None
+                    else created_at_ns
+                ),
+            )
+        except BaseException:
+            stream.close_fd()
+            raise
+
+    @classmethod
+    def allocate_empty_replacement(
+        cls,
+        *,
+        data_root: Path,
+        current: _ActivePart,
+        generation_id: str,
+        partial_path: Path,
+        part_start_ns: int,
+        part_sequence: int,
+        zstd_level: int,
+        max_plain_frame_bytes: int,
+        durability_slo_ns: int,
+        created_at_ns: int,
+    ) -> _ActivePart:
+        if type(current) is not _ActivePart:
+            raise TypeError("current must be _ActivePart")
+        root = Path(os.path.abspath(os.fspath(data_root)))
+        expected_path = Path(os.path.abspath(os.fspath(partial_path)))
+        stream = StreamFile.allocate(
+            expected_path,
+            generation_id=_nonempty(generation_id, field_name="generation_id"),
+            zstd_level=zstd_level,
+            max_plain_frame_bytes=max_plain_frame_bytes,
+        )
+        try:
+            return cls(
+                data_root=root,
+                stream_file=stream,
+                accumulator=_PartAccumulator.from_seed(
+                    current._accumulator.identity_seed,
+                    durability_slo_ns=durability_slo_ns,
+                ),
+                part_start_ns=part_start_ns,
+                part_sequence=part_sequence,
+                received_hour=current.received_hour,
+                created_at_ns=created_at_ns,
             )
         except BaseException:
             stream.close_fd()
@@ -1070,6 +1168,46 @@ class _ActivePart:
         claimed = _ClaimedSealedWork(claim_id, work, claims)
         self._claimed[claim_id] = claimed
         return claimed
+
+    def seal_oversized(
+        self,
+        record: AcceptedRecord,
+        identity: AcceptedRecordIdentityV1,
+    ) -> _ClaimedSealedWork:
+        if self.close_reason is not None:
+            raise ValueError("retired raw parts cannot accept records")
+        if self._pending_claims or self._claimed:
+            raise ValueError("oversized work requires a quiescent raw part")
+        if len(record.encoded_jsonl) <= self.stream_file.max_plain_frame_bytes:
+            raise ValueError("oversized work must exceed the plain frame limit")
+        self._accumulator.validate_record(record, identity)
+        rows = PendingRows(
+            (
+                BufferedRow(
+                    record.encoded_jsonl,
+                    record.accepted_monotonic_ns,
+                ),
+            ),
+            len(record.encoded_jsonl),
+        )
+        work = self.stream_file.seal_for_sync(direct_rows=rows)
+        assert work is not None
+        self._accumulator.append_validated(record)
+        claim_id = self._next_claim_id
+        self._next_claim_id += 1
+        claimed = _ClaimedSealedWork(
+            claim_id,
+            work,
+            (_RecordClaim(identity, record.accepted_monotonic_ns),),
+        )
+        self._claimed[claim_id] = claimed
+        return claimed
+
+    def pending_identities(self) -> tuple[AcceptedRecordIdentityV1, ...]:
+        return tuple(claim.identity for claim in self._pending_claims)
+
+    def pending_plain_bytes(self) -> int:
+        return self.stream_file.pending_plain_bytes
 
     def _require_owned_claim(self, claimed: _ClaimedSealedWork) -> None:
         if type(claimed) is not _ClaimedSealedWork:
@@ -1297,8 +1435,67 @@ class _ActivePart:
     def close_fd_for_test(self) -> None:
         self.stream_file.close_fd()
 
+    def discard_empty(self) -> None:
+        if self.record_count != 0 or self._pending_claims or self._claimed:
+            raise ValueError("only quiescent empty raw parts can be discarded")
+        owned = _require_regular_fd(
+            self.stream_file.fileno(), description="empty raw part"
+        )
+        parent_fd = _open_directory_no_symlinks(self.partial_path.parent)
+        path_fd: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            path_fd = _open_regular_at(parent_fd, self.partial_path.name)
+            observed = _require_regular_fd(path_fd, description="empty raw part path")
+            if not _same_inode(owned, observed):
+                raise OSError(errno.EBUSY, "empty raw part path identity changed")
+            self.stream_file.close_fd()
+            os.unlink(self.partial_path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            if not self.stream_file.closed:
+                self.stream_file.close_fd()
+            descriptors = (parent_fd,) if path_fd is None else (path_fd, parent_fd)
+            _close_all_after(descriptors, primary_error)
+
 
 _LogicalPartKey = tuple[Market | None, str | None, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivePartReservation:
+    key: _LogicalPartKey
+    generation_id: str
+    part_start_ns: int
+    part_sequence: int
+    partial_path: Path
+    data_relative_path: str
+    created_at_ns: int
+
+    @property
+    def received_hour(self) -> int:
+        return self.part_start_ns // _HOUR_NS
+
+
+_ActivePartEntry = _ActivePart | _ActivePartReservation
+
+
+@dataclass(frozen=True, slots=True)
+class _ActivePartRotation:
+    current: _ActivePart
+    reservation: _ActivePartReservation
+    reason: CloseReason
+    closed_at_ns: int
+    seal_acceptance_ordinal: int
+
+    def __post_init__(self) -> None:
+        _nonnegative(
+            self.seal_acceptance_ordinal,
+            field_name="seal_acceptance_ordinal",
+        )
 
 
 class _ActivePartSet:
@@ -1314,6 +1511,7 @@ class _ActivePartSet:
         max_compressed_size_bytes: int,
         rotate_interval_ns: int,
         durability_slo_ns: int,
+        initial_part_sequence: int = 0,
     ) -> None:
         if type(exchange) is not Exchange:
             raise TypeError("exchange must be Exchange")
@@ -1352,32 +1550,330 @@ class _ActivePartSet:
             )
         ):
             raise ValueError("raw part limits must be positive")
-        self._active: dict[_LogicalPartKey, _ActivePart] = {}
-        self._next_part_sequence = 0
+        self._active: dict[_LogicalPartKey, _ActivePartEntry] = {}
+        self._next_part_sequence = _nonnegative(
+            initial_part_sequence,
+            field_name="initial_part_sequence",
+        )
 
     @staticmethod
     def _key(envelope: RawEnvelope) -> _LogicalPartKey:
         return envelope.market, envelope.instrument_key, envelope.logical_stream
+
+    def reserve_part(self, record: AcceptedRecord) -> _ActivePartReservation:
+        if type(record) is not AcceptedRecord:
+            raise TypeError("record must be AcceptedRecord")
+        if record.envelope.exchange is not self._exchange:
+            raise ValueError("record exchange does not match active part set")
+        sequence = self._next_part_sequence
+        self._next_part_sequence += 1
+        part_start_ns = (record.envelope.received_at_ns // _HOUR_NS) * _HOUR_NS
+        generation_id = str(uuid.uuid4())
+        partial_path = raw_partial_path(
+            self._data_root,
+            record.envelope,
+            part_start_ns=part_start_ns,
+            sequence=sequence,
+        )
+        return _ActivePartReservation(
+            key=self._key(record.envelope),
+            generation_id=generation_id,
+            part_start_ns=part_start_ns,
+            part_sequence=sequence,
+            partial_path=partial_path,
+            data_relative_path=Path(str(partial_path).removesuffix(".partial"))
+            .relative_to(self._data_root)
+            .as_posix(),
+            created_at_ns=record.envelope.received_at_ns,
+        )
+
+    def _reserve_replacement(
+        self,
+        key: _LogicalPartKey,
+        part: _ActivePart,
+        *,
+        created_at_ns: int,
+    ) -> _ActivePartReservation:
+        sequence = self._next_part_sequence
+        self._next_part_sequence += 1
+        partial_path = part.partial_path.with_name(
+            f"part-{part.part_start_ns}-{sequence}.jsonl.zst.partial"
+        )
+        return _ActivePartReservation(
+            key=key,
+            generation_id=str(uuid.uuid4()),
+            part_start_ns=part.part_start_ns,
+            part_sequence=sequence,
+            partial_path=partial_path,
+            data_relative_path=Path(str(partial_path).removesuffix(".partial"))
+            .relative_to(self._data_root)
+            .as_posix(),
+            created_at_ns=_nonnegative(created_at_ns, field_name="created_at_ns"),
+        )
+
+    def plan_due_rotations(
+        self,
+        *,
+        now_ns: int,
+        seal_acceptance_ordinal: int,
+    ) -> tuple[_ActivePartRotation, ...]:
+        now = _nonnegative(now_ns, field_name="now_ns")
+        seal_ordinal = _nonnegative(
+            seal_acceptance_ordinal,
+            field_name="seal_acceptance_ordinal",
+        )
+        plans: list[_ActivePartRotation] = []
+        for key, entry in self._active.items():
+            if type(entry) is not _ActivePart or entry.record_count == 0:
+                continue
+            if entry.stream_file.compressed_size >= self._max_compressed_size_bytes:
+                reason = CloseReason.ROTATE_SIZE
+            elif now - entry.created_at_ns >= self._rotate_interval_ns:
+                reason = CloseReason.ROTATE_TIME
+            else:
+                continue
+            entry.validate_retirement(reason, closed_at_ns=now)
+            plans.append(
+                _ActivePartRotation(
+                    current=entry,
+                    reservation=self._reserve_replacement(
+                        key,
+                        entry,
+                        created_at_ns=now,
+                    ),
+                    reason=reason,
+                    closed_at_ns=now,
+                    seal_acceptance_ordinal=seal_ordinal,
+                )
+            )
+        return tuple(sorted(plans, key=lambda item: item.current.data_relative_path))
+
+    def begin_rotations(self, plans: tuple[_ActivePartRotation, ...]) -> None:
+        if any(type(plan) is not _ActivePartRotation for plan in plans):
+            raise TypeError("plans must contain _ActivePartRotation values")
+        keys = tuple(plan.reservation.key for plan in plans)
+        if len(set(keys)) != len(keys):
+            raise ValueError("rotation plans must have unique logical identities")
+        for plan in plans:
+            if self._active.get(plan.reservation.key) is not plan.current:
+                raise ValueError("rotation current part is no longer logical-active")
+            plan.current.validate_retirement(
+                plan.reason,
+                closed_at_ns=plan.closed_at_ns,
+            )
+        for plan in plans:
+            plan.current.retire(plan.reason, closed_at_ns=plan.closed_at_ns)
+            self._active[plan.reservation.key] = plan.reservation
+
+    def materialize_rotation(self, plan: _ActivePartRotation) -> _ActivePart:
+        if type(plan) is not _ActivePartRotation:
+            raise TypeError("plan must be _ActivePartRotation")
+        return _ActivePart.allocate_empty_replacement(
+            data_root=self._data_root,
+            current=plan.current,
+            generation_id=plan.reservation.generation_id,
+            partial_path=plan.reservation.partial_path,
+            part_start_ns=plan.reservation.part_start_ns,
+            part_sequence=plan.reservation.part_sequence,
+            zstd_level=self._zstd_level,
+            max_plain_frame_bytes=self._max_plain_frame_bytes,
+            durability_slo_ns=self._durability_slo_ns,
+            created_at_ns=plan.reservation.created_at_ns,
+        )
+
+    def commit_rotations(
+        self,
+        materialized: tuple[tuple[_ActivePartRotation, _ActivePart], ...],
+    ) -> tuple[tuple[_ActivePart, ...], tuple[_ActivePart, ...]]:
+        for plan, replacement in materialized:
+            if (
+                type(plan) is not _ActivePartRotation
+                or type(replacement) is not _ActivePart
+            ):
+                raise TypeError("materialized rotation has invalid members")
+            if self._active.get(plan.reservation.key) is not plan.reservation:
+                raise ValueError("rotation reservation is no longer logical-active")
+            if (
+                replacement.generation_id != plan.reservation.generation_id
+                or replacement.partial_path != plan.reservation.partial_path
+                or replacement.record_count != 0
+                or replacement.received_hour != plan.current.received_hour
+            ):
+                raise ValueError("rotation replacement does not match its plan")
+            plan.current.validate_retirement(
+                plan.reason,
+                closed_at_ns=plan.closed_at_ns,
+            )
+        for plan, replacement in materialized:
+            self._active[plan.reservation.key] = replacement
+        size_parts = tuple(
+            plan.current
+            for plan, _replacement in materialized
+            if plan.reason is CloseReason.ROTATE_SIZE
+        )
+        interval_parts = tuple(
+            plan.current
+            for plan, _replacement in materialized
+            if plan.reason is CloseReason.ROTATE_TIME
+        )
+        return size_parts, interval_parts
+
+    def materialize_reserved(
+        self,
+        reservation: _ActivePartReservation,
+        record: AcceptedRecord,
+        identity: AcceptedRecordIdentityV1,
+        *,
+        created_at_ns: int | None = None,
+    ) -> _ActivePart:
+        if type(reservation) is not _ActivePartReservation:
+            raise TypeError("reservation must be _ActivePartReservation")
+        self._validate_current_config(record, identity)
+        if reservation.key != self._key(record.envelope):
+            raise ValueError("reservation logical identity does not match record")
+        expected_path = raw_partial_path(
+            self._data_root,
+            record.envelope,
+            part_start_ns=reservation.part_start_ns,
+            sequence=reservation.part_sequence,
+        )
+        if expected_path != reservation.partial_path:
+            raise ValueError("reservation path does not match its record")
+        return _ActivePart.allocate(
+            data_root=self._data_root,
+            first_record=record,
+            first_identity=identity,
+            generation_id=reservation.generation_id,
+            part_start_ns=reservation.part_start_ns,
+            part_sequence=reservation.part_sequence,
+            zstd_level=self._zstd_level,
+            max_plain_frame_bytes=self._max_plain_frame_bytes,
+            durability_slo_ns=self._durability_slo_ns,
+            created_at_ns=created_at_ns,
+        )
+
+    def install_reserved(
+        self,
+        reservation: _ActivePartReservation,
+        part: _ActivePart,
+    ) -> None:
+        if type(reservation) is not _ActivePartReservation:
+            raise TypeError("reservation must be _ActivePartReservation")
+        if type(part) is not _ActivePart:
+            raise TypeError("part must be _ActivePart")
+        current = self._active.get(reservation.key)
+        if current is not None and current is not reservation:
+            raise ValueError("logical identity already has an active raw part")
+        if (
+            part.generation_id != reservation.generation_id
+            or part.partial_path != reservation.partial_path
+        ):
+            raise ValueError("materialized part does not match its reservation")
+        self._active[reservation.key] = part
+
+    def replace_reserved_for_hour(
+        self,
+        reservation: _ActivePartReservation,
+        part: _ActivePart,
+        *,
+        closed_at_ns: int,
+    ) -> _ActivePart | None:
+        if type(reservation) is not _ActivePartReservation:
+            raise TypeError("reservation must be _ActivePartReservation")
+        if type(part) is not _ActivePart:
+            raise TypeError("part must be _ActivePart")
+        current = self._active.get(reservation.key)
+        if current is None:
+            raise ValueError("hour replacement requires an active raw part")
+        if (
+            part.generation_id != reservation.generation_id
+            or part.partial_path != reservation.partial_path
+        ):
+            raise ValueError("materialized part does not match its reservation")
+        if current.received_hour == part.received_hour:
+            raise ValueError("hour replacement must change the received UTC hour")
+        if type(current) is _ActivePartReservation:
+            self._active[reservation.key] = part
+            return None
+        assert type(current) is _ActivePart
+        current.validate_retirement(
+            CloseReason.ROTATE_TIME,
+            closed_at_ns=closed_at_ns,
+        )
+        current.retire(
+            CloseReason.ROTATE_TIME,
+            closed_at_ns=closed_at_ns,
+        )
+        self._active[reservation.key] = part
+        return current
 
     def _allocate(
         self,
         record: AcceptedRecord,
         identity: AcceptedRecordIdentityV1,
     ) -> _ActivePart:
-        sequence = self._next_part_sequence
-        self._next_part_sequence += 1
-        received_hour_start = (record.envelope.received_at_ns // _HOUR_NS) * _HOUR_NS
-        return _ActivePart.allocate(
-            data_root=self._data_root,
-            first_record=record,
-            first_identity=identity,
-            generation_id=str(uuid.uuid4()),
-            part_start_ns=received_hour_start,
-            part_sequence=sequence,
-            zstd_level=self._zstd_level,
-            max_plain_frame_bytes=self._max_plain_frame_bytes,
-            durability_slo_ns=self._durability_slo_ns,
+        reservation = self.reserve_part(record)
+        return self.materialize_reserved(reservation, record, identity)
+
+    def active_part_for(self, record: AcceptedRecord) -> _ActivePart | None:
+        if type(record) is not AcceptedRecord:
+            raise TypeError("record must be AcceptedRecord")
+        entry = self._active.get(self._key(record.envelope))
+        return entry if type(entry) is _ActivePart else None
+
+    def active_entry_for(self, record: AcceptedRecord) -> _ActivePartEntry | None:
+        if type(record) is not AcceptedRecord:
+            raise TypeError("record must be AcceptedRecord")
+        return self._active.get(self._key(record.envelope))
+
+    def active_part_for_logical_identity(
+        self,
+        *,
+        market: Market | None,
+        instrument_key: str | None,
+        logical_stream: str,
+    ) -> _ActivePartEntry | None:
+        return self._active.get((market, instrument_key, logical_stream))
+
+    def active_parts(self) -> tuple[_ActivePart, ...]:
+        return tuple(
+            sorted(
+                (
+                    entry
+                    for entry in self._active.values()
+                    if type(entry) is _ActivePart
+                ),
+                key=lambda item: item.data_relative_path,
+            )
         )
+
+    def active_logical_generation_count(self) -> int:
+        return len(self._active)
+
+    def part_for_generation(self, generation_id: str) -> _ActivePart | None:
+        generation = _nonempty(generation_id, field_name="generation_id")
+        matches = tuple(
+            entry
+            for entry in self._active.values()
+            if type(entry) is _ActivePart and entry.generation_id == generation
+        )
+        if len(matches) > 1:
+            raise AssertionError("active generation ID is not unique")
+        return None if not matches else matches[0]
+
+    def reservation_for_generation(
+        self, generation_id: str
+    ) -> _ActivePartReservation | None:
+        generation = _nonempty(generation_id, field_name="generation_id")
+        matches = tuple(
+            entry
+            for entry in self._active.values()
+            if type(entry) is _ActivePartReservation
+            and entry.generation_id == generation
+        )
+        if len(matches) > 1:
+            raise AssertionError("active reservation generation ID is not unique")
+        return None if not matches else matches[0]
 
     def _validate_current_config(
         self,
@@ -1400,10 +1896,11 @@ class _ActivePartSet:
     ) -> tuple[_ActivePart, ...]:
         self._validate_current_config(record, identity)
         key = self._key(record.envelope)
-        part = self._active.get(key)
+        entry = self._active.get(key)
         retired: tuple[_ActivePart, ...] = ()
         received_hour = record.envelope.received_at_ns // _HOUR_NS
-        if part is not None and part.received_hour != received_hour:
+        if type(entry) is _ActivePart and entry.received_hour != received_hour:
+            part = entry
             part.validate_retirement(
                 CloseReason.ROTATE_TIME,
                 closed_at_ns=record.envelope.received_at_ns,
@@ -1421,9 +1918,18 @@ class _ActivePartSet:
             retired = (part,)
             self._active[key] = replacement
             return retired
-        if part is None:
+        if type(entry) is _ActivePartReservation:
+            if entry.received_hour == received_hour:
+                part = self.materialize_reserved(entry, record, identity)
+            else:
+                part = self._allocate(record, identity)
+            self._active[key] = part
+        elif entry is None:
             part = self._allocate(record, identity)
             self._active[key] = part
+        else:
+            assert type(entry) is _ActivePart
+            part = entry
         part.append_accepted(record, identity)
         return retired
 
@@ -1434,15 +1940,50 @@ class _ActivePartSet:
         closed_at_ns: int,
     ) -> tuple[_ActivePart, ...]:
         closed = _nonnegative(closed_at_ns, field_name="closed_at_ns")
-        parts = tuple(
-            sorted(self._active.values(), key=lambda item: item.data_relative_path)
-        )
+        parts = self.active_parts()
         for part in parts:
             part.validate_retirement(reason, closed_at_ns=closed)
         for part in parts:
             part.retire(reason, closed_at_ns=closed)
         self._active.clear()
         return parts
+
+    def prepare_config_rotation(
+        self,
+        config_sha256: str,
+        *,
+        config_generation: int,
+        closed_at_ns: int,
+    ) -> tuple[_ActivePart, ...]:
+        _sha256(config_sha256, field_name="config_sha256")
+        next_generation = _nonnegative(
+            config_generation,
+            field_name="config_generation",
+        )
+        if next_generation <= self._config_generation:
+            raise ValueError("config_generation must be strictly greater")
+        return self.detach_all(
+            CloseReason.CONFIG_RELOAD,
+            closed_at_ns=closed_at_ns,
+        )
+
+    def commit_config_rotation(
+        self,
+        config_sha256: str,
+        *,
+        config_generation: int,
+    ) -> None:
+        next_sha256 = _sha256(config_sha256, field_name="config_sha256")
+        next_generation = _nonnegative(
+            config_generation,
+            field_name="config_generation",
+        )
+        if next_generation <= self._config_generation:
+            raise ValueError("config_generation must be strictly greater")
+        if self._active:
+            raise ValueError("config rotation commit requires no old active parts")
+        self._config_sha256 = next_sha256
+        self._config_generation = next_generation
 
     def rotate_for_config(
         self,
@@ -1451,52 +1992,76 @@ class _ActivePartSet:
         config_generation: int,
         closed_at_ns: int,
     ) -> tuple[_ActivePart, ...]:
-        next_sha256 = _sha256(config_sha256, field_name="config_sha256")
-        next_generation = _nonnegative(
-            config_generation,
-            field_name="config_generation",
-        )
-        if next_generation <= self._config_generation:
-            raise ValueError("config_generation must be strictly greater")
-        retired = self.detach_all(
-            CloseReason.CONFIG_RELOAD,
+        retired = self.prepare_config_rotation(
+            config_sha256,
+            config_generation=config_generation,
             closed_at_ns=closed_at_ns,
         )
-        self._config_sha256 = next_sha256
-        self._config_generation = next_generation
+        self.commit_config_rotation(
+            config_sha256,
+            config_generation=config_generation,
+        )
         return retired
 
     def detach_size_due(self, *, closed_at_ns: int) -> tuple[_ActivePart, ...]:
         closed = _nonnegative(closed_at_ns, field_name="closed_at_ns")
         due_keys = tuple(
             key
-            for key, part in self._active.items()
-            if part.stream_file.compressed_size >= self._max_compressed_size_bytes
+            for key, entry in self._active.items()
+            if type(entry) is _ActivePart
+            and entry.stream_file.compressed_size >= self._max_compressed_size_bytes
         )
         due = [self._active[key] for key in due_keys]
+        assert all(type(part) is _ActivePart for part in due)
         for part in due:
+            assert type(part) is _ActivePart
             part.validate_retirement(CloseReason.ROTATE_SIZE, closed_at_ns=closed)
+        replacements = {
+            key: self._reserve_replacement(key, part, created_at_ns=closed)
+            for key, part in zip(due_keys, due, strict=True)
+            if type(part) is _ActivePart
+        }
         for part in due:
+            assert type(part) is _ActivePart
             part.retire(CloseReason.ROTATE_SIZE, closed_at_ns=closed)
         for key in due_keys:
-            del self._active[key]
-        return tuple(sorted(due, key=lambda item: item.data_relative_path))
+            self._active[key] = replacements[key]
+        return tuple(
+            sorted(
+                (part for part in due if type(part) is _ActivePart),
+                key=lambda item: item.data_relative_path,
+            )
+        )
 
     def detach_interval_due(self, *, now_ns: int) -> tuple[_ActivePart, ...]:
         now = _nonnegative(now_ns, field_name="now_ns")
         due_keys = tuple(
             key
-            for key, part in self._active.items()
-            if now - part.created_at_ns >= self._rotate_interval_ns
+            for key, entry in self._active.items()
+            if type(entry) is _ActivePart
+            and now - entry.created_at_ns >= self._rotate_interval_ns
         )
         due = [self._active[key] for key in due_keys]
+        assert all(type(part) is _ActivePart for part in due)
         for part in due:
+            assert type(part) is _ActivePart
             part.validate_retirement(CloseReason.ROTATE_TIME, closed_at_ns=now)
+        replacements = {
+            key: self._reserve_replacement(key, part, created_at_ns=now)
+            for key, part in zip(due_keys, due, strict=True)
+            if type(part) is _ActivePart
+        }
         for part in due:
+            assert type(part) is _ActivePart
             part.retire(CloseReason.ROTATE_TIME, closed_at_ns=now)
         for key in due_keys:
-            del self._active[key]
-        return tuple(sorted(due, key=lambda item: item.data_relative_path))
+            self._active[key] = replacements[key]
+        return tuple(
+            sorted(
+                (part for part in due if type(part) is _ActivePart),
+                key=lambda item: item.data_relative_path,
+            )
+        )
 
 
 class _DurabilityCoordinator(Protocol):
@@ -1615,6 +2180,20 @@ class _FinalBarrierControlDependency:
         )
         if association_targets != expected_targets:
             raise ValueError("control dependency targets must match the association")
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalBarrierCloseMember:
+    part: _ActivePart
+    reason: CloseReason
+    closed_at_ns: int
+
+    def __post_init__(self) -> None:
+        if type(self.part) is not _ActivePart:
+            raise TypeError("part must be _ActivePart")
+        if type(self.reason) is not CloseReason or self.reason is CloseReason.RECOVERY:
+            raise ValueError("close member requires a normal close reason")
+        _nonnegative(self.closed_at_ns, field_name="closed_at_ns")
 
 
 @dataclass(slots=True)
@@ -1911,6 +2490,21 @@ class _FinalBarrierController:
         self,
         command: _FinalBarrierCommandState,
     ) -> WriterCriticalError:
+        lifecycle_error = next(
+            (
+                error
+                for error in command.file_errors.values()
+                if isinstance(error, WriterCriticalError)
+                and error.reason
+                in {
+                    WriterCriticalReason.CLOSE_DEADLINE,
+                    WriterCriticalReason.OLDEST_UNPERSISTED_AGE,
+                }
+            ),
+            None,
+        )
+        if lifecycle_error is not None:
+            return lifecycle_error
         failed_control_ids = tuple(
             generation_id
             for generation_id in command.control_generation_ids
@@ -2420,20 +3014,27 @@ class _FinalBarrierController:
         self._try_finish_final_barrier(command)
         return True
 
-    def _start_close_group(
+    def owns_generation(self, generation_id: str) -> bool:
+        return generation_id in self._command_by_generation
+
+    def _start_mixed_close_group(
         self,
-        parts: tuple[_ActivePart, ...],
+        members: tuple[_FinalBarrierCloseMember, ...],
         *,
-        reason: CloseReason,
-        closed_at_ns: int,
+        trigger: DurabilityTrigger,
         control_dependencies: tuple[_FinalBarrierControlDependency, ...],
     ) -> asyncio.Future[tuple[RawManifestV1, ...]]:
-        closed = _nonnegative(closed_at_ns, field_name="closed_at_ns")
+        if type(trigger) is not DurabilityTrigger:
+            raise TypeError("trigger must be DurabilityTrigger")
+        parts = tuple(member.part for member in members)
         generation_ids = tuple(part.generation_id for part in parts)
         if len(set(generation_ids)) != len(generation_ids):
             raise ValueError("final barrier generation IDs must be unique")
-        for part in parts:
-            part.validate_final_barrier(reason, closed_at_ns=closed)
+        for member in members:
+            member.part.validate_final_barrier(
+                member.reason,
+                closed_at_ns=member.closed_at_ns,
+            )
 
         closing_generation_ids = set(generation_ids)
         closing_parts_by_generation = {part.generation_id: part for part in parts}
@@ -2525,9 +3126,12 @@ class _FinalBarrierController:
                     batch_task,
                     [],
                 ).append(work_part.generation_id)
-        for part in parts:
-            if part.close_reason is None:
-                part.retire(reason, closed_at_ns=closed)
+        for member in members:
+            if member.part.close_reason is None:
+                member.part.retire(
+                    member.reason,
+                    closed_at_ns=member.closed_at_ns,
+                )
 
         loop = asyncio.get_running_loop()
         command_id = str(uuid.uuid4())
@@ -2536,7 +3140,7 @@ class _FinalBarrierController:
             command_id=command_id,
             parts=parts,
             work_parts=work_parts,
-            trigger=_CLOSE_TRIGGER[reason],
+            trigger=trigger,
             claims_by_generation={},
             batch_generation_ids=(),
             control_dependencies_by_generation={
@@ -2569,6 +3173,63 @@ class _FinalBarrierController:
         if not prerequisite_claims:
             self._submit_final_batch(command)
         return result_future
+
+    def _start_close_group(
+        self,
+        parts: tuple[_ActivePart, ...],
+        *,
+        reason: CloseReason,
+        closed_at_ns: int,
+        control_dependencies: tuple[_FinalBarrierControlDependency, ...],
+    ) -> asyncio.Future[tuple[RawManifestV1, ...]]:
+        return self._start_mixed_close_group(
+            tuple(
+                _FinalBarrierCloseMember(
+                    part=part,
+                    reason=reason,
+                    closed_at_ns=closed_at_ns,
+                )
+                for part in parts
+            ),
+            trigger=_CLOSE_TRIGGER[reason],
+            control_dependencies=control_dependencies,
+        )
+
+    async def close_mixed_group(
+        self,
+        members: Sequence[_FinalBarrierCloseMember],
+        *,
+        trigger: DurabilityTrigger,
+        control_dependencies: Sequence[_FinalBarrierControlDependency] = (),
+    ) -> tuple[RawManifestV1, ...]:
+        owned_members = tuple(members)
+        owned_dependencies = tuple(control_dependencies)
+        if any(
+            type(member) is not _FinalBarrierCloseMember for member in owned_members
+        ):
+            raise TypeError("members must contain _FinalBarrierCloseMember values")
+        if any(
+            type(dependency) is not _FinalBarrierControlDependency
+            for dependency in owned_dependencies
+        ):
+            raise TypeError(
+                "control_dependencies must contain "
+                "_FinalBarrierControlDependency values"
+            )
+        if not owned_members:
+            if owned_dependencies:
+                raise ValueError("control dependencies require a nonempty close group")
+            return ()
+        result_future = self._start_mixed_close_group(
+            owned_members,
+            trigger=trigger,
+            control_dependencies=owned_dependencies,
+        )
+        try:
+            return await asyncio.shield(result_future)
+        except asyncio.CancelledError:
+            self._detached_futures.add(result_future)
+            raise
 
     async def close_group(
         self,

@@ -1,7 +1,11 @@
 from crypto_collector.storage.durability import (
+    AsyncioSleeper,
+    AsyncSleeper,
     DuplicateFileGeneration,
     DurabilityBatch,
     DurabilityCoordinator,
+    DurabilitySloState,
+    DurabilitySloTransition,
     DurabilityTrigger,
     FileDurabilityResult,
     FilePersistenceError,
@@ -72,6 +76,7 @@ from crypto_collector.storage.models import (
     validate_control_draft,
 )
 from crypto_collector.storage.serialize import decode_envelope_jsonl, encode_envelope
+from crypto_collector.storage.service import RawWriterService
 from crypto_collector.storage.stats import (
     DURABILITY_BUCKET_UPPER_BOUNDS_NS,
     DURABILITY_HISTOGRAM_SCHEMA_VERSION,
@@ -109,6 +114,8 @@ __all__ = [
     "AcceptedRecordIdentityV1",
     "AdmissionContractError",
     "AdmissionState",
+    "AsyncSleeper",
+    "AsyncioSleeper",
     "BufferedRow",
     "CapacityClass",
     "CleanupProofEvidenceV1",
@@ -121,6 +128,8 @@ __all__ = [
     "DurabilityHistogramSeriesV1",
     "DurabilityHistogramSnapshot",
     "DurabilityLedger",
+    "DurabilitySloState",
+    "DurabilitySloTransition",
     "DurabilityStage",
     "DurabilityTrigger",
     "EnqueueResult",
@@ -144,6 +153,7 @@ __all__ = [
     "RawIngressSnapshot",
     "RawManifestReader",
     "RawManifestV1",
+    "RawWriterService",
     "RecoveryAccountingMode",
     "RecoveryBlocked",
     "RecoveryDurabilityCoordinator",
