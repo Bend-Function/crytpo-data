@@ -382,8 +382,10 @@ def test_hardlink_fallback_makes_destination_durable_before_source_unlink(
     assert events == [
         "link",
         "after_link",
+        "after_namespace_publish",
         "directory_fsync",
         "after_destination_directory_fsync",
+        "after_publication_parent_fsync",
         "unlink_source",
         "after_source_unlink",
         "directory_fsync",
@@ -401,6 +403,7 @@ def test_renameat2_publication_is_same_parent_and_directory_durable(
     source.write_bytes(b"immutable")
     events: list[str] = []
     real_fsync = os.fsync
+    real_open_matching_destination = raw_writer_module._open_matching_destination
 
     def fake_renameat2(
         source_path: Path,
@@ -420,18 +423,41 @@ def test_renameat2_publication_is_same_parent_and_directory_durable(
         events.append("common_parent_directory_fsync")
         real_fsync(fd)
 
+    def traced_open_matching_destination(
+        parent_fd: int,
+        source_fd: int,
+        source_path: Path,
+        destination_path: Path,
+    ) -> int:
+        events.append("verify_destination")
+        return real_open_matching_destination(
+            parent_fd,
+            source_fd,
+            source_path,
+            destination_path,
+        )
+
     monkeypatch.setattr(raw_writer_module, "_renameat2_noreplace", fake_renameat2)
+    monkeypatch.setattr(
+        raw_writer_module,
+        "_open_matching_destination",
+        traced_open_matching_destination,
+    )
     monkeypatch.setattr(raw_writer_module.os, "fsync", traced_fsync)
 
     publish_no_replace(
         source,
         destination,
         capability=NoReplaceCapability.RENAMEAT2_NOREPLACE,
+        phase_hook=events.append,
     )
 
     assert events == [
         "renameat2_noreplace",
+        "after_namespace_publish",
+        "verify_destination",
         "common_parent_directory_fsync",
+        "after_publication_parent_fsync",
     ]
     other_parent = tmp_path / "other"
     other_parent.mkdir()

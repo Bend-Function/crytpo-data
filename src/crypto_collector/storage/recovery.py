@@ -66,6 +66,11 @@ from crypto_collector.storage.models import (
     StorageControlTargetV1,
     validate_normalized_data_relative_path,
 )
+from crypto_collector.storage.phases import (
+    StoragePhaseHook,
+    notify_storage_phase,
+    project_storage_phase_hook,
+)
 from crypto_collector.storage.raw_writer import (
     _open_bound_readonly_and_close,
     atomic_write_and_sync_json_exclusive,
@@ -1795,6 +1800,21 @@ _FACT_TYPES: tuple[type[_RecoveryFact], ...] = (
     RecoveryCompleteV1,
 )
 _FACT_TYPE_BY_FILENAME = {fact_type._filename: fact_type for fact_type in _FACT_TYPES}
+_FACT_PHASE_PREFIX: dict[type[_RecoveryFact], str] = {
+    RecoveryIntentV1: "intent",
+    RecoveryArtifactsDurableV1: "artifacts",
+    RecoverySourceSettledV1: "source_settled",
+    RecoveryControlOwnershipV1: "control_ownership",
+    RecoveryControlDurableV1: "control_durable",
+    RecoveryCompleteV1: "complete",
+}
+
+
+def _project_phase_hook(
+    hook: StoragePhaseHook | None,
+    mapping: dict[str, str],
+) -> StoragePhaseHook | None:
+    return project_storage_phase_hook(hook, mapping)
 
 
 def _convert_enum(
@@ -2071,10 +2091,21 @@ def _open_directory_path(path: Path) -> int:
         raise
 
 
-def _create_child_directories(root: Path, segments: tuple[str, ...]) -> None:
+def _create_child_directories(
+    root: Path,
+    segments: tuple[str, ...],
+    *,
+    phase_hook: StoragePhaseHook | None = None,
+    creation_phases: tuple[tuple[str, str] | None, ...] | None = None,
+) -> None:
+    if phase_hook is not None and not callable(phase_hook):
+        raise TypeError("phase_hook must be callable or None")
+    phases = (None,) * len(segments) if creation_phases is None else creation_phases
+    if len(phases) != len(segments):
+        raise ValueError("creation_phases must align with directory segments")
     current_fd = _open_directory_path(root)
     try:
-        for segment in segments:
+        for segment, segment_phases in zip(segments, phases, strict=True):
             if not segment or segment in {".", ".."} or "/" in segment:
                 raise ValueError("recovery directory segment is invalid")
             try:
@@ -2085,7 +2116,11 @@ def _create_child_directories(root: Path, segments: tuple[str, ...]) -> None:
                 )
             except FileNotFoundError:
                 os.mkdir(segment, 0o750, dir_fd=current_fd)
+                if segment_phases is not None:
+                    notify_storage_phase(phase_hook, segment_phases[0])
                 os.fsync(current_fd)
+                if segment_phases is not None:
+                    notify_storage_phase(phase_hook, segment_phases[1])
                 next_fd = os.open(
                     segment,
                     _recovery_directory_flags(),
@@ -2102,13 +2137,22 @@ def _create_child_directories(root: Path, segments: tuple[str, ...]) -> None:
 class _RecoveryJournal:
     """Crash-safe publisher for one exchange's immutable recovery facts."""
 
-    def __init__(self, *, state_root: Path, exchange: Exchange) -> None:
+    def __init__(
+        self,
+        *,
+        state_root: Path,
+        exchange: Exchange,
+        phase_hook: StoragePhaseHook | None = None,
+    ) -> None:
         if not isinstance(state_root, Path):
             raise TypeError("state_root must be Path")
         if type(exchange) is not Exchange:
             raise TypeError("exchange must be Exchange")
+        if phase_hook is not None and not callable(phase_hook):
+            raise TypeError("phase_hook must be callable or None")
         self._state_root = Path(os.path.abspath(os.fspath(state_root)))
         self._exchange = exchange
+        self._phase_hook = phase_hook
 
     @staticmethod
     def _transaction_id(value: str) -> str:
@@ -2128,6 +2172,14 @@ class _RecoveryJournal:
             _create_child_directories(
                 self._state_root,
                 ("raw-recovery", self._exchange.value),
+                phase_hook=self._phase_hook,
+                creation_phases=(
+                    ("recovery_root_mkdir", "recovery_root_parent_fsync"),
+                    (
+                        "exchange_journal_mkdir",
+                        "exchange_journal_parent_fsync",
+                    ),
+                ),
             )
         except (OSError, TypeError, ValueError) as error:
             raise RecoveryBlocked("recovery journal directory is unsafe") from error
@@ -2139,6 +2191,15 @@ class _RecoveryJournal:
             _create_child_directories(
                 self._state_root,
                 ("raw-recovery", self._exchange.value, normalized),
+                phase_hook=self._phase_hook,
+                creation_phases=(
+                    ("recovery_root_mkdir", "recovery_root_parent_fsync"),
+                    (
+                        "exchange_journal_mkdir",
+                        "exchange_journal_parent_fsync",
+                    ),
+                    ("transaction_mkdir", "transaction_parent_fsync"),
+                ),
             )
         except (OSError, TypeError, ValueError) as error:
             raise RecoveryBlocked("recovery journal directory is unsafe") from error
@@ -2291,12 +2352,27 @@ class _RecoveryJournal:
             fact.transaction_id,
         )
         final = transaction_root / fact_type._filename
+        phase_prefix = _FACT_PHASE_PREFIX[fact_type]
         try:
             atomic_write_and_sync_json_exclusive(
                 temporary,
                 fact.canonical_fact_bytes(),
+                phase_hook=self._phase_hook,
+                phase_prefix=phase_prefix,
             )
-            publish_no_replace(temporary, final)
+            publish_no_replace(
+                temporary,
+                final,
+                phase_hook=_project_phase_hook(
+                    self._phase_hook,
+                    {
+                        "after_namespace_publish": f"{phase_prefix}_rename",
+                        "after_publication_parent_fsync": (
+                            f"{phase_prefix}_parent_fsync"
+                        ),
+                    },
+                ),
+            )
             observed = load_recovery_fact(final, fact_type)
             if observed != fact:
                 raise RecoveryBlocked("published recovery fact does not match intent")
@@ -2805,6 +2881,7 @@ class RecoveryContext:
     recovery_coordinator: RecoveryDurabilityCoordinator
     storage_executor: Executor
     source_disposition_resolver: SourceDispositionResolver
+    phase_hook: StoragePhaseHook | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.data_root, Path):
@@ -2846,6 +2923,8 @@ class RecoveryContext:
             raise TypeError(
                 "source_disposition_resolver must implement resolve_missing"
             )
+        if self.phase_hook is not None and not callable(self.phase_hook):
+            raise TypeError("phase_hook must be callable or None")
 
 
 class RecoveryBackend(Protocol):
@@ -3995,6 +4074,8 @@ def _publish_exact_bytes(
     relative_path: str,
     payload: bytes,
     transaction_id: str,
+    phase_hook: StoragePhaseHook | None = None,
+    phase_prefix: str | None = None,
 ) -> None:
     destination = _ensure_data_parent(data_root, relative_path)
     expected = (len(payload), hashlib.sha256(payload).hexdigest())
@@ -4017,8 +4098,17 @@ def _publish_exact_bytes(
                     0o640,
                     dir_fd=parent_fd,
                 )
+                if phase_prefix is not None:
+                    notify_storage_phase(phase_hook, f"{phase_prefix}_temp_create")
                 os.fsync(parent_fd)
+                if phase_prefix is not None:
+                    notify_storage_phase(
+                        phase_hook,
+                        f"{phase_prefix}_temp_parent_fsync",
+                    )
                 os.fsync(fd)
+                if phase_prefix is not None:
+                    notify_storage_phase(phase_hook, f"{phase_prefix}_file_fsync")
                 os.close(fd)
             finally:
                 os.close(parent_fd)
@@ -4026,11 +4116,28 @@ def _publish_exact_bytes(
             raise RecoveryBlocked("empty recovery artifact creation failed") from error
     else:
         try:
-            atomic_write_and_sync_json_exclusive(temporary, payload)
+            atomic_write_and_sync_json_exclusive(
+                temporary,
+                payload,
+                phase_hook=phase_hook,
+                phase_prefix=phase_prefix,
+            )
         except (OSError, TypeError, ValueError) as error:
             raise RecoveryBlocked("recovery artifact write failed") from error
     try:
-        publish_no_replace(temporary, destination)
+        publication_mapping = (
+            {}
+            if phase_prefix is None
+            else {
+                "after_namespace_publish": f"{phase_prefix}_publish",
+                "after_publication_parent_fsync": (f"{phase_prefix}_parent_fsync"),
+            }
+        )
+        publish_no_replace(
+            temporary,
+            destination,
+            phase_hook=_project_phase_hook(phase_hook, publication_mapping),
+        )
     except (OSError, PublicationConflict) as error:
         raise RecoveryBlocked("recovery artifact publication conflict") from error
     _verify_recovery_artifact(data_root, relative_path, *expected)
@@ -4043,6 +4150,7 @@ def _publish_source_range(
     byte_range: RecoveryByteRange,
     relative_path: str,
     transaction_id: str,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     destination = _ensure_data_parent(data_root, relative_path)
     temporary = destination.with_name(f".{destination.name}.tmp-{transaction_id}")
@@ -4065,7 +4173,9 @@ def _publish_source_range(
                 0o640,
                 dir_fd=parent_fd,
             )
+            notify_storage_phase(phase_hook, "quarantine_temp_create")
             os.fsync(parent_fd)
+            notify_storage_phase(phase_hook, "quarantine_temp_parent_fsync")
             offset = byte_range.start_offset
             remaining = byte_range.size_bytes
             while remaining:
@@ -4079,6 +4189,7 @@ def _publish_source_range(
                 offset += len(chunk)
                 remaining -= len(chunk)
             os.fsync(output_fd)
+            notify_storage_phase(phase_hook, "quarantine_file_fsync")
             if size_and_sha256_fd(output_fd) != (
                 byte_range.size_bytes,
                 byte_range.sha256,
@@ -4089,7 +4200,17 @@ def _publish_source_range(
                 os.close(output_fd)
             os.close(parent_fd)
             os.close(source_fd)
-        publish_no_replace(temporary, destination)
+        publish_no_replace(
+            temporary,
+            destination,
+            phase_hook=_project_phase_hook(
+                phase_hook,
+                {
+                    "after_namespace_publish": "quarantine_publish",
+                    "after_publication_parent_fsync": "quarantine_parent_fsync",
+                },
+            ),
+        )
     except RecoveryBlocked:
         raise
     except (OSError, PublicationConflict) as error:
@@ -4130,6 +4251,7 @@ def _prepare_recovered_stream(
     byte_range: RecoveryByteRange,
     data_relative_path: str,
     generation_id: str,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> StreamFile:
     destination = _ensure_data_parent(data_root, data_relative_path)
     partial = destination.with_name(destination.name + ".partial")
@@ -4158,6 +4280,16 @@ def _prepare_recovered_stream(
                 zstd_level=1,
                 max_plain_frame_bytes=1,
                 generation_id=generation_id,
+                phase_hook=_project_phase_hook(
+                    phase_hook,
+                    {
+                        "partial_create_before_parent_fsync": (
+                            "recovered_data_temp_create"
+                        ),
+                        "partial_parent_fsync": ("recovered_data_temp_parent_fsync"),
+                        "after_data_sync": "recovered_data_file_fsync",
+                    },
+                ),
             )
             existing_size = 0
         else:
@@ -4178,6 +4310,10 @@ def _prepare_recovered_stream(
                     level=1,
                     write_checksum=True,
                     write_content_size=True,
+                ),
+                phase_hook=_project_phase_hook(
+                    phase_hook,
+                    {"after_data_sync": "recovered_data_file_fsync"},
                 ),
             )
             partial_fd = None
@@ -4243,6 +4379,7 @@ def _publish_recovered_stream(
     stream: StreamFile,
     destination: Path,
     expected: RecoveryByteRange,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     verification_fd = _open_bound_readonly_and_close(stream)
     try:
@@ -4255,6 +4392,13 @@ def _publish_recovered_stream(
             stream.path,
             destination,
             expected_source_fd=verification_fd,
+            phase_hook=_project_phase_hook(
+                phase_hook,
+                {
+                    "after_namespace_publish": "recovered_data_publish",
+                    "after_publication_parent_fsync": ("recovered_data_parent_fsync"),
+                },
+            ),
         )
     except (OSError, PublicationConflict) as error:
         raise RecoveryBlocked("recovered data publication failed") from error
@@ -4291,6 +4435,7 @@ async def _publish_recovered_range(
         byte_range=byte_range,
         data_relative_path=data_relative_path,
         generation_id=generation_id,
+        phase_hook=context.phase_hook,
     )
     try:
         work = stream.seal_for_sync(force_sync=True)
@@ -4306,6 +4451,7 @@ async def _publish_recovered_range(
             stream=stream,
             destination=context.data_root / data_relative_path,
             expected=byte_range,
+            phase_hook=context.phase_hook,
         )
     except BaseException:
         if not stream.closed:
@@ -4436,8 +4582,10 @@ async def _publish_streaming_plan_artifacts(
         await run_storage(
             context.io_limiter,
             context.storage_executor,
-            fsync_directory,
-            source_path.parent,
+            _fsync_directory_with_phase,
+            path=source_path.parent,
+            phase_hook=context.phase_hook,
+            phase="retained_data_parent_fsync",
         )
     if plan.manifest is not None:
         assert intent.planned_manifest_relative_path is not None
@@ -4449,6 +4597,8 @@ async def _publish_streaming_plan_artifacts(
             relative_path=intent.planned_manifest_relative_path,
             payload=plan.manifest.canonical_bytes(),
             transaction_id=intent.transaction_id,
+            phase_hook=context.phase_hook,
+            phase_prefix="recovery_manifest",
         )
     if plan.quarantine_range is not None:
         assert intent.planned_quarantine_relative_path is not None
@@ -4461,13 +4611,37 @@ async def _publish_streaming_plan_artifacts(
             byte_range=plan.quarantine_range,
             relative_path=intent.planned_quarantine_relative_path,
             transaction_id=intent.transaction_id,
+            phase_hook=context.phase_hook,
         )
+
+
+def _fsync_directory_with_phase(
+    *,
+    path: Path,
+    phase_hook: StoragePhaseHook | None,
+    phase: str,
+) -> None:
+    directory_fd = _open_directory_path(path)
+    primary_error: BaseException | None = None
+    try:
+        os.fsync(directory_fd)
+        notify_storage_phase(phase_hook, phase)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            os.close(directory_fd)
+        except BaseException:
+            if primary_error is None:
+                raise
 
 
 def _settle_discovered_source(
     *,
     data_root: Path,
     intent: RecoveryIntentV1,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     if intent.planned_source_disposition is RecoverySourceDisposition.RETAINED:
         _verify_recovery_artifact(
@@ -4517,7 +4691,9 @@ def _settle_discovered_source(
             ):
                 raise RecoveryBlocked("recovery source inode changed before settlement")
             os.unlink(name, dir_fd=parent_fd)
+            notify_storage_phase(phase_hook, "source_settlement_mutation")
             os.fsync(parent_fd)
+            notify_storage_phase(phase_hook, "source_settlement_parent_fsync")
         finally:
             os.close(parent_fd)
     finally:
@@ -4636,6 +4812,7 @@ async def _reconcile_discovered_source(
             _settle_discovered_source,
             data_root=context.data_root,
             intent=plan.intent,
+            phase_hook=context.phase_hook,
         )
         settled = _settled_fact_from_intent(
             plan.intent,
@@ -4783,6 +4960,7 @@ async def _reconcile_manifest_only_source(
             _settle_discovered_source,
             data_root=context.data_root,
             intent=intent,
+            phase_hook=context.phase_hook,
         )
         settled = _settled_fact_from_intent(
             intent,
@@ -4965,6 +5143,7 @@ async def _resume_incomplete_source_transaction(
             _settle_discovered_source,
             data_root=context.data_root,
             intent=intent,
+            phase_hook=context.phase_hook,
         )
         settled = _settled_fact_from_intent(
             intent,
@@ -4996,6 +5175,7 @@ def _prepare_owned_control_stream(
     *,
     data_root: Path,
     ownership: RecoveryControlOwnershipV1,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> StreamFile:
     frame = base64.b64decode(ownership.control_frame_base64, validate=True)
     destination = _ensure_data_parent(
@@ -5024,6 +5204,16 @@ def _prepare_owned_control_stream(
                 zstd_level=ownership.zstd_level,
                 max_plain_frame_bytes=ownership.max_plain_frame_bytes,
                 generation_id=ownership.control_generation_id,
+                phase_hook=_project_phase_hook(
+                    phase_hook,
+                    {
+                        "partial_create_before_parent_fsync": (
+                            "owned_control_partial_create"
+                        ),
+                        "partial_parent_fsync": ("owned_control_partial_parent_fsync"),
+                        "after_data_sync": "recovery_control_sync",
+                    },
+                ),
             )
             prefix_size = 0
         else:
@@ -5056,6 +5246,10 @@ def _prepare_owned_control_stream(
                     write_checksum=True,
                     write_content_size=True,
                 ),
+                phase_hook=_project_phase_hook(
+                    phase_hook,
+                    {"after_data_sync": "recovery_control_sync"},
+                ),
             )
             fd = None
             prefix_size = observed.st_size
@@ -5069,6 +5263,7 @@ def _prepare_owned_control_stream(
     try:
         if prefix_size < len(frame):
             write_all(stream.fileno(), frame[prefix_size:])
+            notify_storage_phase(phase_hook, "owned_control_frame_write")
         stream.compressed_size = len(frame)
         return stream
     except BaseException:
@@ -5081,6 +5276,7 @@ def _publish_owned_control_stream(
     stream: StreamFile,
     destination: Path,
     ownership: RecoveryControlOwnershipV1,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     verification_fd = _open_bound_readonly_and_close(stream)
     try:
@@ -5093,6 +5289,15 @@ def _publish_owned_control_stream(
             stream.path,
             destination,
             expected_source_fd=verification_fd,
+            phase_hook=_project_phase_hook(
+                phase_hook,
+                {
+                    "after_namespace_publish": "owned_control_data_publish",
+                    "after_publication_parent_fsync": (
+                        "owned_control_data_parent_fsync"
+                    ),
+                },
+            ),
         )
     except RecoveryBlocked:
         raise
@@ -5100,6 +5305,60 @@ def _publish_owned_control_stream(
         raise RecoveryBlocked("owned control carrier publication failed") from error
     finally:
         os.close(verification_fd)
+
+
+def _settle_owned_control_publication_coexistence(
+    *,
+    partial_path: Path,
+    final_path: Path,
+    ownership: RecoveryControlOwnershipV1,
+) -> None:
+    partial_fd: int | None = None
+    final_fd: int | None = None
+    try:
+        partial_fd, _ = _open_regular_no_follow(partial_path)
+        final_fd, _ = _open_regular_no_follow(final_path)
+        partial_stat = os.fstat(partial_fd)
+        final_stat = os.fstat(final_fd)
+        if (partial_stat.st_dev, partial_stat.st_ino) != (
+            final_stat.st_dev,
+            final_stat.st_ino,
+        ):
+            raise RecoveryBlocked("owned control publication identities conflict")
+        expected = (
+            ownership.control_frame_size_bytes,
+            ownership.control_frame_sha256,
+        )
+        if (
+            size_and_sha256_fd(partial_fd) != expected
+            or size_and_sha256_fd(final_fd) != expected
+        ):
+            raise RecoveryBlocked("owned control publication bytes conflict")
+        publish_no_replace(
+            partial_path,
+            final_path,
+            expected_source_fd=partial_fd,
+        )
+    except RecoveryBlocked:
+        raise
+    except (OSError, PublicationConflict) as error:
+        raise RecoveryBlocked(
+            "owned control publication coexistence could not be settled"
+        ) from error
+    finally:
+        if final_fd is not None:
+            os.close(final_fd)
+        if partial_fd is not None:
+            os.close(partial_fd)
+    try:
+        partial_fd, _ = _open_regular_no_follow(partial_path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise RecoveryBlocked("owned control partial path is unsafe") from error
+    else:
+        os.close(partial_fd)
+        raise RecoveryBlocked("owned control partial remains after replay")
 
 
 async def _restore_owned_control_carrier(
@@ -5145,7 +5404,15 @@ async def _restore_owned_control_carrier(
         os.close(partial_fd)
         partial_exists = True
     if final_exists and partial_exists:
-        raise RecoveryBlocked("owned control partial and final coexist")
+        await run_storage(
+            context.io_limiter,
+            context.storage_executor,
+            _settle_owned_control_publication_coexistence,
+            partial_path=partial_path,
+            final_path=final_path,
+            ownership=ownership,
+        )
+        partial_exists = False
 
     expected_manifest = base64.b64decode(
         ownership.control_recovery_manifest_base64,
@@ -5170,6 +5437,7 @@ async def _restore_owned_control_carrier(
             _prepare_owned_control_stream,
             data_root=context.data_root,
             ownership=ownership,
+            phase_hook=context.phase_hook,
         )
         try:
             work = stream.seal_for_sync(force_sync=True)
@@ -5185,6 +5453,7 @@ async def _restore_owned_control_carrier(
                 stream=stream,
                 destination=final_path,
                 ownership=ownership,
+                phase_hook=context.phase_hook,
             )
         except BaseException:
             if not stream.closed:
@@ -5202,6 +5471,8 @@ async def _restore_owned_control_carrier(
         relative_path=ownership.control_manifest_relative_path,
         payload=expected_manifest,
         transaction_id=ownership.transaction_id,
+        phase_hook=context.phase_hook,
+        phase_prefix="owned_control_recovery_manifest",
     )
     await run_storage(
         context.io_limiter,
@@ -5300,6 +5571,7 @@ class PosixRecoveryBackend:
         journal = _RecoveryJournal(
             state_root=context.state_root,
             exchange=context.exchange,
+            phase_hook=context.phase_hook,
         )
         transaction_ids = await run_storage(
             context.io_limiter,
@@ -5449,6 +5721,7 @@ class PosixRecoveryBackend:
         journal = _RecoveryJournal(
             state_root=context.state_root,
             exchange=context.exchange,
+            phase_hook=context.phase_hook,
         )
         chain = await run_storage(
             context.io_limiter,
@@ -5514,6 +5787,7 @@ class PosixRecoveryBackend:
         journal = _RecoveryJournal(
             state_root=context.state_root,
             exchange=context.exchange,
+            phase_hook=context.phase_hook,
         )
         chain = await run_storage(
             context.io_limiter,

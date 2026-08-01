@@ -20,7 +20,13 @@ _PART_RELATIVE_PATH = Path(
 )
 
 
-def _kill_at(root: Path, *, mode: str, phase: str) -> None:
+def _kill_at(
+    root: Path,
+    *,
+    mode: str,
+    phase: str,
+    extra_args: tuple[str, ...] = (),
+) -> None:
     read_fd, write_fd = os.pipe()
     process = subprocess.Popen(
         [
@@ -32,6 +38,7 @@ def _kill_at(root: Path, *, mode: str, phase: str) -> None:
             phase,
             "--pipe-fd",
             str(write_fd),
+            *extra_args,
         ],
         pass_fds=(write_fd,),
         stdout=subprocess.PIPE,
@@ -83,7 +90,11 @@ def _recover_in_fresh_process(root: Path) -> dict[str, object]:
     return json.loads(completed.stdout)
 
 
-def _assert_one_converged_trade(root: Path) -> None:
+def _assert_one_converged_trade(
+    root: Path,
+    *,
+    expected_quarantine_count: int = 0,
+) -> dict[str, object]:
     first = _recover_in_fresh_process(root)
     trade_manifests = [
         item for item in first["manifests"] if item["logical_stream"] == "trade"
@@ -116,11 +127,27 @@ def _assert_one_converged_trade(root: Path) -> None:
         )
         == 1
     )
-    assert first["quarantine"] == []
+    assert len(first["quarantine"]) == expected_quarantine_count
     assert not [path for path in first["partial_paths"] if "/trade/" in f"/{path}"]
+    assert [item["transaction_id"] for item in first["fact_chains"]] == first[
+        "transaction_ids"
+    ]
+    assert len({item["source_relative_path"] for item in first["fact_chains"]}) == len(
+        first["fact_chains"]
+    )
+    for chain in first["fact_chains"]:
+        assert [fact["kind"] for fact in chain["facts"]] == [
+            "intent",
+            "artifacts_durable",
+            "source_settled",
+            "control_ownership",
+            "control_durable",
+            "complete",
+        ]
 
     second = _recover_in_fresh_process(root)
     assert second == first
+    return first
 
 
 @pytest.mark.parametrize(
@@ -208,3 +235,278 @@ def test_recovery_blocks_conflicting_final_and_manifest_temporary(
     assert "temporary conflicts with the final manifest" in completed.stderr
     assert temporary.exists()
     assert final.exists()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    tuple(
+        f"{prefix}_{suffix}"
+        for prefix in (
+            "intent",
+            "artifacts",
+            "source_settled",
+            "control_ownership",
+            "control_durable",
+            "complete",
+        )
+        for suffix in (
+            "temp_create",
+            "temp_parent_fsync",
+            "file_fsync",
+            "rename",
+            "parent_fsync",
+        )
+    ),
+)
+def test_sigkill_at_recovery_fact_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    _kill_at(tmp_path, mode="recovery-edge", phase=phase)
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert report["outcomes"][0]["source_disposition"] == "removed"
+    assert len(report["transaction_ids"]) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "recovery_root_mkdir",
+        "recovery_root_parent_fsync",
+        "exchange_journal_mkdir",
+        "exchange_journal_parent_fsync",
+        "transaction_mkdir",
+        "transaction_parent_fsync",
+    ),
+)
+def test_sigkill_at_recovery_directory_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    _kill_at(tmp_path, mode="recovery-edge", phase=phase)
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert len(report["transaction_ids"]) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "recovered_data_temp_create",
+        "recovered_data_temp_parent_fsync",
+        "recovered_data_file_fsync",
+        "recovered_data_publish",
+        "recovered_data_parent_fsync",
+        "retained_data_parent_fsync",
+        "recovery_manifest_temp_create",
+        "recovery_manifest_temp_parent_fsync",
+        "recovery_manifest_file_fsync",
+        "recovery_manifest_publish",
+        "recovery_manifest_parent_fsync",
+        "quarantine_temp_create",
+        "quarantine_temp_parent_fsync",
+        "quarantine_file_fsync",
+        "quarantine_publish",
+        "quarantine_parent_fsync",
+    ),
+)
+def test_sigkill_at_recovery_artifact_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    _kill_at(tmp_path, mode="recovery-edge", phase=phase)
+    report = _assert_one_converged_trade(
+        tmp_path,
+        expected_quarantine_count=int(phase.startswith("quarantine_")),
+    )
+
+    assert len(report["outcomes"]) == 1
+    expected_disposition = (
+        "retained" if phase == "retained_data_parent_fsync" else "removed"
+    )
+    assert report["outcomes"][0]["source_disposition"] == expected_disposition
+    assert len(report["transaction_ids"]) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ("source_settlement_mutation", "source_settlement_parent_fsync"),
+)
+def test_sigkill_at_source_settlement_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    _kill_at(tmp_path, mode="recovery-edge", phase=phase)
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert report["outcomes"][0]["source_disposition"] == "removed"
+    assert len(report["transaction_ids"]) == 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "owned_control_partial_create",
+        "owned_control_partial_parent_fsync",
+        "owned_control_frame_write",
+        "recovery_control_sync",
+        "owned_control_data_publish",
+        "owned_control_data_parent_fsync",
+        "owned_control_normal_manifest_publish",
+        "owned_control_normal_manifest_parent_fsync",
+    ),
+)
+def test_sigkill_at_owned_control_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    replay_only = {
+        "owned_control_partial_create",
+        "owned_control_partial_parent_fsync",
+        "owned_control_frame_write",
+        "recovery_control_sync",
+        "owned_control_data_publish",
+        "owned_control_data_parent_fsync",
+    }
+    if phase in replay_only:
+        _kill_at(
+            tmp_path,
+            mode="recovery-edge",
+            phase="control_ownership_parent_fsync",
+        )
+        _kill_at(tmp_path, mode="replay-edge", phase=phase)
+    else:
+        _kill_at(tmp_path, mode="recovery-edge", phase=phase)
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert len(report["transaction_ids"]) == 1
+    control_manifests = [
+        item for item in report["manifests"] if item["logical_stream"] == "_control"
+    ]
+    assert len(control_manifests) == 1
+    control = control_manifests[0]
+    if phase.startswith("owned_control_normal_manifest_"):
+        assert control["close_reason"] == "recovery_control"
+        assert control["recovery_transaction_id"] is None
+        assert control["recovery_source_state"] is None
+    else:
+        assert control["close_reason"] == "recovery"
+        assert control["recovery_transaction_id"] == report["transaction_ids"][0]
+        assert control["recovery_source_state"] == "owned_control_carrier"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        "owned_control_recovery_manifest_publish",
+        "owned_control_recovery_manifest_parent_fsync",
+    ),
+)
+def test_sigkill_at_owned_control_recovery_manifest_edge_replays_exactly_once(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    _kill_at(
+        tmp_path,
+        mode="recovery-edge",
+        phase="owned_control_data_parent_fsync",
+    )
+    _kill_at(tmp_path, mode="replay-edge", phase=phase)
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert len(report["transaction_ids"]) == 1
+
+
+def test_retained_orphan_survives_writer_crash_then_recovery_crash(
+    tmp_path: Path,
+) -> None:
+    _kill_at(tmp_path, mode="writer-close", phase="after_source_unlink")
+    closed = next(
+        path
+        for path in (tmp_path / "data").rglob("*.jsonl.zst")
+        if "/trade/" in f"/{path.relative_to(tmp_path / 'data').as_posix()}"
+    )
+    original_sha256 = hashlib.sha256(closed.read_bytes()).hexdigest()
+
+    _kill_at(tmp_path, mode="replay-edge", phase="retained_data_parent_fsync")
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert report["outcomes"][0]["source_disposition"] == "retained"
+    trade_manifest = next(
+        item for item in report["manifests"] if item["logical_stream"] == "trade"
+    )
+    assert (
+        trade_manifest["data_relative_path"]
+        == closed.relative_to(tmp_path / "data").as_posix()
+    )
+    assert trade_manifest["data_sha256"] == original_sha256
+    assert len(report["transaction_ids"]) == 1
+
+
+def test_owned_control_nonprefix_blocks_without_a_second_transaction(
+    tmp_path: Path,
+) -> None:
+    _kill_at(
+        tmp_path,
+        mode="recovery-edge",
+        phase="control_ownership_parent_fsync",
+    )
+    _kill_at(
+        tmp_path,
+        mode="replay-edge",
+        phase="owned_control_partial_parent_fsync",
+    )
+    control_partial = next(
+        path
+        for path in (tmp_path / "data").rglob("*.partial")
+        if "/_control/" in f"/{path.relative_to(tmp_path / 'data').as_posix()}"
+    )
+    control_partial.write_bytes(b"not-the-owned-control-frame")
+
+    completed = subprocess.run(
+        [sys.executable, os.fspath(_HELPER), "recover", os.fspath(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert "owned control carrier" in completed.stderr
+    transaction_root = tmp_path / "state/raw-recovery/okx"
+    assert len([path for path in transaction_root.iterdir() if path.is_dir()]) == 1
+
+
+@pytest.mark.parametrize("fraction", (0.0, 0.5, 1.0))
+def test_owned_control_carrier_prefix_resumes_in_a_fresh_process(
+    tmp_path: Path,
+    fraction: float,
+) -> None:
+    _kill_at(
+        tmp_path,
+        mode="recovery-edge",
+        phase="owned_control_partial_create",
+    )
+    _kill_at(
+        tmp_path,
+        mode="owned-prefix",
+        phase="owned_control_prefix_seeded",
+        extra_args=("--fraction", str(fraction)),
+    )
+
+    report = _assert_one_converged_trade(tmp_path)
+
+    assert len(report["outcomes"]) == 1
+    assert len(report["transaction_ids"]) == 1
+    control_manifest = next(
+        item for item in report["manifests"] if item["logical_stream"] == "_control"
+    )
+    assert control_manifest["recovery_source_state"] == "owned_control_carrier"
+    assert not [path for path in report["partial_paths"] if "/_control/" in f"/{path}"]

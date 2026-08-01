@@ -37,7 +37,11 @@ from crypto_collector.storage.models import (
     AcceptedRecordIdentityV1,
     StorageControlAssociationV1,
 )
-from crypto_collector.storage.phases import StoragePhaseHook, notify_storage_phase
+from crypto_collector.storage.phases import (
+    StoragePhaseHook,
+    notify_storage_phase,
+    project_storage_phase_hook,
+)
 from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 from crypto_collector.storage.stream_file import (
     BufferedRow,
@@ -332,6 +336,7 @@ def _finish_hardlink_publication(
     destination: Path,
     source_fd: int,
     phase_hook: StoragePhaseHook | None = None,
+    new_link: bool = False,
 ) -> None:
     destination_fd = _open_matching_destination(
         parent_fd,
@@ -341,9 +346,12 @@ def _finish_hardlink_publication(
     )
     _close_all_after((destination_fd,), None)
     os.fsync(parent_fd)
-    notify_storage_phase(phase_hook, "after_destination_directory_fsync")
+    if new_link:
+        notify_storage_phase(phase_hook, "after_destination_directory_fsync")
+        notify_storage_phase(phase_hook, "after_publication_parent_fsync")
     os.unlink(source.name, dir_fd=parent_fd)
-    notify_storage_phase(phase_hook, "after_source_unlink")
+    if new_link:
+        notify_storage_phase(phase_hook, "after_source_unlink")
     os.fsync(parent_fd)
 
 
@@ -368,12 +376,14 @@ def _publish_hardlink(
         pass
     if linked:
         notify_storage_phase(phase_hook, "after_link")
+        notify_storage_phase(phase_hook, "after_namespace_publish")
     _finish_hardlink_publication(
         parent_fd=parent_fd,
         source=source,
         destination=destination,
         source_fd=source_fd,
         phase_hook=phase_hook,
+        new_link=linked,
     )
 
 
@@ -382,6 +392,7 @@ def _publish_renameat2(
     source: Path,
     destination: Path,
     source_fd: int,
+    phase_hook: StoragePhaseHook | None = None,
 ) -> None:
     try:
         _renameat2_noreplace(source, destination, dir_fd=parent_fd)
@@ -397,6 +408,7 @@ def _publish_renameat2(
         os.unlink(source.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         return
+    notify_storage_phase(phase_hook, "after_namespace_publish")
     destination_fd = _open_matching_destination(
         parent_fd,
         source_fd,
@@ -405,6 +417,7 @@ def _publish_renameat2(
     )
     _close_all_after((destination_fd,), None)
     os.fsync(parent_fd)
+    notify_storage_phase(phase_hook, "after_publication_parent_fsync")
 
 
 def publish_no_replace(
@@ -464,6 +477,7 @@ def publish_no_replace(
                     source_path,
                     destination_path,
                     publication_source_fd,
+                    phase_hook,
                 )
             except _Renameat2Unavailable:
                 if capability is not None:
@@ -498,10 +512,24 @@ def publish_no_replace(
         _close_all_after(descriptors, primary_error)
 
 
-def _atomic_write_and_sync_json_exclusive_open(path: Path, data: bytes) -> int:
+def _atomic_write_and_sync_json_exclusive_open(
+    path: Path,
+    data: bytes,
+    *,
+    phase_hook: StoragePhaseHook | None = None,
+    phase_prefix: str | None = None,
+) -> int:
     candidate = _normalized_absolute_path(path, field_name="manifest temporary path")
     if type(data) is not bytes or not data:
         raise ValueError("manifest bytes must be nonempty bytes")
+    if phase_hook is not None and not callable(phase_hook):
+        raise TypeError("phase_hook must be callable or None")
+    if phase_prefix is not None and (
+        type(phase_prefix) is not str
+        or not phase_prefix
+        or not phase_prefix.replace("_", "").isalnum()
+    ):
+        raise ValueError("phase_prefix must be a normalized phase identifier or None")
     parent_fd = _open_directory_no_symlinks(candidate.parent)
     file_fd: int | None = None
     try:
@@ -513,9 +541,15 @@ def _atomic_write_and_sync_json_exclusive_open(path: Path, data: bytes) -> int:
             | _required_open_flag("O_CLOEXEC")
         )
         file_fd = os.open(candidate.name, flags, 0o640, dir_fd=parent_fd)
+        if phase_prefix is not None:
+            notify_storage_phase(phase_hook, f"{phase_prefix}_temp_create")
         os.fsync(parent_fd)
+        if phase_prefix is not None:
+            notify_storage_phase(phase_hook, f"{phase_prefix}_temp_parent_fsync")
         write_all(file_fd, data)
         os.fsync(file_fd)
+        if phase_prefix is not None:
+            notify_storage_phase(phase_hook, f"{phase_prefix}_file_fsync")
     except BaseException as error:
         descriptors = (parent_fd,) if file_fd is None else (file_fd, parent_fd)
         _close_all_after(descriptors, error)
@@ -529,8 +563,19 @@ def _atomic_write_and_sync_json_exclusive_open(path: Path, data: bytes) -> int:
     return file_fd
 
 
-def atomic_write_and_sync_json_exclusive(path: Path, data: bytes) -> None:
-    file_fd = _atomic_write_and_sync_json_exclusive_open(path, data)
+def atomic_write_and_sync_json_exclusive(
+    path: Path,
+    data: bytes,
+    *,
+    phase_hook: StoragePhaseHook | None = None,
+    phase_prefix: str | None = None,
+) -> None:
+    file_fd = _atomic_write_and_sync_json_exclusive_open(
+        path,
+        data,
+        phase_hook=phase_hook,
+        phase_prefix=phase_prefix,
+    )
     _close_all_after((file_fd,), None)
 
 
@@ -1749,6 +1794,7 @@ class _ActivePartSet:
         identity: AcceptedRecordIdentityV1,
         *,
         created_at_ns: int | None = None,
+        phase_hook: StoragePhaseHook | None = None,
     ) -> _ActivePart:
         if type(reservation) is not _ActivePartReservation:
             raise TypeError("reservation must be _ActivePartReservation")
@@ -1774,7 +1820,7 @@ class _ActivePartSet:
             max_plain_frame_bytes=self._max_plain_frame_bytes,
             durability_slo_ns=self._durability_slo_ns,
             created_at_ns=created_at_ns,
-            phase_hook=self._phase_hook,
+            phase_hook=self._phase_hook if phase_hook is None else phase_hook,
         )
 
     def install_reserved(
@@ -2281,22 +2327,44 @@ class _FinalBarrierController:
             raise TypeError("publication_function must be callable")
         if phase_hook is not None and not callable(phase_hook):
             raise TypeError("phase_hook must be callable or None")
-        if phase_hook is not None:
-            if publication_function is not publish_no_replace:
-                raise ValueError("phase_hook requires the production publisher")
-            publication_function = partial(
-                publish_no_replace,
-                phase_hook=phase_hook,
-            )
+        if phase_hook is not None and publication_function is not publish_no_replace:
+            raise ValueError("phase_hook requires the production publisher")
         self._coordinator = durability_coordinator
         self._io_limiter = io_limiter
         self._storage_executor = storage_executor
         self._no_replace_capability = no_replace_capability
         self._publication_function = publication_function
+        self._phase_hook = phase_hook
         self._message_sink = completion_queue.put_nowait
         self._commands: dict[str, _FinalBarrierCommandState] = {}
         self._command_by_generation: dict[str, str] = {}
         self._detached_futures: set[asyncio.Future[tuple[RawManifestV1, ...]]] = set()
+
+    def _publisher_for(
+        self,
+        part: _ActivePart,
+        *,
+        manifest: bool,
+    ) -> _PublishNoReplace:
+        if self._phase_hook is None:
+            return self._publication_function
+        mapping: dict[str, str] = {}
+        if part.close_reason is CloseReason.RECOVERY_CONTROL:
+            prefix = (
+                "owned_control_normal_manifest" if manifest else "owned_control_data"
+            )
+            mapping = {
+                "after_namespace_publish": f"{prefix}_publish",
+                "after_publication_parent_fsync": f"{prefix}_parent_fsync",
+            }
+        return partial(
+            publish_no_replace,
+            phase_hook=project_storage_phase_hook(
+                self._phase_hook,
+                mapping,
+                passthrough=True,
+            ),
+        )
 
     async def _publish_one(
         self,
@@ -2311,10 +2379,11 @@ class _FinalBarrierController:
         )
         manifest_primary_error: BaseException | None = None
         try:
+            data_publisher = self._publisher_for(part, manifest=False)
             await run_storage(
                 self._io_limiter,
                 self._storage_executor,
-                self._publication_function,
+                data_publisher,
                 part.partial_path,
                 part.closed_data_path,
                 capability=self._no_replace_capability,
@@ -2363,10 +2432,11 @@ class _FinalBarrierController:
         primary_error: BaseException | None = None
         try:
             part.stream_file.notify_phase("after_manifest_temp_sync")
+            manifest_publisher = self._publisher_for(part, manifest=True)
             await run_storage(
                 self._io_limiter,
                 self._storage_executor,
-                self._publication_function,
+                manifest_publisher,
                 part.manifest_partial_path,
                 part.closed_manifest_path,
                 capability=self._no_replace_capability,

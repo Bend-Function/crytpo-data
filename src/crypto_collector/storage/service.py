@@ -62,7 +62,10 @@ from crypto_collector.storage.models import (
     WriterMetricsSnapshotV1,
     WriterStatus,
 )
-from crypto_collector.storage.phases import StoragePhaseHook
+from crypto_collector.storage.phases import (
+    StoragePhaseHook,
+    project_storage_phase_hook,
+)
 from crypto_collector.storage.raw_writer import (
     NoReplaceCapability,
     _ActivePart,
@@ -494,6 +497,7 @@ class RawWriterService:
                 recovery_coordinator=recovery_coordinator,
                 storage_executor=executor,
                 source_disposition_resolver=resolver,
+                phase_hook=phase_hook,
             )
             await run_storage(
                 io_limiter,
@@ -1738,6 +1742,17 @@ class RawWriterService:
                 record,
                 identity,
                 created_at_ns=carrier_created_at_ns,
+                phase_hook=project_storage_phase_hook(
+                    self._recovery_context.phase_hook,
+                    {
+                        "partial_create_before_parent_fsync": (
+                            "owned_control_partial_create"
+                        ),
+                        "partial_parent_fsync": ("owned_control_partial_parent_fsync"),
+                        "after_frame_write": "owned_control_frame_write",
+                        "after_data_sync": "recovery_control_sync",
+                    },
+                ),
             )
             part.append_accepted(record, identity)
             self._mark_buffered(identity)

@@ -15,6 +15,7 @@ import zstandard
 from crypto_collector.domain.envelope import RawEnvelope
 from crypto_collector.domain.json_codec import decode_json, encode_json
 from crypto_collector.domain.types import CloseReason, Exchange, Market, Transport
+from crypto_collector.storage import recovery as recovery_module
 from crypto_collector.storage.durability import (
     PosixSyncBackend,
     RecoveryAccountingMode,
@@ -77,6 +78,40 @@ SOURCE_RELATIVE_PATH = (
 RECOVERED_RELATIVE_PATH = (
     "raw/okx/spot/BTC-USDT/trade/2026/07/31/00/part-1785456000000000000-1.jsonl.zst"
 )
+
+
+def test_fsync_directory_phase_precedes_descriptor_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    real_fsync = recovery_module.os.fsync
+    real_close = recovery_module.os.close
+
+    def traced_fsync(fd: int) -> None:
+        events.append("fsync")
+        real_fsync(fd)
+        events.append("fsync_returned")
+
+    def traced_close(fd: int) -> None:
+        events.append("close")
+        real_close(fd)
+
+    monkeypatch.setattr(recovery_module.os, "fsync", traced_fsync)
+    monkeypatch.setattr(recovery_module.os, "close", traced_close)
+
+    recovery_module._fsync_directory_with_phase(
+        path=tmp_path,
+        phase_hook=events.append,
+        phase="retained_data_parent_fsync",
+    )
+
+    assert events[-4:] == [
+        "fsync",
+        "fsync_returned",
+        "retained_data_parent_fsync",
+        "close",
+    ]
 
 
 def valid_intent_values(**overrides: object) -> dict[str, object]:
