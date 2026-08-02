@@ -232,7 +232,7 @@ git commit -m "feat: freeze writer gate workload contract"
 - Create: `tests/unit/benchmarks/test_oracle.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write identity, count, and touched-cardinality RED tests**
+- [x] **Step 1: Write identity, count, and touched-cardinality RED tests**
 
 ```python
 def test_multiplier_two_exact_counts_and_touched_files() -> None:
@@ -259,7 +259,7 @@ derivative identities are `funding` then `open_interest`, the final fixed identi
 `gate-identity-v1:kraken:-:-:_control`, allocation is `q+1` for the first `r`
 identities, and local sequences are contiguous from zero.
 
-- [ ] **Step 2: Write schedule and payload RED tests**
+- [x] **Step 2: Write schedule and payload RED tests**
 
 Use a compact strict test workload and assert:
 
@@ -279,7 +279,7 @@ Cover `N > B`, `N == B`, functional `N < required_B`, burst seconds zero and the
 schedulable second, equal-due event-ID ordering, multiplier/identity overflow, and
 non-integral/sub-10-second duration rejection.
 
-- [ ] **Step 3: Run tests and verify RED**
+- [x] **Step 3: Run tests and verify RED**
 
 Run:
 
@@ -290,7 +290,7 @@ Run:
 
 Expected: FAIL because `build_workload_plan` and oracle types do not exist.
 
-- [ ] **Step 4: Implement immutable summaries and streaming iterators**
+- [x] **Step 4: Implement immutable summaries and streaming iterators**
 
 Expose these exact public call shapes:
 
@@ -311,7 +311,7 @@ the fixed stream iterators with `heapq.merge`.
 Hash `WorkloadPlanHeaderV1`, declared-order stream summaries, and globally merged
 `PlannedEventV1` canonical lines. Never materialize the 10-minute plan.
 
-- [ ] **Step 5: Add literal golden vectors**
+- [x] **Step 5: Add literal golden vectors**
 
 The JSON file must contain exact 10-second and 10-minute summary counts, the fixed
 3,172/3,505 touched counts, per-stream burst seconds/counts, selected identity/event/
@@ -325,7 +325,7 @@ streamed plan-hash test `@pytest.mark.performance` and require
 `CRYPTO_COLLECTOR_FULL_GATE_ORACLE=1` so the offline suite stays bounded. Golden
 maintenance and qualification verification run that opt-in test explicitly.
 
-- [ ] **Step 6: Run focused and property tests**
+- [x] **Step 6: Run focused and property tests**
 
 Run:
 
@@ -346,7 +346,7 @@ CRYPTO_COLLECTOR_FULL_GATE_ORACLE=1 .venv/bin/python -m pytest \
   tests/performance/test_writer_durability.py::test_qualification_plan_matches_literal_golden_hash -q
 ```
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add src/crypto_collector/benchmarks/oracle.py \
