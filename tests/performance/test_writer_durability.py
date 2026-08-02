@@ -7,9 +7,12 @@ from typing import Any, cast
 import pytest
 
 from crypto_collector.benchmarks.contracts import (
+    FinalWorkerAggregateV1,
     GateAdmissionTraceSetV1,
     GateAdmissionTraceV1,
     GateArtifactRefV1,
+    GateResourceSummaryV1,
+    GateStorageHealthSummaryV1,
 )
 from crypto_collector.benchmarks.oracle import build_workload_plan
 from crypto_collector.benchmarks.workload import load_workload
@@ -30,6 +33,27 @@ def test_writer_gate_foundational_artifact_surface_is_frozen() -> None:
         "merged_row_count",
         "merged_content_size_bytes",
         "merged_content_sha256",
+    )
+
+
+def test_writer_gate_aggregation_surface_is_frozen() -> None:
+    assert tuple(FinalWorkerAggregateV1.model_fields)[:5] == (
+        "schema_version",
+        "record_type",
+        "worker_count",
+        "sampling_round_count",
+        "final_round_index",
+    )
+    assert tuple(GateResourceSummaryV1.model_fields)[-4:] == (
+        "first_open_fds_after_warmup",
+        "max_open_fds_after_warmup",
+        "final_open_fds_after_warmup",
+        "fd_growth_after_warmup",
+    )
+    assert tuple(GateStorageHealthSummaryV1.model_fields)[-3:] == (
+        "sample_count_valid",
+        "coverage_valid",
+        "workers_healthy",
     )
 
 
