@@ -582,6 +582,81 @@ scheduled monotonic times. Coverage is final completion time minus first request
 The expected count and coverage predicates remain those in Plan02. Preflight and
 post-run capability probes are separate from periodic health sampling.
 
+Task 4 freezes these aggregate field orders:
+
+```text
+FinalWorkerAggregateV1:
+schema_version, record_type, worker_count, sampling_round_count, final_round_index,
+accepted_record_count, durable_record_count, unpersisted_record_count,
+uncertain_record_count, enqueue_high_water_count, normal_overflow_count,
+control_overflow_count, not_accepting_count, durability_histogram_schema_version,
+durability_bucket_counts, durability_sample_count, durability_lag_p50_ns,
+durability_lag_p95_ns, durability_lag_p99_ns, durability_lag_max_ns, sync_count,
+sync_duration_total_ns, sync_duration_max_ns, slo_breach_count, write_failure_count,
+sync_failure_count, publication_failure_count, unpersisted_record_count_peak,
+queued_records_peak, queued_bytes_peak, buffered_records_peak, buffered_bytes_peak,
+in_flight_records_peak, in_flight_bytes_peak, resident_record_bytes_peak,
+resident_control_records_peak, resident_control_bytes_peak,
+oldest_unpersisted_age_max_ns,
+active_logical_generation_count_peak, retiring_generation_count_peak,
+open_file_descriptor_count_peak, sync_inflight_peak
+
+GateResourceSummaryV1:
+schema_version, record_type, process_count, round_count, post_warmup_round_count,
+warmup_ended_monotonic_ns, resource_trend_valid, rss_peak_bytes,
+rss_slope_bytes_per_minute,
+open_fds_peak, first_open_fds_after_warmup, max_open_fds_after_warmup,
+final_open_fds_after_warmup, fd_growth_after_warmup
+
+GateStorageHealthSummaryV1:
+schema_version, record_type, duration_ns, interval_ns, sample_count,
+expected_min_sample_count, first_request_monotonic_ns,
+final_completion_monotonic_ns, coverage_ns, required_coverage_ns,
+sample_max_gap_ns, minimum_data_available_bytes, minimum_state_available_bytes,
+minimum_available_bytes_if_shared, critical_worker_observation_count,
+sample_count_valid, coverage_valid, workers_healthy
+```
+
+The worker aggregate sums cumulative values only from the five final snapshots.
+`sync_duration_max_ns` and `durability_lag_max_ns` are cross-worker maxima. Every
+other `*_peak` except `oldest_unpersisted_age_max_ns` is the maximum of same-round
+worker sums; the age maximum is the maximum non-null worker age observed in any
+round. Final unpersisted and uncertain counts remain explicit terminal facts even
+though unpersisted records are also represented by a same-round peak. Uncertain
+records are a monotonic terminal-error counter, not a gauge; a valid CLOSED sequence
+therefore keeps that count zero throughout and has no redundant uncertain peak.
+
+Resource summaries retain an unavailable result rather than manufacturing a zero:
+fewer than two post-warmup rounds produce a null RSS slope, zero post-warmup rounds
+produce null first/max FD totals and null FD growth, and one post-warmup round produces
+FD growth zero. `resource_trend_valid` is true exactly when at least two post-warmup
+rounds make both trends qualification-usable. Qualification requires it. OLS uses
+integer sums followed by a fixed local `Decimal` context with precision 50 and
+`ROUND_HALF_EVEN`, so ambient process precision cannot change evidence bytes. The
+warmup predicate is `scheduled_monotonic_ns >= warmup_ended_monotonic_ns`.
+For post-warmup pairs `(x_i, y_i)`, subtract the first scheduled time from every
+`x_i`, let `y_i` be the six-process RSS sum, and compute
+`(n*sum(x_i*y_i)-sum(x_i)*sum(y_i)) * 60_000_000_000 /
+(n*sum(x_i*x_i)-sum(x_i)**2)`, floored at zero. FD baseline, maximum, and final are
+the first, maximum, and last post-warmup same-round totals; growth is
+`max(0, maximum - baseline)` rather than final-minus-baseline.
+The nullable slope uses a canonical nonnegative Decimal contract: constructors accept
+only a `Decimal` or its canonical JSON string, reject booleans/integers/floats,
+non-finite values, signs, exponents, leading zeroes, and redundant fractional zeroes,
+and normalize computed values to plain base-ten notation before serialization. This
+makes strict JSONL decoding reproduce the same model and canonical bytes.
+
+Health summaries require at least one sample. The exact predicates are
+`max(2, ceil(duration_ns / interval_ns) - 1)` and required coverage
+`max(0, duration_ns - 2 * interval_ns)`. `sample_max_gap_ns` is only the measured
+maximum scheduled-time gap. The allowed maximum gap is a separate workload setting,
+so Task 5 compares the measurement with that bound instead of Task 4 inventing one.
+The two root minima remain independent primary facts.
+`minimum_available_bytes_if_shared` is their conservative minimum and is never their
+sum. Task 4 cannot infer a shared mount from available-byte values because its input
+has no device or mount identity; shared-mount floor accounting is performed in Task 6
+from target-probe facts.
+
 ## 6. Runner And Candidate Report
 
 The runner is one supervisor plus exactly five children created with

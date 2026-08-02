@@ -626,6 +626,11 @@ git commit -m "feat: add writer gate evidence artifacts"
 - Modify: `src/crypto_collector/benchmarks/contracts.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
+The exact Task 4 aggregate model field orders and insufficient-post-warmup semantics
+are frozen in design section 5.5. Periodic health samples preserve independent data
+and state free-space minima but do not infer shared mounts; shared-mount floor
+accounting belongs to Task 6, where device and mount identities are available.
+
 - [ ] **Step 1: Write worker-sequence RED tests**
 
 Build five two-sample sequences plus final CLOSED snapshots. Assert only final
@@ -661,7 +666,11 @@ def test_storage_health_rejects_burst_sampling() -> None:
 Cover same-round six-process RSS/FD sums, missing/seventh/duplicate processes, changed
 PID or process key, negative OLS slope flooring to zero, one/zero post-warmup rounds,
 exact Decimal conversion, scheduled-time gaps, completion coverage, two independent
-root `statvfs` facts, and shared-root free-space treatment.
+root `statvfs` facts, and conservative free-space treatment without inferring shared
+mounts. Fewer than two post-warmup rounds produce a null RSS slope; zero post-warmup
+rounds also produce null FD growth, while one produces FD growth zero. The summary
+records the observed scheduled-time maximum gap; Task 5 compares it with the
+independently configured workload gap limit.
 
 - [ ] **Step 3: Run tests and verify RED**
 
