@@ -551,13 +551,19 @@ intervals must not overlap.
 
 Within each stable worker sequence:
 
-- external round and request times strictly increase;
+- external round indices are zero-based and consecutive, while scheduled and
+  per-worker request-start times strictly increase;
 - observed snapshot time is nondecreasing;
 - an equal observed time requires byte-identical snapshot bytes;
 - cumulative counters, bucket/sample counts, maxima, and series membership never
   decrease;
 - quantiles may decrease and are not treated as counters;
 - exchange, worker ID, config digest, and config generation never change.
+
+Input order is evidence order and is never repaired by sorting. A round interval is
+the minimum request start through maximum request completion. The next interval may
+start exactly at the previous completion but must not start before it. Exactly the
+last round has kind `final`; earlier samples cannot already be CLOSED.
 
 Only each worker's final CLOSED barrier snapshot contributes cumulative totals and
 histogram buckets. Round sums determine gauge peaks. Aggregate histogram quantiles are
@@ -581,6 +587,10 @@ worker lifecycle/critical state. Sample gap is the difference between consecutiv
 scheduled monotonic times. Coverage is final completion time minus first request time.
 The expected count and coverage predicates remain those in Plan02. Preflight and
 post-run capability probes are separate from periodic health sampling.
+Resource and health inputs are nonempty, preserve their incoming order, use zero-based
+consecutive round indices and strictly increasing scheduled times, and use the same
+non-overlapping interval rule as worker rounds. Duplicate, missing, reordered, or
+overlapping rounds fail instead of being sorted or skipped.
 
 Task 4 freezes these aggregate field orders:
 
@@ -628,12 +638,15 @@ therefore keeps that count zero throughout and has no redundant uncertain peak.
 
 Resource summaries retain an unavailable result rather than manufacturing a zero:
 fewer than two post-warmup rounds produce a null RSS slope, zero post-warmup rounds
-produce null first/max FD totals and null FD growth, and one post-warmup round produces
-FD growth zero. `resource_trend_valid` is true exactly when at least two post-warmup
-rounds make both trends qualification-usable. Qualification requires it. OLS uses
-integer sums followed by a fixed local `Decimal` context with precision 50 and
-`ROUND_HALF_EVEN`, so ambient process precision cannot change evidence bytes. The
-warmup predicate is `scheduled_monotonic_ns >= warmup_ended_monotonic_ns`.
+produce null first/max/final FD totals and null FD growth, and one post-warmup round
+produces equal first/max/final FD totals and FD growth zero. With two or more rounds,
+all four FD facts and the RSS slope are non-null. `resource_trend_valid` is true
+exactly when at least two post-warmup rounds make both trends qualification-usable.
+Qualification requires it. OLS computes its numerator and denominator entirely with
+Python integers and performs only the final division in a newly constructed
+`Context(prec=50, rounding=ROUND_HALF_EVEN)`; no ambient Decimal context is copied.
+The warmup predicate is
+`scheduled_monotonic_ns >= warmup_ended_monotonic_ns`.
 For post-warmup pairs `(x_i, y_i)`, subtract the first scheduled time from every
 `x_i`, let `y_i` be the six-process RSS sum, and compute
 `(n*sum(x_i*y_i)-sum(x_i)*sum(y_i)) * 60_000_000_000 /
@@ -656,6 +669,20 @@ The two root minima remain independent primary facts.
 sum. Task 4 cannot infer a shared mount from available-byte values because its input
 has no device or mount identity; shared-mount floor accounting is performed in Task 6
 from target-probe facts.
+`sample_count_valid` is exactly `sample_count >= expected_min_sample_count`.
+`coverage_ns` is exactly final completion minus first request start and
+`coverage_valid` is exactly `coverage_ns >= required_coverage_ns`. A single sample has
+`sample_max_gap_ns=0`; otherwise it is the maximum consecutive scheduled-time
+difference. Root minima are the independent column minima and the conditional shared
+value is the minimum of those two facts. `critical_worker_observation_count` counts
+every CRITICAL worker row, and `workers_healthy` is true exactly when that count is
+zero.
+
+Any periodic `statvfs` or worker-health sampling exception fails the run immediately,
+retains the completed/partial health artifact, and forbids publication of a candidate
+report. A later successful sample cannot erase that failure. Because an exception is
+not a successful sample row, this fail-closed runner rule is the primary error fact;
+Task 7 tests it explicitly.
 
 ## 6. Runner And Candidate Report
 

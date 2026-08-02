@@ -672,6 +672,11 @@ rounds also produce null FD growth, while one produces FD growth zero. The summa
 records the observed scheduled-time maximum gap; Task 5 compares it with the
 independently configured workload gap limit.
 
+All three input sequences preserve evidence order, start at round zero, advance round
+indices by one, and strictly advance scheduled times. Adjacent request intervals may
+touch at one endpoint but cannot overlap. A resource or health sampling exception
+fails the runner before candidate-report publication and is covered in Task 7.
+
 - [ ] **Step 3: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_aggregation.py -q`
@@ -947,6 +952,10 @@ conservation, five stable workers, six stable process keys, expected touched fil
 zero error counters, and a passing runtime receipt. A separate injected in-process
 child harness may cover deterministic clock edge cases, but it cannot replace the
 spawn integration test.
+
+Inject one periodic `statvfs` failure and one worker-health sampling failure. Each
+must stop the run, retain its completed/partial health artifact, and forbid candidate
+report publication even if a later probe would succeed.
 
 - [ ] **Step 3: Run tests and verify RED**
 
