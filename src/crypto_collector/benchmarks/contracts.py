@@ -26,6 +26,7 @@ from crypto_collector.storage.models import (
     WriterMetricsSnapshotV1,
     validate_normalized_data_relative_path,
 )
+from crypto_collector.storage.raw_writer import NoReplaceCapability
 from crypto_collector.storage.stats import DURABILITY_BUCKET_UPPER_BOUNDS_NS
 
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
@@ -64,6 +65,7 @@ CANONICAL_EXCHANGES = (
 )
 EMPTY_SHA256 = sha256(b"").hexdigest()
 _CANONICAL_NONNEGATIVE_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
+_NORMALIZED_ABSOLUTE_POSIX_PATH = re.compile(r"/(?:[^/\x00]+(?:/[^/\x00]+)*)?\Z")
 
 
 def _worker_instance_id(exchange: Exchange) -> str:
@@ -103,11 +105,47 @@ CanonicalNonNegativeDecimal = Annotated[
     Decimal,
     BeforeValidator(_normalize_nonnegative_decimal),
 ]
+TargetId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    ),
+]
+
+
+def _normalize_absolute_posix_path(value: object) -> str:
+    if type(value) is not str:
+        raise ValueError("path must be an absolute POSIX string")
+    if value == "/":
+        return value
+    if _NORMALIZED_ABSOLUTE_POSIX_PATH.fullmatch(value) is None or any(
+        part in {"", ".", ".."} for part in value.split("/")[1:]
+    ):
+        raise ValueError("path must be lexically normalized absolute POSIX")
+    return value
+
+
+NormalizedAbsolutePosixPath = Annotated[
+    str,
+    BeforeValidator(_normalize_absolute_posix_path),
+]
 
 
 class _GateContract(FrozenStrictModel):
     def canonical_bytes(self) -> bytes:
         return encode_json(self.model_dump(mode="json")) + b"\n"
+
+
+class _SelfHashingGateContract(_GateContract):
+    @model_validator(mode="after")
+    def validate_self_hash(self) -> Self:
+        unsigned = self.model_dump(mode="json", exclude={"sha256"})
+        expected = sha256(encode_json(unsigned) + b"\n").hexdigest()
+        if getattr(self, "sha256", None) != expected:
+            raise ValueError("document SHA-256 does not match its canonical fields")
+        return self
 
 
 class GateArtifactRefV1(_GateContract):
@@ -780,6 +818,148 @@ class GateStorageHealthSummaryV1(_GateContract):
         return self
 
 
+class GateRootProbeV1(_GateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_root_probe_v1"] = "gate_root_probe_v1"
+    root: NormalizedAbsolutePosixPath
+    storage_device: Annotated[
+        str,
+        StringConstraints(pattern=r"^(?:0|[1-9][0-9]*):(?:0|[1-9][0-9]*)$"),
+    ]
+    filesystem: NonEmptyString
+    mount_point: NormalizedAbsolutePosixPath
+    mount_options: tuple[NonEmptyString, ...]
+    minimum_available_bytes: Literal[107374182400]
+    observed_available_bytes: NonNegativeInt
+    no_replace_capability: Literal[NoReplaceCapability.HARDLINK]
+    same_parent_publication_only: Literal[True]
+    file_sync_supported: Literal[True]
+    directory_sync_supported: Literal[True]
+
+    @model_validator(mode="after")
+    def validate_root_facts(self) -> Self:
+        if self.root == "/":
+            raise ValueError("gate root may not be the filesystem root")
+        if not self.filesystem.strip() or self.filesystem != self.filesystem.strip():
+            raise ValueError("filesystem must be a normalized nonempty value")
+        if not self.mount_options:
+            raise ValueError("mount options must be nonempty")
+        if self.mount_options != tuple(sorted(set(self.mount_options))):
+            raise ValueError("mount options must be sorted and unique")
+        if any(
+            not option.startswith(("mount:", "super:"))
+            or option in {"mount:", "super:"}
+            for option in self.mount_options
+        ):
+            raise ValueError("mount options must use mount: or super: prefixes")
+        return self
+
+
+class GateTargetV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_target_v1"] = "gate_target_v1"
+    target_id: TargetId
+    data_root: GateRootProbeV1
+    state_root: GateRootProbeV1
+    deployment_purpose: Literal["raw-writer-gate-b"] = "raw-writer-gate-b"
+    created_at_unix_ns: NonNegativeInt
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_target(self) -> Self:
+        if self.data_root.root == self.state_root.root:
+            raise ValueError("data and state roots must be distinct")
+        for root in (self.data_root, self.state_root):
+            if root.observed_available_bytes < root.minimum_available_bytes:
+                raise ValueError("target root available bytes are below its floor")
+        if (
+            self.data_root.storage_device == self.state_root.storage_device
+            and self.data_root.mount_point == self.state_root.mount_point
+            and min(
+                self.data_root.observed_available_bytes,
+                self.state_root.observed_available_bytes,
+            )
+            < (
+                self.data_root.minimum_available_bytes
+                + self.state_root.minimum_available_bytes
+            )
+        ):
+            raise ValueError("shared target mount is below its combined floor")
+        return self
+
+
+class GateTargetReprobeV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_target_reprobe_v1"] = "gate_target_reprobe_v1"
+    target_id: TargetId
+    expected_target_id: TargetId
+    declaration_sha256: Sha256
+    probed_at_unix_ns: NonNegativeInt
+    data_root: GateRootProbeV1
+    state_root: GateRootProbeV1
+    shared_mount: bool
+    shared_required_available_bytes: NonNegativeInt | None
+    shared_observed_available_bytes: NonNegativeInt | None
+    target_id_matches: bool
+    declaration_facts_match: bool
+    available_space_valid: bool
+    reprobe_valid: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_reprobe(self) -> Self:
+        if self.data_root.root == self.state_root.root:
+            raise ValueError("re-probed data and state roots must be distinct")
+        expected_shared = (
+            self.data_root.storage_device == self.state_root.storage_device
+            and self.data_root.mount_point == self.state_root.mount_point
+        )
+        if self.shared_mount != expected_shared:
+            raise ValueError("shared mount flag does not match root facts")
+        if expected_shared:
+            expected_required = (
+                self.data_root.minimum_available_bytes
+                + self.state_root.minimum_available_bytes
+            )
+            expected_observed = min(
+                self.data_root.observed_available_bytes,
+                self.state_root.observed_available_bytes,
+            )
+            if (
+                self.shared_required_available_bytes != expected_required
+                or self.shared_observed_available_bytes != expected_observed
+            ):
+                raise ValueError("shared mount byte facts are inconsistent")
+        elif (
+            self.shared_required_available_bytes is not None
+            or self.shared_observed_available_bytes is not None
+        ):
+            raise ValueError("distinct mounts require null shared byte facts")
+        if self.target_id_matches != (self.target_id == self.expected_target_id):
+            raise ValueError("target ID match flag is inconsistent")
+        individual_space_valid = all(
+            root.observed_available_bytes >= root.minimum_available_bytes
+            for root in (self.data_root, self.state_root)
+        )
+        shared_space_valid = not expected_shared or (
+            self.shared_observed_available_bytes is not None
+            and self.shared_required_available_bytes is not None
+            and self.shared_observed_available_bytes
+            >= self.shared_required_available_bytes
+        )
+        if self.available_space_valid != (
+            individual_space_valid and shared_space_valid
+        ):
+            raise ValueError("available-space validity is inconsistent")
+        if self.reprobe_valid != (
+            self.target_id_matches
+            and self.declaration_facts_match
+            and self.available_space_valid
+        ):
+            raise ValueError("target re-probe validity is inconsistent")
+        return self
+
+
 __all__ = [
     "CANONICAL_EXCHANGES",
     "FinalWorkerAggregateV1",
@@ -791,10 +971,13 @@ __all__ = [
     "GateProcessResourceSampleV1",
     "GateResourceSamplingRoundV1",
     "GateResourceSummaryV1",
+    "GateRootProbeV1",
     "GateSamplingRoundV1",
     "GateSecondBucketV1",
     "GateStorageHealthSampleV1",
     "GateStorageHealthSummaryV1",
+    "GateTargetReprobeV1",
+    "GateTargetV1",
     "GateWorkerHealthV1",
     "GateWorkerKeyV1",
     "GateWorkerSampleV1",

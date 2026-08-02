@@ -12,7 +12,10 @@ from crypto_collector.benchmarks.contracts import (
     GateAdmissionTraceV1,
     GateArtifactRefV1,
     GateResourceSummaryV1,
+    GateRootProbeV1,
     GateStorageHealthSummaryV1,
+    GateTargetReprobeV1,
+    GateTargetV1,
 )
 from crypto_collector.benchmarks.oracle import build_workload_plan
 from crypto_collector.benchmarks.workload import load_workload
@@ -43,6 +46,27 @@ def test_writer_gate_aggregation_surface_is_frozen() -> None:
         "worker_count",
         "sampling_round_count",
         "final_round_index",
+    )
+
+
+def test_writer_gate_target_surface_is_frozen() -> None:
+    assert tuple(GateRootProbeV1.model_fields)[-5:] == (
+        "observed_available_bytes",
+        "no_replace_capability",
+        "same_parent_publication_only",
+        "file_sync_supported",
+        "directory_sync_supported",
+    )
+    assert tuple(GateTargetV1.model_fields)[-2:] == (
+        "created_at_unix_ns",
+        "sha256",
+    )
+    assert tuple(GateTargetReprobeV1.model_fields)[-5:] == (
+        "target_id_matches",
+        "declaration_facts_match",
+        "available_space_valid",
+        "reprobe_valid",
+        "sha256",
     )
     assert tuple(GateResourceSummaryV1.model_fields)[-4:] == (
         "first_open_fds_after_warmup",
