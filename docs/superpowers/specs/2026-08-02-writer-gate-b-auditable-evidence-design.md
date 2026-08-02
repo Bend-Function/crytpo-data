@@ -384,6 +384,92 @@ Evidence models are strict, frozen, versioned Pydantic models with extra fields
 forbidden and strict integer/boolean handling. Canonical JSONL is
 `encode_json(model_dump(mode="json")) + b"\n"` in the declared row order.
 
+Canonical field order is part of the version-one contract. Models are added by the
+task that first has enough primary facts to test every field; Task 3 must not create
+placeholder report, receipt, archive, provenance, acceptance, or disclosure models.
+Those later self-hashing models put their own `sha256` field last, include it in their
+published canonical bytes, and omit only that field from their digest input.
+
+Task 3 freezes these foundational field orders:
+
+```text
+GateArtifactRefV1:
+schema_version, record_type, relative_path, row_count, content_size_bytes,
+content_sha256, compressed_size_bytes, compressed_sha256
+
+GateExchangeArtifactPartitionV1:
+schema_version, record_type, exchange, artifact
+
+GateAdmissionTraceSetV1:
+schema_version, record_type, partitions, merged_row_count,
+merged_content_size_bytes, merged_content_sha256
+
+GateAdmissionTraceV1:
+schema_version, record_type, planned_event_id, stream_group, logical_stream,
+exchange, market, instrument_key, canonical_identity, identity_index,
+local_sequence, due_monotonic_ns, deadline_monotonic_ns,
+attempt_started_monotonic_ns, admission_completed_monotonic_ns, enqueue_status,
+payload_bytes, payload_sha256, accepted_identity
+
+GateSecondBucketV1:
+schema_version, record_type, stream_group, second_index, scheduled_count,
+attempted_count, accepted_count, admitted_in_actual_second_count,
+scheduled_payload_bytes, attempted_payload_bytes, accepted_payload_bytes,
+early_count, late_count, out_of_window_count
+
+GateWorkerKeyV1:
+exchange, worker_instance_id
+
+GateWorkerSampleV1:
+schema_version, record_type, round_index, round_kind, scheduled_monotonic_ns,
+request_started_monotonic_ns, request_completed_monotonic_ns, snapshot
+
+GateSamplingRoundV1:
+schema_version, record_type, round_index, round_kind, scheduled_monotonic_ns,
+expected_worker_keys, samples
+
+GateProcessKeyV1:
+role, exchange, worker_instance_id
+
+GateProcessResourceSampleV1:
+schema_version, record_type, round_index, scheduled_monotonic_ns,
+request_started_monotonic_ns, request_completed_monotonic_ns, process_key,
+process_id, rss_bytes, open_fd_count
+
+GateResourceSamplingRoundV1:
+schema_version, record_type, round_index, scheduled_monotonic_ns,
+expected_process_keys, samples
+
+GateWorkerHealthV1:
+exchange, worker_instance_id, lifecycle, critical_reason
+
+GateStorageHealthSampleV1:
+schema_version, record_type, round_index, scheduled_monotonic_ns,
+request_started_monotonic_ns, request_completed_monotonic_ns,
+data_available_bytes, state_available_bytes, workers
+```
+
+All ordered key/partition/sample tuples are sorted, unique, and complete. Version
+fields reject booleans and numeric coercion. Trace timing permits early and late rows
+to be serialized as failure evidence, but requires due before deadline and attempt
+start no later than admission completion. Accepted and accepted-high-water statuses
+require an accepted identity whose routing fields equal the trace; every other status
+forbids one. Final worker rounds require five CLOSED snapshots. Evidence paths are
+normalized POSIX-relative paths with no NUL, backslash, absolute prefix, or empty,
+`.` or `..` component.
+
+The one supervisor process key has role `supervisor` and null exchange/worker fields.
+Each `exchange_worker` key has its canonical exchange and exact
+`gate-worker-v1-<exchange>` ID. Process-key order is supervisor followed by canonical
+exchange order; worker-key order is canonical exchange order. Nested sample round
+indices and scheduled times equal their parent, request timing is
+`scheduled <= started <= completed`, process IDs are positive signed-64 integers, and
+neither a key nor PID may change. Trace partitions use normalized `.jsonl.zst` paths,
+contain only rows for their declared exchange, and their merged row/byte counts equal
+the sums of their refs. Readers take caller-derived maximum rows, decompressed bytes,
+and line bytes from the bound workload/schema; they never trust claimed artifact sizes
+as decompression limits.
+
 Zstd is an archive transport, not a canonical encoding. Artifact hashes used for
 qualification are over decompressed canonical JSONL bytes. A separate compressed-file
 SHA is required for transfer integrity. Therefore zstd library or frame metadata
@@ -410,7 +496,8 @@ Evidence is a one-way hash DAG with no self-reference:
 The required `GateRunIndexV1` binding set is:
 
 - workload and streamed workload-plan hashes;
-- admission trace content/compressed hashes;
+- the ordered five-part admission trace set, every part's content/compressed hashes,
+  and the virtual merged content hash;
 - per-second bucket content hash;
 - worker-sampling artifact hash;
 - process-resource and storage-health artifact hashes;
@@ -430,6 +517,15 @@ identity, local sequence, due and deadline monotonic times, attempt start, admis
 completion, enqueue status, exact payload bytes/SHA, and exact accepted identity when
 accepted. Accepted statuses require one identity; every other status forbids it.
 
+Admission trace is five primary zstd JSONL partitions in canonical exchange order,
+not one duplicated merged file. Each exchange child writes only its partition, ordered
+by `(due_monotonic_ns, planned_event_id)`. `GateAdmissionTraceSetV1` binds every
+partition and a virtual semantic stream produced by a five-way heap merge on that same
+key. Its merged row count, decompressed byte count, and SHA are computed while merging;
+there is no sixth physical trace. Missing, duplicate, reordered, cross-exchange, or
+internally unsorted partitions fail closed. Planned-event-ID collision is a contract
+error even though the ordering key remains deterministic for the committed workload.
+
 `WorkloadPlanHeaderV1`, the declared-order stream summaries, and every
 `PlannedEventV1` canonical line form the workload-plan hash input. Event rows are a
 heap merge of the fixed number of per-stream iterators ordered by
@@ -437,8 +533,9 @@ heap merge of the fixed number of per-stream iterators ordered by
 length/SHA, due/deadline offsets, and algorithm versions. Only equal-due groups need
 local event-ID ordering; the full plan is never sorted or retained in memory.
 
-The runtime verifier streams the trace and simultaneously rebuilds expected oracle
-rows. It checks ordering, one-to-one event correspondence, exact payload facts,
+The runtime verifier heap-merges the five trace readers and simultaneously rebuilds
+the global expected oracle stream. It checks ordering, one-to-one event correspondence,
+exact payload facts,
 timestamps, status/identity agreement, count/rate/burst buckets, and content hash.
 It uses a temporary strict SQLite database under the state root for global identity
 uniqueness and joins, so 25 million events are not materialized in RAM.
@@ -468,12 +565,16 @@ nearest-rank values recomputed from elementwise-summed final buckets.
 
 ### 5.5 Resource and health samples
 
-Process samples use Linux `/proc/self/status` `VmRSS` and a count of numeric entries in
-`/proc/self/fd`. Samples are taken in monotonic rounds at the configured interval.
-After warmup, RSS slope is the ordinary least-squares slope over
-`(observed_monotonic_ns, rss_bytes)`, computed with `Decimal`, converted to bytes per
-minute, and floored at zero. FD growth is maximum post-warmup FD count minus the first
-post-warmup FD count, floored at zero.
+Each process samples its own Linux `/proc/self/status` `VmRSS` and numeric entries in
+`/proc/self/fd`. A complete monotonic round contains the supervisor plus the five
+canonical exchange children. Process keys and PIDs remain stable. For every round,
+RSS and FD counts are summed across all six processes; limits are applied to those
+same-round totals, never once per process. After warmup, RSS slope is the ordinary
+least-squares slope over `(round_scheduled_monotonic_ns, total_rss_bytes)`, computed
+with `Decimal`, converted to bytes per minute, and floored at zero. FD growth is the
+maximum post-warmup total FD count minus the first post-warmup total, floored at zero.
+This preserves the original one-process resource budget rather than multiplying it by
+six.
 
 Storage-health samples independently call `statvfs` for data and state roots and record
 worker lifecycle/critical state. Sample gap is the difference between consecutive
@@ -483,10 +584,25 @@ post-run capability probes are separate from periodic health sampling.
 
 ## 6. Runner And Candidate Report
 
-The runner opens exactly one `RawWriterService` per declared exchange with deterministic
-worker IDs and immutable config. It uses production `try_accept`, `sync_now`,
-`metrics_snapshot`, final barrier, `close_all`, manifest loading, and raw validation.
-It never reads coordinator, ledger, ingress-queue, or recovery internals.
+The runner is one supervisor plus exactly five children created with
+`multiprocessing.get_context("spawn")`, matching the production process boundary.
+Each child owns one exchange, one event loop, and one `RawWriterService` with its
+deterministic worker ID and immutable config. It uses production `try_accept`,
+`sync_now`, `metrics_snapshot`, final barrier, `close_all`, manifest loading, and raw
+validation, and never reads coordinator, ledger, ingress-queue, or recovery internals.
+The supervisor computes the global workload-plan hash once before admission. It sends
+only immutable workload/config inputs, that bound hash, absolute monotonic/UTC
+admission anchors, sampling commands, and bounded status/control messages over IPC;
+planned market events and trace rows never cross IPC. Children independently validate
+the exact workload source SHA plus plan header/stream-summary bytes, but do not each
+repeat the 25-million-row global plan hash.
+
+Every child uses an exchange-partitioned oracle iterator whose five-way heap merge is
+byte-for-byte equal to the global iterator. Children complete readiness handshakes
+before the supervisor chooses a future admission anchor. A child crash, missing round,
+clock/plan/config disagreement, or failed final barrier stops all admission and fails
+the run closed while retaining every completed and partial artifact. The supervisor
+never restarts a qualification child and never reuses its exchange subtree.
 
 Qualification requires fresh data/recovery exchange subtrees, a same-hour UTC
 preflight, multiplier at least two, duration at least ten minutes, a target declaration,
@@ -494,8 +610,9 @@ and the immutable image claim. Functional mode owns temporary roots, runs the ex
 10-second workload, forbids a target declaration, and can never produce an acceptance
 receipt.
 
-The runner waits until each due time without busy spinning, attempts every planned
-event exactly once, samples workers/resources concurrently, waits through the drain
+Each child waits until its due times without busy spinning, attempts every partitioned
+event exactly once, and writes its primary trace. The supervisor coordinates complete
+worker/resource rounds, waits through the drain
 second, closes and validates all outputs, and publishes a `GateCandidateReportV1`.
 That report contains `candidate_runtime_passed`, but it has no authoritative
 `qualification_accepted=true` field. Runner exit zero means only that candidate runtime

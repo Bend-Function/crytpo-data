@@ -4,7 +4,13 @@
 
 **Goal:** Build a deterministic writer-only durability benchmark whose final qualification verdict is independently reproducible from primary runtime, raw-storage, target, source, wheel, and container evidence.
 
-**Architecture:** A strict workload loader feeds a streaming deterministic oracle. The production runner records primary artifacts while using only public `RawWriterService` APIs; a fresh-process runtime verifier recomputes storage facts, and a host-side provenance verifier binds the exact source and executed image. Candidate reports never self-qualify; only the final acceptance receipt can set `qualification_accepted=true`.
+**Architecture:** A strict workload loader feeds a streaming deterministic oracle. A
+spawn supervisor coordinates five exchange child processes; each child owns one
+production `RawWriterService` and one primary trace partition. A fresh-process runtime
+verifier heap-merges those partitions and recomputes storage facts, and a host-side
+provenance verifier binds the exact source and executed image. Candidate reports never
+self-qualify; only the final acceptance receipt can set
+`qualification_accepted=true`.
 
 **Tech Stack:** Python 3.11, asyncio, Pydantic v2, ruamel.yaml, simplejson, zstandard, SQLite, Typer, pytest, Ruff, mypy, POSIX/Linux filesystem APIs, Docker/BuildKit, Git.
 
@@ -68,6 +74,62 @@ are implementation/reproducibility checks only.
 - `Dockerfile`, `.dockerignore`: pinned collector image.
 - `docs/operations/writer-benchmark.md`: implementation, target, validation, archive,
   disclosure, and failure runbook.
+
+## Pre-Task-3 Contract And Process Amendment
+
+This section supersedes conflicting Task 3, Task 4, and Task 7 wording below. It was
+added before any of those tasks were implemented after two measured facts:
+
+- one process can generate only about 29,000 planned drafts/s and the production
+  admission path measured about 21,500 accepts/s on the development host, below the
+  41,768/s aggregate mean and far below a global 250,000-event trade burst;
+- the collector architecture already requires one spawned process per exchange.
+
+The runner therefore uses `multiprocessing.get_context("spawn")` with one supervisor
+and exactly five canonical exchange children. Each child opens one service, uses an
+efficient exchange-partitioned oracle iterator, writes one canonical trace partition,
+and samples its own `/proc/self`. Planned events and trace rows never cross IPC. All
+children receive one future monotonic/UTC admission anchor only after a complete
+readiness handshake. There is no automatic child restart during a gate run.
+
+Primary admission trace is an ordered five-part set, not a physical global file plus
+five duplicates. Each part has its own decompressed/compressed sizes and SHA values.
+The set additionally binds row count, byte count, and semantic SHA of a virtual
+five-way heap merge by `(due_monotonic_ns, planned_event_id)`. The runtime verifier
+performs that merge directly from bounded zstd readers and compares it to the global
+oracle. Missing, duplicate, reordered, cross-exchange, or internally unsorted parts
+reject the run.
+
+Resource rounds contain six stable process keys: supervisor first, followed by the
+five exchange children in canonical exchange order. RSS and open FDs are summed within
+each complete round. Peak, post-warmup RSS OLS slope, FD baseline/peak/final/growth,
+and configured limits use those totals. A per-process application of the 4 GiB/4096-FD
+limits is forbidden because it would multiply the approved resource budget.
+
+Canonical schema ownership is incremental. Task 3 defines only the foundational
+primary rows and artifact codecs whose exact field order is frozen in the approved
+design: `GateArtifactRefV1`, `GateExchangeArtifactPartitionV1`,
+`GateAdmissionTraceSetV1`, `GateAdmissionTraceV1`, `GateSecondBucketV1`,
+`GateWorkerKeyV1`, `GateWorkerSampleV1`, `GateSamplingRoundV1`,
+`GateProcessKeyV1`, `GateProcessResourceSampleV1`,
+`GateResourceSamplingRoundV1`, `GateWorkerHealthV1`, and
+`GateStorageHealthSampleV1`. Do not create placeholder future models.
+
+Later tasks add their models only after their own RED tests freeze every field and its
+order:
+
+- Task 4: final worker/resource/storage summary models;
+- Task 5: candidate report, run index, raw/manifest inventory, runtime receipt, and
+  runtime index models required by the verifier fixture;
+- Task 6: target declaration and re-probe models;
+- Task 7: no new evidence schema; it must consume the frozen Task 3-6 models;
+- Task 8: file/archive/provenance/acceptance/disclosure models and the complete hash
+  DAG chain.
+
+Every later self-hashing model places `sha256` last, publishes canonical bytes with it,
+and computes the digest with only that field omitted. A task must not implement a
+future model until its field order, invariants, public/private classification, and
+predecessor references are explicit in tests and the design.
 
 ### Task 1: Freeze Workload Schema And Baseline Bytes
 
@@ -355,7 +417,68 @@ git add src/crypto_collector/benchmarks/oracle.py \
 git commit -m "feat: add deterministic writer gate oracle"
 ```
 
-### Task 3: Define Primary Artifacts And The One-Way Hash DAG
+### Task 2A: Add Exchange-Partitioned Streaming Iteration
+
+**Files:**
+- Modify: `src/crypto_collector/benchmarks/oracle.py`
+- Modify: `tests/unit/benchmarks/test_oracle.py`
+
+- [ ] **Step 1: Write partition-equivalence RED tests**
+
+Build a strict two-exchange micro plan. Assert every partition contains only its
+requested exchange and this merge is exact at the model and canonical-byte levels:
+
+```python
+partitions = tuple(iter_exchange_plan_events(plan, exchange)
+                   for exchange in plan.streams[0].exchanges)
+merged = heapq.merge(*partitions,
+                     key=lambda event: (event.due_offset_ns,
+                                        event.planned_event_id))
+assert tuple(merged) == tuple(iter_plan_events(plan))
+```
+
+Cover control identities, capped sparse allocation, burst and smooth rows, all eight
+stream groups, invalid exchange type, and an exchange absent from the plan. Assert
+each partition count equals the sum of allocations for that exchange. The test must
+fail because `iter_exchange_plan_events` does not exist.
+
+- [ ] **Step 2: Implement bounded partition iteration**
+
+Expose:
+
+```text
+iter_exchange_plan_events(plan: WorkloadPlanV1, exchange: Exchange)
+    -> Iterator[PlannedEventV1]
+```
+
+Derive each exchange's contiguous identity span, ordinal start, per-identity burst
+prefix, and global smooth index arithmetically. Do not filter `iter_plan_events` and do
+not scan or build payloads for another exchange. Within a stream, sort only that
+exchange's burst tie group and same-due smooth group; heap-merge the fixed eight stream
+iterators. The five exchange iterators must merge exactly to the existing global
+iterator, so this addition cannot change any workload-plan or golden hash.
+
+- [ ] **Step 3: Run focused and full oracle gates**
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_oracle.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/oracle.py \
+  tests/unit/benchmarks/test_oracle.py
+.venv/bin/ruff format --check src/crypto_collector/benchmarks/oracle.py \
+  tests/unit/benchmarks/test_oracle.py
+.venv/bin/mypy src/crypto_collector/benchmarks/oracle.py
+git diff --check
+```
+
+- [ ] **Step 4: Review, commit, and push**
+
+```bash
+git add src/crypto_collector/benchmarks/oracle.py \
+  tests/unit/benchmarks/test_oracle.py
+git commit -m "feat: partition writer gate events by exchange"
+```
+
+### Task 3: Define Foundational Primary Artifacts And Partitioned Codecs
 
 **Files:**
 - Create: `src/crypto_collector/benchmarks/contracts.py`
@@ -387,25 +510,28 @@ def test_semantic_hash_ignores_zstd_frame_variation(tmp_path: Path) -> None:
     assert first.compressed_sha256 != second.compressed_sha256
 ```
 
-Reject bool/int confusion, extra fields, invalid SHA/image IDs, duplicate/sorted-key
+Reject bool/int confusion, extra fields, invalid SHA values, duplicate/sorted-key
 violations, noncanonical JSON bytes, missing final newline, trailing bytes, malformed
-zstd, and accepted/nonaccepted identity disagreement.
+zstd, accepted/nonaccepted identity disagreement, incomplete worker/process rounds,
+and unstable process IDs.
 
-- [ ] **Step 2: Write hash-DAG and no-replace RED tests**
+- [ ] **Step 2: Write partitioned-hash and no-replace RED tests**
 
-Assert the exact predecessor chain:
+Create five small exchange partitions and assert:
 
 ```python
-assert runtime_receipt.run_index_sha256 == run_index.sha256
-assert runtime_index.runtime_receipt_sha256 == runtime_receipt.sha256
-assert provenance.runtime_index_sha256 == runtime_index.sha256
-assert acceptance.provenance_receipt_sha256 == provenance.sha256
-assert disclosure.acceptance_receipt_sha256 == acceptance.sha256
+trace_set = validate_trace_partitions(canonical_five_partitions())
+assert trace_set.merged_content_sha256 == hash_global_trace_rows()
+assert trace_set.merged_row_count == sum(part.artifact.row_count
+                                         for part in trace_set.partitions)
 ```
 
-Test that a later node cannot refer to itself/future nodes, existing destinations are
-never overwritten, temp sync precedes hard-link publication, directory sync follows,
-and partial files never parse as completed evidence.
+Mutation tests reject missing/sixth/duplicate/reordered partitions, an exchange row in
+the wrong part, internally unsorted rows, merged count/size/hash disagreement, and a
+planned-event-ID collision. Also prove existing destinations are never overwritten,
+temp sync/close precedes hard-link publication, directory sync follows, failed writes
+retain `.partial` evidence, and partial files never parse as completed evidence. The
+complete one-way hash-DAG test moves to Task 8, when every node actually exists.
 
 - [ ] **Step 3: Run tests and verify RED**
 
@@ -419,26 +545,53 @@ Expected: FAIL because contracts and artifact writers do not exist.
 
 - [ ] **Step 4: Implement frozen contracts and canonical artifacts**
 
-Define strict version-one models for:
+Define only these strict version-one models in the exact approved field order:
 
 ```text
-GateAdmissionTraceV1, GateSecondBucketV1, GateWorkerSampleV1,
-GateSamplingRoundV1, GateResourceSampleV1, GateStorageHealthSampleV1,
-GateCandidateReportV1, GateRunIndexV1, GateRuntimeReceiptV1,
-GateRuntimeIndexV1, GateFileInventoryV1, GateArchiveManifestV1,
-GateArchiveAttestationV1, GateProvenanceReceiptV1,
-GateAcceptanceReceiptV1, GateEvidenceDisclosureV1
+GateArtifactRefV1, GateExchangeArtifactPartitionV1,
+GateAdmissionTraceSetV1, GateAdmissionTraceV1, GateSecondBucketV1,
+GateWorkerKeyV1, GateWorkerSampleV1, GateSamplingRoundV1,
+GateProcessKeyV1, GateProcessResourceSampleV1,
+GateResourceSamplingRoundV1, GateWorkerHealthV1,
+GateStorageHealthSampleV1
 ```
 
-Each SHA-bearing model exposes `canonical_bytes()` and computes its digest with its own
-digest field omitted. Paths stored in evidence are normalized POSIX-relative strings;
-private absolute target paths appear only in target/report models.
+Paths stored in evidence are normalized POSIX-relative strings. Reuse the canonical
+storage `AcceptedRecordIdentityV1`, `EnqueueStatus`, and `WriterMetricsSnapshotV1`
+instead of redefining them.
+
+Expose these exact foundational call shapes (with a bounded Pydantic model type
+variable `RowT`):
+
+```text
+write_jsonl_zstd(root: Path, relative_path: str, rows: Iterable[RowT], *,
+                 zstd_level: int) -> GateArtifactRefV1
+iter_jsonl_zstd(root: Path, artifact: GateArtifactRefV1,
+                model_type: type[RowT], *, max_rows: int,
+                max_content_bytes: int, max_line_bytes: int) -> Iterator[RowT]
+iter_merged_trace_partitions(root: Path,
+                             partitions: Sequence[GateExchangeArtifactPartitionV1],
+                             *, max_rows: int, max_content_bytes: int,
+                             max_line_bytes: int)
+    -> Iterator[GateAdmissionTraceV1]
+build_admission_trace_set(root: Path,
+                          partitions: Sequence[GateExchangeArtifactPartitionV1],
+                          *, max_rows: int, max_content_bytes: int,
+                          max_line_bytes: int) -> GateAdmissionTraceSetV1
+```
+
+`root` is an absolute normalized directory; artifact paths never escape it. Generic
+rows must be frozen strict models with canonical bytes. Readers first validate the
+compressed file size/SHA through no-follow descriptors, then enforce all three
+caller-provided bounds while decompressing and require exact canonical re-encoding.
 
 Implement streaming JSONL/zstd read/write with content and compressed SHA-256 values,
 where canonical JSONL is exactly `encode_json(model_dump(mode="json")) + b"\n"`.
 Require strict canonical-byte comparison after model parsing, bounded decompression, and
-same-parent sync/hard-link/directory-sync publication. Reuse the production
-`NoReplaceCapability.HARDLINK` semantics; do not add rename-overwrite fallbacks.
+same-parent sync/hard-link/directory-sync publication. Implement bounded five-reader
+heap merge validation without writing a sixth trace. Reuse the production
+`NoReplaceCapability.HARDLINK` semantics explicitly; do not depend on the Linux
+renameat2 default and do not add rename-overwrite fallbacks.
 
 - [ ] **Step 5: Run focused tests and checks**
 
@@ -489,7 +642,11 @@ byte-identical cache repeats and decreasing quantiles with monotonic cumulative 
 
 ```python
 def test_rss_ols_and_fd_growth_use_only_post_warmup_samples() -> None:
-    summary = summarize_resources(samples(), warmup_ended_monotonic_ns=120)
+    summary = summarize_resources(
+        six_process_rounds(),
+        expected_processes=canonical_process_keys(),
+        warmup_ended_monotonic_ns=120,
+    )
     assert summary.rss_slope_bytes_per_minute == Decimal("120")
     assert summary.fd_growth_after_warmup == 3
 
@@ -501,9 +658,10 @@ def test_storage_health_rejects_burst_sampling() -> None:
     assert summary.coverage_valid is False
 ```
 
-Cover negative OLS slope flooring to zero, one/zero post-warmup samples, exact Decimal
-conversion, scheduled-time gaps, completion coverage, two independent root `statvfs`
-facts, and shared-root free-space treatment.
+Cover same-round six-process RSS/FD sums, missing/seventh/duplicate processes, changed
+PID or process key, negative OLS slope flooring to zero, one/zero post-warmup rounds,
+exact Decimal conversion, scheduled-time gaps, completion coverage, two independent
+root `statvfs` facts, and shared-root free-space treatment.
 
 - [ ] **Step 3: Run tests and verify RED**
 
@@ -517,11 +675,12 @@ Expose these exact public call shapes:
 
 ```text
 validate_worker_rounds(rounds: Iterable[GateSamplingRoundV1], *,
-                       expected_workers: Sequence[WorkerKey])
+                       expected_workers: Sequence[GateWorkerKeyV1])
     -> ValidatedWorkerSequences
 aggregate_final_worker_snapshots(sequences: ValidatedWorkerSequences)
     -> FinalWorkerAggregateV1
-summarize_resources(samples: Iterable[GateResourceSampleV1], *,
+summarize_resources(rounds: Iterable[GateResourceSamplingRoundV1], *,
+                    expected_processes: Sequence[GateProcessKeyV1],
                     warmup_ended_monotonic_ns: int)
     -> GateResourceSummaryV1
 summarize_storage_health(samples: Iterable[GateStorageHealthSampleV1], *,
@@ -530,12 +689,14 @@ summarize_storage_health(samples: Iterable[GateStorageHealthSampleV1], *,
 ```
 
 Use canonical snapshot bytes for equal-time comparisons, explicit cumulative/max/gauge
-field tuples, and the repository durability histogram bounds. Do not introspect
-`RawWriterService` internals.
+field tuples, the repository durability histogram bounds, and same-round total process
+resources. Do not introspect `RawWriterService` internals and do not apply resource
+limits separately to each process.
 
 Define `FinalWorkerAggregateV1`, `GateResourceSummaryV1`, and
 `GateStorageHealthSummaryV1` as frozen strict models in `contracts.py`. Keep
-`WorkerKey` and `ValidatedWorkerSequences` as immutable internal aggregation types.
+`ValidatedWorkerSequences` as an immutable internal aggregation type; use the
+canonical `GateWorkerKeyV1` at the artifact boundary.
 
 - [ ] **Step 5: Run focused tests and checks**
 
@@ -566,13 +727,19 @@ git commit -m "feat: aggregate writer gate primary samples"
 **Files:**
 - Create: `src/crypto_collector/benchmarks/runtime_verifier.py`
 - Create: `tests/unit/benchmarks/test_runtime_verifier.py`
+- Modify: `src/crypto_collector/benchmarks/contracts.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
 - [ ] **Step 1: Write a passing micro-evidence fixture and mutation RED tests**
 
-The fixture must contain committed workload bytes, plan rows, canonical trace/buckets,
-five worker sequences, resource/health samples, raw zstd parts, and valid manifests.
-Do not construct a verdict boolean directly.
+Before constructing the fixture, freeze every field, order, invariant, status/successor
+rule, and digest input for `GateCandidateReportV1`, `GateRunIndexV1`,
+`GateRawInventoryV1`, `GateManifestInventoryV1`, `GateRuntimeReceiptV1`, and
+`GateRuntimeIndexV1`. The fixture must contain committed workload bytes, plan rows,
+five canonical trace
+partitions plus their virtual merge hash, buckets, five worker sequences, six-process
+resource rounds, health samples, raw zstd parts, and valid manifests. Do not construct
+a verdict boolean directly.
 
 ```python
 def test_runtime_verifier_recomputes_acceptance(tmp_path: Path) -> None:
@@ -621,10 +788,12 @@ one, can set `runtime_evidence_valid=true`, and must always set
 
 Open a temporary SQLite database beneath the declared state root with
 `journal_mode=WAL`, `synchronous=FULL`, strict tables, and primary keys for planned
-event ID, exact accepted identity tuple, and durable row identity. Stream-join oracle
-rows and trace rows, then stream manifests/raw rows through `load_raw_manifest` and
-`validate_local_source`. Reject missing/extra/duplicate facts and noncontiguous
-per-worker acceptance ordinals.
+event ID, exact accepted identity tuple, and durable row identity. Open the exact five
+trace partitions with bounded readers, verify each part, heap-merge them by
+`(due_monotonic_ns, planned_event_id)`, and stream-join that virtual trace with the
+global oracle. Then stream manifests/raw rows through `load_raw_manifest` and
+`validate_local_source`. Reject missing/extra/duplicate facts, partition/hash
+disagreement, and noncontiguous per-worker acceptance ordinals.
 
 Recompute buckets, counts, payload bytes, rates, bursts, UTC hours, worker aggregation,
 resource/health predicates, and target re-probe facts. Compare candidate summaries
@@ -633,8 +802,9 @@ remove the temporary SQLite files only after a successful directory sync.
 
 - [ ] **Step 4: Prove bounded memory and fail-closed interruption**
 
-Add a marked performance test that validates a generated million-row synthetic trace
-under a test RSS bound. Unit tests use 10,000 rows. Interrupt after each artifact
+Add a marked performance test that validates five generated partitions totaling one
+million synthetic rows under a test RSS bound. Unit tests use 10,000 rows. Interrupt
+after each artifact
 boundary, rerun from a fresh verifier, and prove no partial receipt is accepted or
 overwritten.
 
@@ -646,8 +816,10 @@ Run:
 .venv/bin/python -m pytest tests/unit/benchmarks/test_runtime_verifier.py \
   tests/performance/test_writer_durability.py -q
 .venv/bin/ruff check src/crypto_collector/benchmarks/runtime_verifier.py \
+  src/crypto_collector/benchmarks/contracts.py \
   tests/unit/benchmarks/test_runtime_verifier.py
-.venv/bin/mypy src/crypto_collector/benchmarks/runtime_verifier.py
+.venv/bin/mypy src/crypto_collector/benchmarks/runtime_verifier.py \
+  src/crypto_collector/benchmarks/contracts.py
 git diff --check
 ```
 
@@ -657,6 +829,7 @@ Expected: PASS.
 
 ```bash
 git add src/crypto_collector/benchmarks/runtime_verifier.py \
+  src/crypto_collector/benchmarks/contracts.py \
   tests/unit/benchmarks/test_runtime_verifier.py \
   tests/performance/test_writer_durability.py
 git commit -m "feat: independently verify writer gate runtime evidence"
@@ -757,10 +930,14 @@ wrong target IDs. Functional reports must never expose authoritative acceptance.
 
 - [ ] **Step 2: Write a micro production-path integration RED test**
 
-Inject clocks and a tiny workload, open five real `RawWriterService` instances, run
-events, close them, validate manifests/raw rows, then invoke the fresh runtime verifier.
-Assert exact record/payload conservation, five stable workers, expected touched files,
-zero error counters, and a passing runtime receipt.
+Use a real spawn context and a tiny workload. Start one supervisor and five child
+processes, have each child open its real `RawWriterService`, run its exchange iterator,
+publish its trace partition, and close. Validate manifests/raw rows and the virtual
+five-part merge, then invoke the fresh runtime verifier. Assert exact record/payload
+conservation, five stable workers, six stable process keys, expected touched files,
+zero error counters, and a passing runtime receipt. A separate injected in-process
+child harness may cover deterministic clock edge cases, but it cannot replace the
+spawn integration test.
 
 - [ ] **Step 3: Run tests and verify RED**
 
@@ -775,17 +952,32 @@ Expected: FAIL because runner/CLI APIs do not exist.
 
 - [ ] **Step 4: Implement runner orchestration**
 
-Open one service per explicit exchange using public `RawWriterService.open` arguments:
-data/state roots, exchange, deterministic worker ID, canonical config SHA, generation
-zero, writer/ingress configs, exact metric-stream allowlist, and production clock.
-Derive the config digest from the fully resolved benchmark writer/ingress configs.
+Use `multiprocessing.get_context("spawn")` to create exactly five canonical exchange
+children. Inside each child, open one service using public `RawWriterService.open`
+arguments: data/state roots, exchange, deterministic worker ID, canonical config SHA,
+generation zero, writer/ingress configs, exact metric-stream allowlist, and production
+clock. Derive the config digest from the fully resolved benchmark writer/ingress
+configs and require every child to report the same digest and workload-plan hash.
 
-Use a heap-merged oracle iterator. Sleep until due time, call only
-`try_accept(draft, source=source, shard=shard)`, record trace timing/status/identity,
-and continue after overflow only to retain complete failure evidence. Run complete
-sampling rounds concurrently. At the admission boundary, stop attempts, call
-`sync_now`, `close_all(CloseReason.SHUTDOWN, deadline)`, validate returned manifests,
-capture final CLOSED snapshots, inventories, buckets, candidate report, and run index.
+Compute the 25-million-row global workload-plan hash once in the supervisor before
+spawn/admission. Each child validates the exact workload source SHA and canonical plan
+header/stream summaries and binds the supervisor-provided global hash; children must
+not each recompute the global event hash.
+
+After all readiness handshakes, the supervisor chooses one future monotonic and UTC
+admission anchor. Each child uses only `iter_exchange_plan_events(plan, exchange)`,
+sleeps until due time, calls only `try_accept(draft, source=source, shard=shard)`, and
+streams timing/status/identity facts into its own trace partition. Continue after
+overflow only to retain complete failure evidence. No planned event or trace row uses
+IPC. The supervisor issues bounded sample commands and accepts a round only when all
+five worker samples and all six process resource samples are complete and stable.
+
+At the admission boundary, stop attempts in every child, call `sync_now`,
+`close_all(CloseReason.SHUTDOWN, deadline)`, validate returned manifests, and capture
+final CLOSED snapshots. The supervisor validates the five trace parts and virtual
+merge, then publishes inventories, buckets, candidate report, and run index. Any child
+exit, IPC timeout, missing round, or anchor/config disagreement stops the others,
+marks the run failed, and forbids restart or exchange-subtree reuse.
 
 All artifacts use same-parent no-replace publication. On failure after artifact
 publisher initialization, publish a failed successor index when the state root remains
@@ -878,6 +1070,20 @@ Reject dirty checkout inputs, untracked/ignored build inputs, mismatched builds,
 caller-only image claims, removed/failed containers, mutable/unversioned archives,
 WebDAV-only evidence, inventory mismatch, receipt/index disagreement, private paths in
 disclosure, and any attempt to qualify functional mode.
+
+This is also the first task where the complete one-way DAG exists. Freeze every field
+order before implementation and assert the exact predecessor chain:
+
+```python
+assert runtime_receipt.run_index_sha256 == run_index.sha256
+assert runtime_index.runtime_receipt_sha256 == runtime_receipt.sha256
+assert provenance.runtime_index_sha256 == runtime_index.sha256
+assert acceptance.provenance_receipt_sha256 == provenance.sha256
+assert disclosure.acceptance_receipt_sha256 == acceptance.sha256
+```
+
+Reject self/future references, a predecessor of the wrong schema or mode, and any node
+whose last `sha256` field does not equal the digest of its preceding canonical fields.
 
 - [ ] **Step 2: Run tests and verify RED**
 
