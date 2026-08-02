@@ -79,7 +79,7 @@ are implementation/reproducibility checks only.
 - Create: `tests/unit/benchmarks/test_workload.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Replace the import-only RED test with strict workload tests**
+- [x] **Step 1: Replace the import-only RED test with strict workload tests**
 
 Add tests that import only the intended public loader and models:
 
@@ -131,7 +131,7 @@ rates/fractions, non-finite/negative decimals, `instrument_instances *
 logical_streams_per_instrument != file_instances`, and every mismatch among fixed,
 scalable, and active counts.
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -143,7 +143,7 @@ Run:
 Expected: collection fails because `crypto_collector.benchmarks.workload` does not
 exist.
 
-- [ ] **Step 3: Commit the exact baseline YAML shape**
+- [x] **Step 3: Commit the exact baseline YAML shape**
 
 Extend the already-created baseline values with these exact top-level keys:
 
@@ -175,7 +175,7 @@ qualification limits from the approved design and prior Task 7 snippet. Remove t
 redundant `exchange_workers` and `markets_per_worker` keys because the explicit tuples
 are authoritative.
 
-- [ ] **Step 4: Implement the strict loader**
+- [x] **Step 4: Implement the strict loader**
 
 Use frozen strict Pydantic models and `ruamel.yaml.YAML(typ="safe", pure=True)`.
 Expose exactly this public shape:
@@ -198,7 +198,7 @@ errors. Compute SHA-256 over exact source bytes before parsing. Set
 shasum -a 256 benchmarks/workloads/research-default-v1.yaml
 ```
 
-- [ ] **Step 5: Run focused tests and static checks**
+- [x] **Step 5: Run focused tests and static checks**
 
 Run:
 
@@ -214,7 +214,7 @@ git diff --check
 Expected: PASS. Keep Task 2 oracle imports out of the performance test until Task 2
 Step 1 creates its next RED state.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add src/crypto_collector/benchmarks/__init__.py \
