@@ -329,6 +329,10 @@ class GateAdmissionTraceV1(_GateContract):
             )
             if observed_route != expected_route:
                 raise ValueError("accepted identity routing must match the trace")
+            if identity.worker_instance_id != _worker_instance_id(self.exchange):
+                raise ValueError(
+                    "accepted identity worker instance ID does not match its exchange"
+                )
         return self
 
 
@@ -1464,13 +1468,25 @@ class GateRuntimeReceiptV1(_SelfHashingGateContract):
             if self.expected_target_id is not None or self.target_reprobe is not None:
                 raise ValueError("functional runtime receipt forbids target evidence")
         else:
-            if self.expected_target_id is None or self.target_reprobe is None:
+            if self.expected_target_id is None:
                 raise ValueError(
-                    "qualification runtime receipt requires target evidence"
+                    "qualification runtime receipt requires an expected target ID"
                 )
-            if self.target_reprobe.expected_target_id != self.expected_target_id:
-                raise ValueError("target re-probe expected ID differs from receipt")
-            target_valid = self.target_reprobe.reprobe_valid
+            if self.target_reprobe is None:
+                if (
+                    self.evidence_integrity_valid
+                    or self.recomputed_summary is not None
+                    or self.candidate_summary_matches
+                    or self.runtime_predicates_passed
+                ):
+                    raise ValueError(
+                        "missing qualification target evidence requires a structural rejection"
+                    )
+                target_valid = False
+            else:
+                if self.target_reprobe.expected_target_id != self.expected_target_id:
+                    raise ValueError("target re-probe expected ID differs from receipt")
+                target_valid = self.target_reprobe.reprobe_valid
         expected_runtime_valid = (
             self.evidence_integrity_valid
             and self.candidate_summary_matches

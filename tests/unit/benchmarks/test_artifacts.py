@@ -479,6 +479,15 @@ def test_trace_identity_status_and_timestamps_are_strict() -> None:
                 ),
             }
         )
+    with pytest.raises(ValidationError, match="worker instance ID"):
+        GateAdmissionTraceV1.model_validate(
+            {
+                **values,
+                "accepted_identity": accepted.accepted_identity.model_copy(
+                    update={"worker_instance_id": _worker_id(Exchange.OKX)}
+                ),
+            }
+        )
 
 
 def test_bucket_actual_second_count_is_independent_of_scheduled_second() -> None:

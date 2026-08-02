@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+import zstandard
+from pydantic import BaseModel, ValidationError
 
+from crypto_collector.benchmarks import runtime_verifier
 from crypto_collector.benchmarks.contracts import (
     CANONICAL_EXCHANGES,
     FinalWorkerAggregateV1,
@@ -27,15 +30,24 @@ from crypto_collector.benchmarks.contracts import (
     GateStorageHealthSummaryV1,
     GateStreamRuntimeSummaryV1,
     GateTargetReprobeV1,
+    GateTargetV1,
+    StreamGroup,
 )
+from crypto_collector.benchmarks.runtime_verifier import (
+    RuntimeEvidenceValidationError,
+    TargetProbePort,
+    validate_runtime_evidence,
+)
+from crypto_collector.benchmarks.target import GATE_B_ROOT_MINIMUM_AVAILABLE_BYTES
 from crypto_collector.domain.json_codec import encode_json
 from crypto_collector.storage.raw_writer import NoReplaceCapability
 from crypto_collector.storage.stats import DURABILITY_BUCKET_UPPER_BOUNDS_NS
+from tests.support.writer_gate_evidence import write_passing_micro_evidence
 
 _SHA_A = "a" * 64
 _SHA_B = "b" * 64
 _RUN_ID = "00000000-0000-4000-8000-000000000001"
-_STREAMS = (
+_STREAMS: tuple[StreamGroup, ...] = (
     "trade",
     "book_live",
     "ticker",
@@ -46,7 +58,7 @@ _STREAMS = (
     "control",
 )
 
-_EXPECTED_FIELDS = {
+_EXPECTED_FIELDS: dict[type[BaseModel], tuple[str, ...]] = {
     GateEvidenceDocumentRefV1: (
         "schema_version",
         "record_type",
@@ -241,6 +253,118 @@ def _rehash(model_type: type[Any], model: Any, **updates: Any) -> Any:
     return _self_hashed(model_type, unsigned)
 
 
+def test_runtime_verifier_rejects_noncanonical_entrypoint(tmp_path: Path) -> None:
+    wrong_path = tmp_path / "other-index.json"
+    wrong_path.write_bytes(b"{}\n")
+    probe: TargetProbePort | None = None
+
+    with pytest.raises(RuntimeEvidenceValidationError, match="run-index.json"):
+        validate_runtime_evidence(wrong_path, target_probe=probe)
+
+    assert not (tmp_path / "runtime-receipt.json").exists()
+    assert not (tmp_path / "runtime-index.json").exists()
+
+
+def test_raw_frame_scanner_accepts_multiple_independent_frames(
+    tmp_path: Path,
+) -> None:
+    compressor = zstandard.ZstdCompressor(
+        level=3,
+        write_checksum=True,
+        write_content_size=True,
+    )
+    path = tmp_path / "multi-frame.jsonl.zst"
+    path.write_bytes(
+        compressor.compress(b'{"row":1}\n') + compressor.compress(b'{"row":2}\n')
+    )
+
+    runtime_verifier._validate_raw_zstd_frames(
+        path,
+        max_plain_frame_bytes=64,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "checksum_corrupt",
+        "truncated",
+        "trailing_garbage",
+        "invalid_second_frame",
+        "missing_frame_newline",
+    ),
+)
+def test_raw_frame_scanner_rejects_physical_corruption(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    compressor = zstandard.ZstdCompressor(
+        level=3,
+        write_checksum=True,
+        write_content_size=True,
+    )
+    first = compressor.compress(b'{"row":1}\n')
+    if mutation == "checksum_corrupt":
+        changed = bytearray(first)
+        changed[-1] ^= 1
+        source = bytes(changed)
+    elif mutation == "truncated":
+        source = first[:-1]
+    elif mutation == "trailing_garbage":
+        source = first + b"not-a-zstd-frame"
+    elif mutation == "invalid_second_frame":
+        source = first + zstandard.ZstdCompressor(
+            level=3,
+            write_checksum=False,
+            write_content_size=True,
+        ).compress(b'{"row":2}\n')
+    else:
+        assert mutation == "missing_frame_newline"
+        source = compressor.compress(b'{"row":1}')
+    path = tmp_path / f"{mutation}.jsonl.zst"
+    path.write_bytes(source)
+
+    with pytest.raises(RuntimeEvidenceValidationError):
+        runtime_verifier._validate_raw_zstd_frames(
+            path,
+            max_plain_frame_bytes=64,
+        )
+
+
+def test_runtime_verifier_recomputes_functional_acceptance(tmp_path: Path) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+
+    receipt = validate_runtime_evidence(
+        evidence.run_index_path,
+        target_probe=None,
+    )
+
+    assert receipt.runtime_evidence_valid is True
+    assert receipt.qualification_runtime_accepted is False
+    assert receipt.recomputed_summary == evidence.candidate_report.runtime_summary
+    assert (evidence.root / "runtime-receipt.json").read_bytes() == (
+        receipt.canonical_bytes()
+    )
+    runtime_index_path = evidence.root / "runtime-index.json"
+    runtime_index_source = runtime_index_path.read_bytes()
+    runtime_index = GateRuntimeIndexV1.model_validate_json(
+        runtime_index_source,
+        strict=True,
+    )
+    assert runtime_index.canonical_bytes() == runtime_index_source
+    assert (runtime_index.run_id, runtime_index.mode) == (
+        evidence.run_index.run_id,
+        "functional",
+    )
+    for reference, path in (
+        (runtime_index.run_index, evidence.run_index_path),
+        (runtime_index.runtime_receipt, evidence.root / "runtime-receipt.json"),
+    ):
+        source = path.read_bytes()
+        assert reference.content_size_bytes == len(source)
+        assert reference.content_sha256 == hashlib.sha256(source).hexdigest()
+
+
 def _artifact(path: str, *, rows: int = 1) -> GateArtifactRefV1:
     return GateArtifactRefV1(
         relative_path=path,
@@ -392,7 +516,7 @@ def _health_summary(*, qualification: bool = False) -> GateStorageHealthSummaryV
     )
 
 
-def _stream_summary(name: str) -> GateStreamRuntimeSummaryV1:
+def _stream_summary(name: StreamGroup) -> GateStreamRuntimeSummaryV1:
     return GateStreamRuntimeSummaryV1(
         stream_group=name,
         expected_record_count=1,
@@ -419,7 +543,7 @@ def _stream_summary(name: str) -> GateStreamRuntimeSummaryV1:
     )
 
 
-_QUALIFICATION_STREAM_FACTS = (
+_QUALIFICATION_STREAM_FACTS: tuple[tuple[StreamGroup, int, int, int, int], ...] = (
     ("trade", 15_000_000, 20_106_023_944, 250_000, 86),
     ("book_live", 6_000_000, 191_396_044_800, 50_000, 217),
     ("ticker", 300_000, 625_200_128, 2_500, 81),
@@ -432,7 +556,7 @@ _QUALIFICATION_STREAM_FACTS = (
 
 
 def _qualification_stream_summary(
-    name: str,
+    name: StreamGroup,
     record_count: int,
     payload_bytes: int,
     burst_count: int,
@@ -650,7 +774,7 @@ def _root_probe(*, root: str, device: str) -> GateRootProbeV1:
         filesystem="ext4",
         mount_point=root,
         mount_options=("mount:rw", "super:rw"),
-        minimum_available_bytes=100 * 1024**3,
+        minimum_available_bytes=GATE_B_ROOT_MINIMUM_AVAILABLE_BYTES,
         observed_available_bytes=300 * 1024**3,
         no_replace_capability=NoReplaceCapability.HARDLINK,
         same_parent_publication_only=True,
@@ -893,6 +1017,21 @@ def test_receipt_truth_table_accepts_only_valid_qualification_evidence() -> None
     assert failing.runtime_evidence_valid is False
     assert failing.qualification_runtime_accepted is False
 
+    structural_rejection = _rehash(
+        GateRuntimeReceiptV1,
+        passing,
+        recomputed_summary=None,
+        target_reprobe=None,
+        failure_codes=["target_evidence_invalid"],
+        evidence_integrity_valid=False,
+        candidate_summary_matches=False,
+        runtime_predicates_passed=False,
+        runtime_evidence_valid=False,
+        qualification_runtime_accepted=False,
+    )
+    assert structural_rejection.target_reprobe is None
+    assert structural_rejection.runtime_evidence_valid is False
+
     invalid_cases = (
         {"evidence_integrity_valid": False},
         {"candidate_summary_matches": False},
@@ -929,3 +1068,134 @@ def test_runtime_index_binds_complete_document_refs() -> None:
         GateRuntimeIndexV1.model_validate(
             {**index.model_dump(mode="python"), "mode": "qualification"}
         )
+
+
+def _write_qualification_entrypoint(
+    evidence: Any,
+    *,
+    declaration_target_id: str,
+    expected_target_id: str,
+) -> None:
+    target_unsigned = {
+        "schema_version": 1,
+        "record_type": "gate_target_v1",
+        "target_id": declaration_target_id,
+        "data_root": _root_probe(
+            root=evidence.data_root.as_posix(),
+            device="1:1",
+        ).model_dump(mode="json"),
+        "state_root": _root_probe(
+            root=evidence.state_root.as_posix(),
+            device="2:2",
+        ).model_dump(mode="json"),
+        "deployment_purpose": "raw-writer-gate-b",
+        "created_at_unix_ns": 1_800_000_000_000_000_000,
+    }
+    target = _self_hashed(GateTargetV1, target_unsigned)
+    target_path = evidence.root / "target-declaration.json"
+    target_path.write_bytes(target.canonical_bytes())
+    target_source = target_path.read_bytes()
+    target_ref = GateEvidenceDocumentRefV1(
+        relative_path=target_path.name,
+        content_size_bytes=len(target_source),
+        content_sha256=hashlib.sha256(target_source).hexdigest(),
+    )
+    qualification = _rehash(
+        GateRunIndexV1,
+        evidence.run_index,
+        mode="qualification",
+        expected_target_id=expected_target_id,
+        target_declaration=target_ref.model_dump(mode="json"),
+        implementation_source_commit="c" * 40,
+        collector_wheel_sha256=_SHA_A,
+        requirements_lock_sha256=_SHA_A,
+        dockerfile_sha256=_SHA_A,
+        expected_image_id=f"sha256:{_SHA_A}",
+        runtime_image_id=f"sha256:{_SHA_A}",
+    )
+    evidence.run_index_path.write_bytes(qualification.canonical_bytes())
+
+
+def test_qualification_target_mismatch_publishes_structural_rejection(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+    _write_qualification_entrypoint(
+        evidence,
+        declaration_target_id="declared-target",
+        expected_target_id="different-target",
+    )
+
+    def probe_should_not_run(
+        declaration: GateTargetV1,
+        *,
+        expected_target_id: str,
+    ) -> GateTargetReprobeV1:
+        pytest.fail("a mismatched declaration must fail before the live probe")
+
+    receipt = validate_runtime_evidence(
+        evidence.run_index_path,
+        target_probe=probe_should_not_run,
+    )
+
+    assert receipt.mode == "qualification"
+    assert receipt.target_reprobe is None
+    assert receipt.failure_codes == ("target_evidence_invalid",)
+    assert receipt.runtime_evidence_valid is False
+    assert receipt.qualification_runtime_accepted is False
+    assert (evidence.root / "runtime-receipt.json").is_file()
+    assert (evidence.root / "runtime-index.json").is_file()
+
+
+def test_qualification_probe_wrong_type_publishes_structural_rejection(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+    _write_qualification_entrypoint(
+        evidence,
+        declaration_target_id="declared-target",
+        expected_target_id="declared-target",
+    )
+
+    def invalid_probe(
+        declaration: GateTargetV1,
+        *,
+        expected_target_id: str,
+    ) -> Any:
+        return True
+
+    receipt = validate_runtime_evidence(
+        evidence.run_index_path,
+        target_probe=invalid_probe,
+    )
+
+    assert receipt.target_reprobe is None
+    assert receipt.failure_codes == ("target_evidence_invalid",)
+    assert receipt.runtime_evidence_valid is False
+
+
+def test_qualification_probe_wrong_binding_publishes_structural_rejection(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+    _write_qualification_entrypoint(
+        evidence,
+        declaration_target_id="declared-target",
+        expected_target_id="declared-target",
+    )
+
+    def foreign_probe(
+        declaration: GateTargetV1,
+        *,
+        expected_target_id: str,
+    ) -> GateTargetReprobeV1:
+        return _target_reprobe()
+
+    receipt = validate_runtime_evidence(
+        evidence.run_index_path,
+        target_probe=foreign_probe,
+    )
+
+    assert receipt.target_reprobe is None
+    assert receipt.failure_codes == ("target_evidence_invalid",)
+    assert receipt.runtime_evidence_valid is False
