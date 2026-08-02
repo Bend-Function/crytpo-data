@@ -866,7 +866,7 @@ git commit -m "feat: independently verify writer gate runtime evidence"
 - Modify: `src/crypto_collector/benchmarks/contracts.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write mount/probe/declaration RED tests**
+- [x] **Step 1: Write mount/probe/declaration RED tests**
 
 Before writing implementation code, freeze the exact field order in the approved
 design for `GateRootProbeV1`, `GateTargetV1`, and `GateTargetReprobeV1`. Both target
@@ -884,13 +884,13 @@ sync, production hard-link no-replace, directory sync, cleanup plus cleanup-pare
 capability mismatch, target-ID mismatch, declaration SHA tampering, and no-replace
 declaration publication.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_target.py -q`
 
 Expected: FAIL because target APIs do not exist.
 
-- [ ] **Step 3: Implement exact Linux probes**
+- [x] **Step 3: Implement exact Linux probes**
 
 Expose these exact public call shapes:
 
@@ -907,7 +907,7 @@ resolved paths on component boundaries. Probe the actual hard-link primitive use
 directory/file flags, `os.fsync`, `os.link`, and explicit cleanup syncs. Hash the
 declaration with its digest omitted, then publish once through the artifact publisher.
 
-- [ ] **Step 4: Run focused tests and checks**
+- [x] **Step 4: Run focused tests and checks**
 
 Run:
 
@@ -923,7 +923,7 @@ git diff --check
 Expected: PASS on macOS through injected Linux fixtures; real declaration remains
 Linux-only.
 
-- [ ] **Step 5: Commit Task 6**
+- [x] **Step 5: Commit Task 6**
 
 ```bash
 git add src/crypto_collector/benchmarks/target.py \
