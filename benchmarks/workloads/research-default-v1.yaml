@@ -1,0 +1,48 @@
+schema_version: 1
+name: research-default-v1
+generation_seed: 20260731
+exchanges: [binance, okx, bybit, bitget, kraken]
+markets: [spot, perpetual]
+symbols_per_market: 25
+derivative_logical_streams: [funding, open_interest]
+identity_algorithm: gate-identity-v1
+payload_algorithm: gate-payload-v1
+schedule_algorithm: gate-schedule-v2-full-second-burst
+stream_transports:
+  trade: websocket
+  book_live: websocket
+  ticker: websocket
+  bbo: websocket
+  funding: websocket
+  open_interest: websocket
+  candle_1m: websocket
+  book_deep_snapshot: rest
+  _control: internal
+fixed_scope_file_count: 5
+scalable_file_count: 1750
+active_file_count: 1755
+streams:
+  trade: {instances: 250, mean_records_per_second: "50", burst_records_in_1s: 500, payload_p50_bytes: 600, payload_p95_bytes: 1400, payload_max_bytes: 8192}
+  book_live: {instances: 250, mean_records_per_second: "20", burst_records_in_1s: 100, payload_p50_bytes: 8192, payload_p95_bytes: 32768, payload_max_bytes: 262144}
+  ticker: {instances: 250, mean_records_per_second: "1", burst_records_in_1s: 5, payload_p50_bytes: 1200, payload_p95_bytes: 2400, payload_max_bytes: 8192}
+  bbo: {instances: 250, mean_records_per_second: "10", burst_records_in_1s: 50, payload_p50_bytes: 500, payload_p95_bytes: 1000, payload_max_bytes: 4096}
+  derivative: {instrument_instances: 125, file_instances: 250, markets: [perpetual], logical_streams_per_instrument: 2, mean_records_per_second: "2", burst_records_in_1s: 10, payload_p50_bytes: 1400, payload_p95_bytes: 3000, payload_max_bytes: 16384}
+  candle_1m: {instances: 250, mean_records_per_second: "0.5", burst_records_in_1s: 2, payload_p50_bytes: 1000, payload_p95_bytes: 2000, payload_max_bytes: 4096}
+  book_deep_snapshot: {instances: 250, mean_records_per_second: "0.0334", burst_records_in_1s: 1, payload_p50_bytes: 131072, payload_p95_bytes: 262144, payload_max_bytes: 1048576}
+  control: {instances: 5, scope: exchange, mean_records_per_second: "0.1", burst_records_in_1s: 10, payload_p50_bytes: 800, payload_p95_bytes: 2000, payload_max_bytes: 8192}
+payload_generation: {decimal_string_fraction: "0.70", repeated_key_fraction: "0.80", incompressible_fraction: "0.20"}
+queues:
+  shard_max_records: 10000
+  shard_max_bytes: 67108864
+  worker_max_bytes: 536870912
+  control_reserve_records: 1024
+  control_reserve_bytes: 8388608
+qualification:
+  warmup_seconds: 120
+  storage_health_sample_interval_seconds: 1
+  storage_health_max_gap_seconds: 2
+  max_rss_bytes: 4294967296
+  max_rss_slope_bytes_per_minute: 2097152
+  max_open_fds: 4096
+  max_fd_growth_after_warmup: 10
+  durability_lag_max_ns: 1000000000
