@@ -613,10 +613,10 @@ open_file_descriptor_count_peak, sync_inflight_peak
 
 GateResourceSummaryV1:
 schema_version, record_type, process_count, round_count, post_warmup_round_count,
-warmup_ended_monotonic_ns, resource_trend_valid, rss_peak_bytes,
-rss_slope_bytes_per_minute,
-open_fds_peak, first_open_fds_after_warmup, max_open_fds_after_warmup,
-final_open_fds_after_warmup, fd_growth_after_warmup
+warmup_ended_monotonic_ns, resource_trend_valid, first_request_monotonic_ns,
+final_completion_monotonic_ns, coverage_ns, sample_max_gap_ns, rss_peak_bytes,
+rss_slope_bytes_per_minute, open_fds_peak, first_open_fds_after_warmup,
+max_open_fds_after_warmup, final_open_fds_after_warmup, fd_growth_after_warmup
 
 GateStorageHealthSummaryV1:
 schema_version, record_type, duration_ns, interval_ns, sample_count,
@@ -644,7 +644,9 @@ all four FD facts and the RSS slope are non-null. `resource_trend_valid` is true
 exactly when at least two post-warmup rounds make both trends qualification-usable.
 Qualification requires it. OLS computes its numerator and denominator entirely with
 Python integers and performs only the final division in a newly constructed
-`Context(prec=50, rounding=ROUND_HALF_EVEN)`; no ambient Decimal context is copied.
+`Context(prec=50, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999,
+capitals=1, clamp=0, flags=[], traps=[InvalidOperation, DivisionByZero, Overflow])`;
+no ambient or mutable default Decimal context is copied.
 The warmup predicate is
 `scheduled_monotonic_ns >= warmup_ended_monotonic_ns`.
 For post-warmup pairs `(x_i, y_i)`, subtract the first scheduled time from every
@@ -658,6 +660,10 @@ only a `Decimal` or its canonical JSON string, reject booleans/integers/floats,
 non-finite values, signs, exponents, leading zeroes, and redundant fractional zeroes,
 and normalize computed values to plain base-ten notation before serialization. This
 makes strict JSONL decoding reproduce the same model and canonical bytes.
+Resource coverage is final completion minus first request start and its measured
+maximum gap uses consecutive scheduled times, with zero for one round. Task 5 aligns
+these facts with the bound admission-plus-drain sampling interval and rejects a
+truncated prefix even when that prefix contains two valid post-warmup points.
 
 Health summaries require at least one sample. The exact predicates are
 `max(2, ceil(duration_ns / interval_ns) - 1)` and required coverage
@@ -683,6 +689,10 @@ retains the completed/partial health artifact, and forbids publication of a cand
 report. A later successful sample cannot erase that failure. Because an exception is
 not a successful sample row, this fail-closed runner rule is the primary error fact;
 Task 7 tests it explicitly.
+
+All three Task 4 summary models are private, primary-derived evidence. They may be
+embedded in the private candidate/report DAG and compared against fresh recomputation,
+but are not authoritative verdicts or public disclosure models.
 
 ## 6. Runner And Candidate Report
 

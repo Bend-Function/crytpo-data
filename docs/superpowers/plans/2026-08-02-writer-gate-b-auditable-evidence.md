@@ -778,7 +778,9 @@ def test_runtime_verifier_rejects_primary_fact_mutation(tmp_path: Path,
 Mutations cover every workload/plan/trace/bucket/sample/report/inventory hash, due time,
 payload byte/SHA, attempt/completion boundary, accepted identity, duplicate ordinal,
 raw row, manifest count/hash, UTC hour, final worker field, resource limit, storage
-health gap/coverage, target claim, and serialized candidate summary.
+health gap/coverage, resource prefix/gap/coverage, target claim, and serialized
+candidate summary. Resource rounds must cover the bound admission-plus-drain sampling
+interval; two valid post-warmup points followed by a truncated artifact are rejected.
 
 - [ ] **Step 2: Run tests and verify RED**
 
