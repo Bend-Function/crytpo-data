@@ -631,7 +631,7 @@ are frozen in design section 5.5. Periodic health samples preserve independent d
 and state free-space minima but do not infer shared mounts; shared-mount floor
 accounting belongs to Task 6, where device and mount identities are available.
 
-- [ ] **Step 1: Write worker-sequence RED tests**
+- [x] **Step 1: Write worker-sequence RED tests**
 
 Build five two-sample sequences plus final CLOSED snapshots. Assert only final
 cumulative facts are summed, gauge peaks come from same-round sums, bucket vectors are
@@ -643,7 +643,7 @@ round overlap, duplicate/missing samples, decreasing counters/buckets/maxima, re
 series, equal observed time with changed bytes, and every nonzero final gauge. Permit
 byte-identical cache repeats and decreasing quantiles with monotonic cumulative buckets.
 
-- [ ] **Step 2: Write resource/health RED tests**
+- [x] **Step 2: Write resource/health RED tests**
 
 ```python
 def test_rss_ols_and_fd_growth_use_only_post_warmup_samples() -> None:
@@ -677,13 +677,13 @@ indices by one, and strictly advance scheduled times. Adjacent request intervals
 touch at one endpoint but cannot overlap. A resource or health sampling exception
 fails the runner before candidate-report publication and is covered in Task 7.
 
-- [ ] **Step 3: Run tests and verify RED**
+- [x] **Step 3: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_aggregation.py -q`
 
 Expected: FAIL because aggregation functions do not exist.
 
-- [ ] **Step 4: Implement aggregation**
+- [x] **Step 4: Implement aggregation**
 
 Expose these exact public call shapes:
 
@@ -712,7 +712,7 @@ Define `FinalWorkerAggregateV1`, `GateResourceSummaryV1`, and
 `ValidatedWorkerSequences` as an immutable internal aggregation type; use the
 canonical `GateWorkerKeyV1` at the artifact boundary.
 
-- [ ] **Step 5: Run focused tests and checks**
+- [x] **Step 5: Run focused tests and checks**
 
 Run:
 
@@ -727,7 +727,7 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 4**
+- [x] **Step 6: Commit Task 4**
 
 ```bash
 git add src/crypto_collector/benchmarks/aggregation.py \
