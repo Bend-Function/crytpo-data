@@ -131,6 +131,13 @@ and computes the digest with only that field omitted. A task must not implement 
 future model until its field order, invariants, public/private classification, and
 predecessor references are explicit in tests and the design.
 
+Task 6 is an implementation prerequisite for Task 5 even though the historical task
+numbers are retained below. Implement and review the target declaration/re-probe
+contracts first, then implement the runtime verifier against those concrete models.
+Task 5 must not substitute a boolean or an untyped mapping for target evidence. This
+ordering correction does not move runner, provenance, image, or external qualification
+work across their original boundaries.
+
 ### Task 1: Freeze Workload Schema And Baseline Bytes
 
 **Files:**
@@ -860,6 +867,12 @@ git commit -m "feat: independently verify writer gate runtime evidence"
 - Modify: `tests/performance/test_writer_durability.py`
 
 - [ ] **Step 1: Write mount/probe/declaration RED tests**
+
+Before writing implementation code, freeze the exact field order in the approved
+design for `GateRootProbeV1`, `GateTargetV1`, and `GateTargetReprobeV1`. Both target
+objects are private self-hashing documents: their `sha256` is the SHA-256 of canonical
+JSON plus one newline with only the final `sha256` field omitted. A downstream document
+reference separately hashes the complete published bytes, including that field.
 
 Test decoded mountinfo escapes (`\040`, `\011`, `\134`), component-boundary matching,
 longest mount selection, independent data/state lookups, sorted prefixed mount/super

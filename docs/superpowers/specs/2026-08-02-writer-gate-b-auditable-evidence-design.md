@@ -755,6 +755,63 @@ explicit expected target ID and rejects any declaration or re-probe mismatch.
 The declaration SHA covers its complete canonical private model with only the SHA field
 omitted. It is published once without replacement. It is never redacted in place.
 
+Task 6 is an implementation prerequisite for Task 5. The historical task numbers stay
+unchanged, but the concrete target models and re-probe implementation are completed
+before the runtime verifier; an untyped or boolean-only `TargetProbePort` is forbidden.
+
+The exact Task 6 field order is:
+
+```text
+GateRootProbeV1:
+schema_version, record_type, root, storage_device, filesystem, mount_point,
+mount_options, minimum_available_bytes, observed_available_bytes,
+no_replace_capability, same_parent_publication_only, file_sync_supported,
+directory_sync_supported
+
+GateTargetV1:
+schema_version, record_type, target_id, data_root, state_root, deployment_purpose,
+created_at_unix_ns, sha256
+
+GateTargetReprobeV1:
+schema_version, record_type, target_id, expected_target_id, declaration_sha256,
+probed_at_unix_ns, data_root, state_root, shared_mount,
+shared_required_available_bytes, shared_observed_available_bytes,
+target_id_matches, declaration_facts_match, available_space_valid, reprobe_valid,
+sha256
+```
+
+All three are strict, frozen private models. `GateRootProbeV1.root` and `mount_point`
+are lexically normalized absolute POSIX paths. The root may not be `/`; the mount point
+may. Operational APIs additionally require the root to exist, be a real directory,
+and contain no symlink component. `storage_device` is canonical unsigned
+`major:minor`. Mount options are sorted, unique, nonempty values prefixed `mount:` or
+`super:`. `minimum_available_bytes` is exactly 100 GiB, and the only accepted
+no-replace capability is the production `hardlink` primitive. All three capability
+booleans are literal true.
+
+`GateTargetV1` requires distinct roots, both individual free-space floors, and, when
+device plus mount point are shared, the conservative minimum of the two independently
+observed available-byte values to meet the sum of both floors. Its target ID is a
+bounded printable identifier, its deployment purpose is exactly `raw-writer-gate-b`,
+and `created_at_unix_ns` is a nonnegative Unix wall-clock timestamp.
+
+Re-probe records fresh complete root facts even when a comparison fails. Immutable
+fact comparison includes root, device, filesystem, mount point, options, floor, and
+capabilities, but excludes the changing available-byte observation. `shared_mount` is
+derived from equal device and mount point. The two shared-byte fields are both null
+when roots do not share a mount; otherwise they equal the sum of the two floors and
+the minimum of the two fresh observations. `target_id_matches` compares the declaration
+and caller expectation, `declaration_facts_match` compares both immutable root
+projections, `available_space_valid` applies both individual floors plus the shared
+floor, and `reprobe_valid` is exactly the conjunction of those three booleans.
+
+For both self-hashing target documents, digest input is exactly
+`encode_json(model_dump(mode="json", exclude={"sha256"})) + b"\n"`. Published
+canonical bytes include the final `sha256` field and one newline. The declaration is
+written from a same-parent unique temporary file, file-synced, hard-link-published
+without replacement, and parent-directory-synced. Probe cleanup removes every probe
+name and syncs the probed root again, including on a failed capability check.
+
 ## 8. Two-Stage Independent Verification
 
 ### 8.1 Runtime receipt
