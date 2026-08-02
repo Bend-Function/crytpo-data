@@ -747,11 +747,18 @@ git commit -m "feat: aggregate writer gate primary samples"
 
 **Files:**
 - Create: `src/crypto_collector/benchmarks/runtime_verifier.py`
+- Create: `tests/support/writer_gate_crash_child.py`
+- Create: `tests/support/writer_gate_evidence.py`
+- Create: `tests/support/writer_gate_mutations.py`
+- Create: `tests/unit/benchmarks/test_runtime_fixture.py`
+- Create: `tests/unit/benchmarks/test_runtime_verifier_interruption.py`
+- Create: `tests/unit/benchmarks/test_runtime_verifier_mutations.py`
 - Create: `tests/unit/benchmarks/test_runtime_verifier.py`
 - Modify: `src/crypto_collector/benchmarks/contracts.py`
 - Modify: `tests/performance/test_writer_durability.py`
+- Modify: `tests/unit/benchmarks/test_artifacts.py`
 
-- [ ] **Step 1: Write a passing micro-evidence fixture and mutation RED tests**
+- [x] **Step 1: Write a passing micro-evidence fixture and mutation RED tests**
 
 Before constructing the fixture, freeze every field, order, invariant, status/successor
 rule, and digest input for `GateCandidateReportV1`, `GateRunIndexV1`,
@@ -796,13 +803,13 @@ receipt truth table with exact model facts here; the full verifier qualification
 is exercised only by the opt-in target-host test and Task 10. No test-only workload or
 target bypass is permitted.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_runtime_verifier.py -q`
 
 Expected: FAIL because the verifier does not exist.
 
-- [ ] **Step 3: Implement disk-backed streaming validation**
+- [x] **Step 3: Implement disk-backed streaming validation**
 
 Expose this exact public call shape:
 
@@ -838,7 +845,7 @@ resource/health predicates, and target re-probe facts. Compare candidate summari
 only to reject disagreement. Publish the receipt and runtime index without replacement;
 remove the temporary SQLite files only after a successful directory sync.
 
-- [ ] **Step 4: Prove bounded memory and fail-closed interruption**
+- [x] **Step 4: Prove bounded memory and fail-closed interruption**
 
 Add a marked performance test that validates five generated partitions totaling one
 million synthetic rows under a test RSS bound. Unit tests use 10,000 rows. Interrupt
@@ -847,7 +854,7 @@ receipt is accepted or overwritten. An interruption before the receipt may retai
 unique partial; an interruption after receipt publication reuses that exact receipt
 and publishes only the missing runtime index.
 
-- [ ] **Step 5: Run focused tests and checks**
+- [x] **Step 5: Run focused tests and checks**
 
 Run:
 
@@ -864,7 +871,7 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 5**
+- [x] **Step 6: Commit Task 5**
 
 ```bash
 git add src/crypto_collector/benchmarks/runtime_verifier.py \
