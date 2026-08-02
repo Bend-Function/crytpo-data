@@ -6,12 +6,31 @@ from typing import Any, cast
 
 import pytest
 
+from crypto_collector.benchmarks.contracts import (
+    GateAdmissionTraceSetV1,
+    GateAdmissionTraceV1,
+    GateArtifactRefV1,
+)
 from crypto_collector.benchmarks.oracle import build_workload_plan
 from crypto_collector.benchmarks.workload import load_workload
 from crypto_collector.domain.json_codec import decode_json
 
 WORKLOAD_PATH = Path("benchmarks/workloads/research-default-v1.yaml")
 GOLDEN_PATH = Path("benchmarks/workloads/research-default-v1.golden.json")
+
+
+def test_writer_gate_foundational_artifact_surface_is_frozen() -> None:
+    assert tuple(GateArtifactRefV1.model_fields)[:3] == (
+        "schema_version",
+        "record_type",
+        "relative_path",
+    )
+    assert "planned_event_id" in GateAdmissionTraceV1.model_fields
+    assert tuple(GateAdmissionTraceSetV1.model_fields)[-3:] == (
+        "merged_row_count",
+        "merged_content_size_bytes",
+        "merged_content_sha256",
+    )
 
 
 def test_research_default_workload_has_exact_multiplier_two_cardinalities() -> None:
