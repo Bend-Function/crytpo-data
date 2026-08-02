@@ -102,7 +102,7 @@
       "declared_file_identity_count": 3505,
       "expected_touched_file_identity_count": 3172,
       "expected_payload_byte_count": 3666721024,
-      "workload_plan_sha256": "5619377d452c70f05337a55ba4cf277edfd8835cae3d2c76a88949d25fb59429",
+      "workload_plan_sha256": "adf7eb020aea5aa42ec1372dccd34316255414ee45f323de1926e8da3f46df32",
       "streams": {
         "trade": {
           "summary": {"expected_record_count": 250000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 250000, "scheduled_burst_count": 250000, "burst_second": 4, "expected_payload_byte_count": 334776688},
@@ -145,7 +145,7 @@
       "declared_file_identity_count": 3505,
       "expected_touched_file_identity_count": 3505,
       "expected_payload_byte_count": 219164642984,
-      "workload_plan_sha256": "0f29b8c50dbed9ca12899b74339e6dd45ef441678c49e202b50718c3e5738518",
+      "workload_plan_sha256": "709288d2651f74d9f46a6aa294a4240981f62c12bccb6a5f7dc59e10f3fd838d",
       "streams": {
         "trade": {"summary": {"expected_record_count": 15000000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 250000, "scheduled_burst_count": 250000, "burst_second": 86, "expected_payload_byte_count": 20106023944}},
         "book_live": {"summary": {"expected_record_count": 6000000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 50000, "scheduled_burst_count": 50000, "burst_second": 217, "expected_payload_byte_count": 191396044800}},
@@ -166,7 +166,7 @@
     "declared_file_identity_count": 15,
     "expected_touched_file_identity_count": 14,
     "expected_payload_byte_count": 11648,
-    "workload_plan_sha256": "2854f091be40a190ff419d4559316cdaa49d8bea1ae05c90d905a07f16f0ba65",
+    "workload_plan_sha256": "5dc950b2c86bda10030c14cc1289aa1fc9facc84e6f1d63b7a4db0c30fc5a531",
     "streams": {
       "trade": {
         "summary": {"expected_record_count": 20, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 4, "scheduled_burst_count": 4, "burst_second": 4, "expected_payload_byte_count": 7168},

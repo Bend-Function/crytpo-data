@@ -181,16 +181,28 @@ burst_start_ns = burst_second * 1_000_000_000
 ```
 
 Qualification requires `N >= required_B`. Functional mode may use capped `B`.
-The first `B` events in canonical identity/local-sequence enumeration all have exactly
-`due_offset_ns = burst_start_ns`; ties at that due time are ordered by planned event ID.
-They may not be attempted early and every one must complete accepted before
+For ordinary and derivative streams, each identity contributes its first
+`min(allocated_count, burst_records_in_1s)` local events. Control has five fixed
+identities while its rate scales with `M`, so each control identity instead contributes
+its first `min(allocated_count, burst_records_in_1s * M)` local events. These per-
+identity prefixes contain exactly `B` events because allocation counts differ by at
+most one. Every selected event has exactly `due_offset_ns = burst_start_ns`; ties at
+that due time are ordered by planned event ID. This prevents the canonical identity
+ordering from concentrating a nominally global burst in the first exchange. Selected
+events may not be attempted early and every one must complete accepted before
 `burst_start_ns + 1s`. This gives the last event the same full-second deadline as the
 first and directly measures admission of the whole burst.
 
+`gate-schedule-v2-full-second-burst` is frozen to this distributed-prefix definition.
+An earlier unmerged development implementation selected one global first-`B` prefix;
+it produced no target declaration, runtime receipt, or acceptance evidence, and its
+candidate hashes are not a supported schedule variant.
+
 The remaining events are distributed deterministically over the schedulable span
 excluding the burst second. Let `J = N - B`, `schedulable_ns = duration_ns - 1s`, and
-`outside_ns = schedulable_ns - 1s`. For zero-based remaining event index `j` in
-canonical identity/local-sequence order:
+`outside_ns = schedulable_ns - 1s`. Exclude the selected prefix from each identity,
+then enumerate the remaining events in canonical identity/local-sequence order. For
+zero-based remaining event index `j`:
 
 ```
 compressed = floor(j * outside_ns / J)

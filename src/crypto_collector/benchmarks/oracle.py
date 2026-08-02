@@ -904,6 +904,43 @@ def _iter_event_ids_and_ordinals(summary: StreamPlanV1) -> Iterator[tuple[str, i
         yield event_id, ordinal
 
 
+def _burst_quota_per_identity(summary: StreamPlanV1) -> int:
+    multiplier = summary.multiplier if summary.stream_group == "control" else 1
+    return summary.burst_records_in_1s * multiplier
+
+
+def _iter_burst_ordinals(summary: StreamPlanV1) -> Iterator[int]:
+    ordinal_start = 0
+    quota = _burst_quota_per_identity(summary)
+    selected_count = 0
+    for identity_index in range(summary.identity_count):
+        allocated_count = _allocated_count(summary, identity_index)
+        selected_for_identity = min(allocated_count, quota)
+        yield from range(ordinal_start, ordinal_start + selected_for_identity)
+        selected_count += selected_for_identity
+        ordinal_start += allocated_count
+    if selected_count != summary.scheduled_burst_count:
+        raise AssertionError("distributed burst count does not match stream plan")
+
+
+def _iter_smooth_ordinals(summary: StreamPlanV1) -> Iterator[int]:
+    ordinal_start = 0
+    quota = _burst_quota_per_identity(summary)
+    selected_count = 0
+    for identity_index in range(summary.identity_count):
+        allocated_count = _allocated_count(summary, identity_index)
+        selected_for_identity = min(allocated_count, quota)
+        yield from range(
+            ordinal_start + selected_for_identity,
+            ordinal_start + allocated_count,
+        )
+        selected_count += allocated_count - selected_for_identity
+        ordinal_start += allocated_count
+    expected_count = summary.expected_record_count - summary.scheduled_burst_count
+    if selected_count != expected_count:
+        raise AssertionError("smooth event count does not match stream plan")
+
+
 def _selector_lane(event_id: str, selector_name: str) -> int:
     source = f"gate-payload-v1:{event_id}:{selector_name}".encode("ascii")
     return int.from_bytes(sha256(source).digest()[:8], "big", signed=False)
@@ -1050,7 +1087,7 @@ def _build_event(scheduled: _ScheduledEvent) -> PlannedEventV1:
 def _iter_burst_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
     burst_rows = [
         (_event_facts_at(summary, ordinal)[0], ordinal)
-        for ordinal in range(summary.scheduled_burst_count)
+        for ordinal in _iter_burst_ordinals(summary)
     ]
     burst_rows.sort(key=lambda row: row[0])
     for event_id, ordinal in burst_rows:
@@ -1070,14 +1107,13 @@ def _iter_smooth_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
     outside_ns = schedulable_ns - ONE_SECOND_NS
     tie_group: list[tuple[str, int, int]] = []
     prior_due: int | None = None
-    for index in range(remaining_count):
+    for index, ordinal in enumerate(_iter_smooth_ordinals(summary)):
         compressed = index * outside_ns // remaining_count
         due_offset_ns = (
             compressed
             if compressed < summary.burst_start_ns
             else compressed + ONE_SECOND_NS
         )
-        ordinal = summary.scheduled_burst_count + index
         event_id, _, _ = _event_facts_at(summary, ordinal)
         if prior_due is not None and due_offset_ns != prior_due:
             tie_group.sort(key=lambda row: row[0])

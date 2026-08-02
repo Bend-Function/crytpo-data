@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from copy import deepcopy
 from decimal import localcontext
 from hashlib import sha256
@@ -89,6 +90,22 @@ def _micro_loaded(*, seed: int = 20260731) -> LoadedWorkload:
     streams["trade"]["burst_records_in_1s"] = 2
     streams["ticker"]["mean_records_per_second"] = "0.05"
     streams["ticker"]["burst_records_in_1s"] = 2
+    model = GateWorkloadV1.model_validate(data)
+    source = encode_json(data)
+    return LoadedWorkload(
+        workload=model,
+        source_bytes=source,
+        sha256=sha256(source).hexdigest(),
+    )
+
+
+def _micro_loaded_with_trade_rate(rate: str) -> LoadedWorkload:
+    data = cast(
+        dict[str, Any],
+        deepcopy(_micro_loaded().workload.model_dump(mode="json")),
+    )
+    streams = cast(dict[str, dict[str, Any]], data["streams"])
+    streams["trade"]["mean_records_per_second"] = rate
     model = GateWorkloadV1.model_validate(data)
     source = encode_json(data)
     return LoadedWorkload(
@@ -394,6 +411,120 @@ def test_schedule_payload_and_global_order_are_exact() -> None:
         plan.stream("ticker").expected_record_count
         < plan.stream("ticker").required_burst_count
     )
+    trade_burst = [
+        event
+        for event in events
+        if event.stream_group == "trade"
+        and event.due_offset_ns == plan.stream("trade").burst_start_ns
+    ]
+    assert Counter(event.canonical_identity for event in trade_burst) == {
+        identity.canonical_identity: 2
+        for identity in plan.stream("trade").iter_identities()
+    }
+    assert {
+        identity.canonical_identity: sorted(
+            event.local_sequence
+            for event in trade_burst
+            if event.canonical_identity == identity.canonical_identity
+        )
+        for identity in plan.stream("trade").iter_identities()
+    } == {
+        identity.canonical_identity: [0, 1]
+        for identity in plan.stream("trade").iter_identities()
+    }
+
+
+def test_qualification_burst_is_evenly_distributed_across_identities() -> None:
+    plan = build_workload_plan(
+        load_workload(WORKLOAD),
+        multiplier=2,
+        duration_ns=600_000_000_000,
+    )
+    summary = plan.stream("trade")
+    scheduled = tuple(oracle_module._iter_burst_schedule(summary))
+    identities = [
+        oracle_module._event_facts_at(summary, item.ordinal)[1] for item in scheduled
+    ]
+
+    assert Counter(item.identity_index for item in identities) == {
+        identity_index: 500 for identity_index in range(500)
+    }
+    assert Counter(item.exchange.value for item in identities) == {
+        exchange: 50_000 for exchange in ("binance", "okx", "bybit", "bitget", "kraken")
+    }
+
+
+def test_burst_and_smooth_ordinals_partition_every_stream_exactly() -> None:
+    plan = build_workload_plan(
+        _micro_loaded(), multiplier=1, duration_ns=10_000_000_000
+    )
+
+    for summary in plan.streams:
+        burst = tuple(oracle_module._iter_burst_ordinals(summary))
+        smooth = tuple(oracle_module._iter_smooth_ordinals(summary))
+        assert set(burst).isdisjoint(smooth)
+        assert sorted((*burst, *smooth)) == list(range(summary.expected_record_count))
+
+
+@pytest.mark.parametrize("rate", ["0.05", "0.15", "0.2", "0.25", "0.35"])
+def test_distributed_burst_is_each_identity_local_prefix(rate: str) -> None:
+    summary = build_workload_plan(
+        _micro_loaded_with_trade_rate(rate),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    ).stream("trade")
+    burst_by_identity: dict[int, list[int]] = {
+        index: [] for index in range(summary.identity_count)
+    }
+    smooth_by_identity: dict[int, list[int]] = {
+        index: [] for index in range(summary.identity_count)
+    }
+    for ordinal in oracle_module._iter_burst_ordinals(summary):
+        _, identity, local_sequence = oracle_module._event_facts_at(summary, ordinal)
+        burst_by_identity[identity.identity_index].append(local_sequence)
+    for ordinal in oracle_module._iter_smooth_ordinals(summary):
+        _, identity, local_sequence = oracle_module._event_facts_at(summary, ordinal)
+        smooth_by_identity[identity.identity_index].append(local_sequence)
+
+    for identity in summary.iter_identities():
+        boundary = min(
+            identity.allocated_event_count,
+            summary.burst_records_in_1s,
+        )
+        assert burst_by_identity[identity.identity_index] == list(range(boundary))
+        assert smooth_by_identity[identity.identity_index] == list(
+            range(boundary, identity.allocated_event_count)
+        )
+
+
+def test_control_burst_quota_scales_without_scaling_identities() -> None:
+    loaded = _micro_loaded()
+    data = cast(dict[str, Any], deepcopy(loaded.workload.model_dump(mode="json")))
+    streams = cast(dict[str, dict[str, Any]], data["streams"])
+    streams["control"]["mean_records_per_second"] = "1"
+    model = GateWorkloadV1.model_validate(data)
+    source = encode_json(data)
+    plan = build_workload_plan(
+        LoadedWorkload(
+            workload=model,
+            source_bytes=source,
+            sha256=sha256(source).hexdigest(),
+        ),
+        multiplier=2,
+        duration_ns=10_000_000_000,
+    )
+    summary = plan.stream("control")
+
+    assert summary.identity_count == 1
+    assert summary.scheduled_burst_count == 2
+    assert [
+        oracle_module._event_facts_at(summary, ordinal)[2]
+        for ordinal in oracle_module._iter_burst_ordinals(summary)
+    ] == [0, 1]
+    assert [
+        oracle_module._event_facts_at(summary, ordinal)[2]
+        for ordinal in oracle_module._iter_smooth_ordinals(summary)
+    ] == list(range(2, 20))
 
 
 @pytest.mark.parametrize("target_second", [0, 8])
