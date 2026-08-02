@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from decimal import Decimal
@@ -74,6 +75,18 @@ def test_loaded_workload_and_models_are_frozen_and_loaded_workload_uses_slots() 
     with pytest.raises(ValidationError):
         loaded.workload.generation_seed = 1
     assert not hasattr(loaded, "__dict__")
+
+
+def test_loaded_workload_nested_mappings_are_immutable_and_serializable() -> None:
+    loaded = load_workload(WORKLOAD)
+
+    with pytest.raises(TypeError):
+        loaded.workload.stream_transports["trade"] = "rest"
+    with pytest.raises(TypeError):
+        del loaded.workload.streams["trade"]
+
+    dumped = loaded.workload.model_dump(mode="json")
+    assert GateWorkloadV1.model_validate(dumped) == loaded.workload
 
 
 @pytest.mark.parametrize("value", [1.0, True, "1.0", {"unexpected": 1}])
@@ -316,6 +329,32 @@ def test_load_workload_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="symbolic link"):
         load_workload(link)
+
+
+def test_load_workload_rejects_file_swapped_to_symlink_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_bytes(tmp_path / "workload.yaml", WORKLOAD.read_bytes())
+    target = _write_bytes(tmp_path / "target.yaml", WORKLOAD.read_bytes())
+    original_open = os.open
+
+    def swap_then_open(
+        candidate: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if str(candidate) == str(path):
+            path.unlink()
+            path.symlink_to(target)
+        return original_open(candidate, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_workload(path)
 
 
 def test_load_workload_rejects_non_regular_files(tmp_path: Path) -> None:

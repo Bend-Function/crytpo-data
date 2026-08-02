@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import math
+import os
 import re
 import stat
 from collections.abc import Mapping
@@ -8,6 +10,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import (
@@ -16,6 +19,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -242,11 +246,11 @@ class GateWorkloadV1(_FrozenStrictModel):
     identity_algorithm: Literal["gate-identity-v1"]
     payload_algorithm: Literal["gate-payload-v1"]
     schedule_algorithm: Literal["gate-schedule-v2-full-second-burst"]
-    stream_transports: dict[LogicalStreamName, StreamTransport]
+    stream_transports: Mapping[LogicalStreamName, StreamTransport]
     fixed_scope_file_count: PositiveInt
     scalable_file_count: PositiveInt
     active_file_count: PositiveInt
-    streams: dict[StreamGroupName, StreamDefinitionV1]
+    streams: Mapping[StreamGroupName, StreamDefinitionV1]
     payload_generation: _PayloadGenerationV1
     queues: _QueueLimitsV1
     qualification: _QualificationLimitsV1
@@ -287,6 +291,36 @@ class GateWorkloadV1(_FrozenStrictModel):
             name: _STREAM_MODELS[name].model_validate(value[name])
             for name in names
         }
+
+    @field_validator("stream_transports", mode="after")
+    @classmethod
+    def freeze_stream_transports(
+        cls,
+        value: Mapping[LogicalStreamName, StreamTransport],
+    ) -> Mapping[LogicalStreamName, StreamTransport]:
+        return MappingProxyType(dict(value))
+
+    @field_validator("streams", mode="after")
+    @classmethod
+    def freeze_streams(
+        cls,
+        value: Mapping[StreamGroupName, StreamDefinitionV1],
+    ) -> Mapping[StreamGroupName, StreamDefinitionV1]:
+        return MappingProxyType(dict(value))
+
+    @field_serializer("stream_transports")
+    def serialize_stream_transports(
+        self,
+        value: Mapping[LogicalStreamName, StreamTransport],
+    ) -> dict[LogicalStreamName, StreamTransport]:
+        return dict(value)
+
+    @field_serializer("streams")
+    def serialize_streams(
+        self,
+        value: Mapping[StreamGroupName, StreamDefinitionV1],
+    ) -> dict[StreamGroupName, StreamDefinitionV1]:
+        return dict(value)
 
     @model_validator(mode="after")
     def validate_scope_and_cardinalities(self) -> Self:
@@ -483,18 +517,25 @@ def _parse_yaml_mapping(source_bytes: bytes, *, path: Path) -> dict[str, Any]:
 
 
 def _read_source_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        metadata = path.lstat()
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"{path}: workload must not be a symbolic link") from error
+        raise ValueError(f"{path}: workload is not a readable regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{path}: workload must be a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
     except OSError as error:
         raise ValueError(f"{path}: workload is not a readable regular file") from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise ValueError(f"{path}: workload must not be a symbolic link")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"{path}: workload must be a regular file")
-    try:
-        return path.read_bytes()
-    except OSError as error:
-        raise ValueError(f"{path}: workload is not a readable regular file") from error
+    finally:
+        os.close(descriptor)
 
 
 def load_workload(path: Path) -> LoadedWorkload:
