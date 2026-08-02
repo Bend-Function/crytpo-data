@@ -486,7 +486,7 @@ git commit -m "feat: partition writer gate events by exchange"
 - Create: `tests/unit/benchmarks/test_artifacts.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write strict-model and canonical-codec RED tests**
+- [x] **Step 1: Write strict-model and canonical-codec RED tests**
 
 Create model fixtures and assert:
 
@@ -515,7 +515,7 @@ violations, noncanonical JSON bytes, missing final newline, trailing bytes, malf
 zstd, accepted/nonaccepted identity disagreement, incomplete worker/process rounds,
 and unstable process IDs.
 
-- [ ] **Step 2: Write partitioned-hash and no-replace RED tests**
+- [x] **Step 2: Write partitioned-hash and no-replace RED tests**
 
 Create five small exchange partitions and assert:
 
@@ -533,7 +533,7 @@ temp sync/close precedes hard-link publication, directory sync follows, failed w
 retain `.partial` evidence, and partial files never parse as completed evidence. The
 complete one-way hash-DAG test moves to Task 8, when every node actually exists.
 
-- [ ] **Step 3: Run tests and verify RED**
+- [x] **Step 3: Run tests and verify RED**
 
 Run:
 
@@ -543,7 +543,7 @@ Run:
 
 Expected: FAIL because contracts and artifact writers do not exist.
 
-- [ ] **Step 4: Implement frozen contracts and canonical artifacts**
+- [x] **Step 4: Implement frozen contracts and canonical artifacts**
 
 Define only these strict version-one models in the exact approved field order:
 
@@ -593,7 +593,7 @@ heap merge validation without writing a sixth trace. Reuse the production
 `NoReplaceCapability.HARDLINK` semantics explicitly; do not depend on the Linux
 renameat2 default and do not add rename-overwrite fallbacks.
 
-- [ ] **Step 5: Run focused tests and checks**
+- [x] **Step 5: Run focused tests and checks**
 
 Run:
 
@@ -609,7 +609,7 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 3**
+- [x] **Step 6: Commit Task 3**
 
 ```bash
 git add src/crypto_collector/benchmarks/contracts.py \
