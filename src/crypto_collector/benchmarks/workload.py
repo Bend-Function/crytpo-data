@@ -45,7 +45,12 @@ _ORDINARY_STREAMS = (
     "candle_1m",
     "book_deep_snapshot",
 )
-_STREAM_GROUPS = (*_ORDINARY_STREAMS[:4], "derivative", *_ORDINARY_STREAMS[4:], "control")
+_STREAM_GROUPS = (
+    *_ORDINARY_STREAMS[:4],
+    "derivative",
+    *_ORDINARY_STREAMS[4:],
+    "control",
+)
 
 
 def _tuple(value: object) -> object:
@@ -137,9 +142,7 @@ class _PayloadSizedStreamV1(_FrozenStrictModel):
     @model_validator(mode="after")
     def validate_payload_sizes(self) -> Self:
         if not (
-            self.payload_p50_bytes
-            <= self.payload_p95_bytes
-            <= self.payload_max_bytes
+            self.payload_p50_bytes <= self.payload_p95_bytes <= self.payload_max_bytes
         ):
             raise ValueError("payload sizes must be ordered p50 <= p95 <= max")
         return self
@@ -288,8 +291,7 @@ class GateWorkloadV1(_FrozenStrictModel):
         if len(names) != len(_STREAM_GROUPS) or set(names) != set(_STREAM_GROUPS):
             raise ValueError("streams must contain exactly the version-one groups")
         return {
-            name: _STREAM_MODELS[name].model_validate(value[name])
-            for name in names
+            name: _STREAM_MODELS[name].model_validate(value[name]) for name in names
         }
 
     @field_validator("stream_transports", mode="after")
@@ -369,17 +371,14 @@ class GateWorkloadV1(_FrozenStrictModel):
         if tuple(derivative.markets) != ("perpetual",):
             raise ValueError("derivative markets must be exactly perpetual")
         expected_derivative_instruments = (
-            len(self.exchanges)
-            * len(derivative.markets)
-            * self.symbols_per_market
+            len(self.exchanges) * len(derivative.markets) * self.symbols_per_market
         )
         if derivative.instrument_instances != expected_derivative_instruments:
             raise ValueError(
                 "derivative instrument instances must match the declared scope"
             )
         if (
-            derivative.instrument_instances
-            * derivative.logical_streams_per_instrument
+            derivative.instrument_instances * derivative.logical_streams_per_instrument
             != derivative.file_instances
         ):
             raise ValueError(

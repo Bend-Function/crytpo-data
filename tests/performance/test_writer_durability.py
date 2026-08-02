@@ -58,8 +58,7 @@ def _cardinalities(
         touched_file_count += min(count, identity_count)
 
     declared_file_count = (
-        workload.fixed_scope_file_count
-        + multiplier * workload.scalable_file_count
+        workload.fixed_scope_file_count + multiplier * workload.scalable_file_count
     )
     return record_count, touched_file_count, declared_file_count
 

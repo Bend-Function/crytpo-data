@@ -57,10 +57,7 @@ def test_research_default_v1_freezes_scope_algorithms_and_source_bytes() -> None
     )
     assert loaded.workload.identity_algorithm == "gate-identity-v1"
     assert loaded.workload.payload_algorithm == "gate-payload-v1"
-    assert (
-        loaded.workload.schedule_algorithm
-        == "gate-schedule-v2-full-second-burst"
-    )
+    assert loaded.workload.schedule_algorithm == "gate-schedule-v2-full-second-burst"
     assert loaded.workload.streams["trade"].mean_records_per_second == Decimal(50)
     assert loaded.workload.fixed_scope_file_count == 5
     assert loaded.workload.scalable_file_count == 1_750
