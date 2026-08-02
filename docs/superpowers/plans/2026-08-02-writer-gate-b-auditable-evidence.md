@@ -1,0 +1,1110 @@
+# Writer Gate B Auditable Evidence Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a deterministic writer-only durability benchmark whose final qualification verdict is independently reproducible from primary runtime, raw-storage, target, source, wheel, and container evidence.
+
+**Architecture:** A strict workload loader feeds a streaming deterministic oracle. The production runner records primary artifacts while using only public `RawWriterService` APIs; a fresh-process runtime verifier recomputes storage facts, and a host-side provenance verifier binds the exact source and executed image. Candidate reports never self-qualify; only the final acceptance receipt can set `qualification_accepted=true`.
+
+**Tech Stack:** Python 3.11, asyncio, Pydantic v2, ruamel.yaml, simplejson, zstandard, SQLite, Typer, pytest, Ruff, mypy, POSIX/Linux filesystem APIs, Docker/BuildKit, Git.
+
+---
+
+## Authority And Execution Rules
+
+This plan supersedes only Task 7 in
+`docs/superpowers/plans/2026-07-31-durable-raw-storage.md`. The approved design is
+`docs/superpowers/specs/2026-08-02-writer-gate-b-auditable-evidence-design.md`.
+Tasks 1-6 of Plan02 remain implemented at commit `4927ac1`; design commit `f640d93`
+is the base for this plan.
+
+Execute in `/Users/funcma/Project/crytpo-data/.worktrees/plan02-durable-storage` on
+branch `codex/plan02-durable-storage`. Do not stage unrelated files. The existing
+untracked workload/package/RED-test files are the Task 1 starting point, not evidence
+of completion.
+
+For every implementation task:
+
+1. A fresh implementer subagent follows the listed RED/GREEN steps and commits.
+2. A fresh specification reviewer checks the commit against this plan and the design.
+3. A fresh code-quality reviewer checks correctness, strictness, tests, and scope.
+4. Findings are fixed with new commits; published commits are not amended.
+5. Focused tests, Ruff, mypy, and `git diff --check` pass before push.
+
+No target report, runtime receipt, or evidence disclosure is committed until a real
+Linux target and immutable evidence backend satisfy Task 10. Docker Desktop results
+are implementation/reproducibility checks only.
+
+## File Map
+
+- `src/crypto_collector/benchmarks/workload.py`: strict workload models, YAML loading,
+  raw-byte SHA, cross-field reconciliation.
+- `src/crypto_collector/benchmarks/contracts.py`: versioned frozen primary-artifact,
+  report, receipt, inventory, and disclosure models.
+- `src/crypto_collector/benchmarks/oracle.py`: identities, allocation, payloads,
+  schedules, plan summaries, streaming plan hash.
+- `src/crypto_collector/benchmarks/artifacts.py`: canonical JSON/JSONL, zstd transport,
+  streaming hashes, no-replace publication, evidence hash DAG.
+- `src/crypto_collector/benchmarks/aggregation.py`: worker-round validation,
+  final-only aggregation, histograms, RSS/FD/storage-health calculations.
+- `src/crypto_collector/benchmarks/runtime_verifier.py`: trace/oracle/raw/manifest
+  replay, SQLite joins, runtime receipt.
+- `src/crypto_collector/benchmarks/target.py`: Linux mount lookup, sync/hard-link
+  probes, target declaration and re-probe.
+- `src/crypto_collector/benchmarks/runner.py`: production writer orchestration and
+  candidate artifact generation.
+- `src/crypto_collector/benchmarks/provenance.py`: source archive, wheel/image,
+  container, immutable archive, acceptance receipt, and disclosure checks.
+- `src/crypto_collector/benchmarks/writer.py`: Typer CLI facade only.
+- `benchmarks/workloads/research-default-v1.yaml`: immutable workload input.
+- `benchmarks/workloads/research-default-v1.golden.json`: reviewed literal vectors.
+- `tests/unit/benchmarks/`: pure contract, oracle, artifact, aggregation, target,
+  verifier, runner, and provenance tests.
+- `tests/integration/benchmarks/test_writer_functional.py`: production-path micro and
+  exact 10-second functional tests.
+- `tests/performance/test_writer_durability.py`: complete Gate B contract and opt-in
+  target-host qualification test.
+- `scripts/reproduce-writer-image.sh`: two clean-source reproducible builds and checks.
+- `Dockerfile`, `.dockerignore`: pinned collector image.
+- `docs/operations/writer-benchmark.md`: implementation, target, validation, archive,
+  disclosure, and failure runbook.
+
+### Task 1: Freeze Workload Schema And Baseline Bytes
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/__init__.py`
+- Create: `src/crypto_collector/benchmarks/workload.py`
+- Create: `benchmarks/workloads/research-default-v1.yaml`
+- Create: `tests/unit/benchmarks/__init__.py`
+- Create: `tests/unit/benchmarks/test_workload.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Replace the import-only RED test with strict workload tests**
+
+Add tests that import only the intended public loader and models:
+
+```python
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from crypto_collector.benchmarks.workload import (
+    RESEARCH_DEFAULT_V1_SHA256,
+    GateWorkloadV1,
+    load_workload,
+)
+
+WORKLOAD = Path("benchmarks/workloads/research-default-v1.yaml")
+
+
+def test_research_default_v1_freezes_scope_and_algorithms() -> None:
+    loaded = load_workload(WORKLOAD)
+    assert loaded.sha256 == RESEARCH_DEFAULT_V1_SHA256
+    assert loaded.workload.exchanges == (
+        "binance", "okx", "bybit", "bitget", "kraken"
+    )
+    assert loaded.workload.markets == ("spot", "perpetual")
+    assert loaded.workload.derivative_logical_streams == (
+        "funding", "open_interest"
+    )
+    assert loaded.workload.identity_algorithm == "gate-identity-v1"
+    assert loaded.workload.payload_algorithm == "gate-payload-v1"
+    assert loaded.workload.schedule_algorithm == (
+        "gate-schedule-v2-full-second-burst"
+    )
+    assert loaded.workload.streams["trade"].mean_records_per_second == Decimal("50")
+    assert loaded.workload.fixed_scope_file_count == 5
+    assert loaded.workload.scalable_file_count == 1_750
+    assert loaded.workload.active_file_count == 1_755
+
+
+@pytest.mark.parametrize("value", [1.0, True, "1.0", {"unexpected": 1}])
+def test_workload_rejects_noncanonical_schema_version(value: object) -> None:
+    with pytest.raises((TypeError, ValidationError, ValueError)):
+        GateWorkloadV1.model_validate({"schema_version": value})
+```
+
+Also test duplicate exchange/market/derivative names, unknown transport, non-string
+rates/fractions, non-finite/negative decimals, `instrument_instances *
+logical_streams_per_instrument != file_instances`, and every mismatch among fixed,
+scalable, and active counts.
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_workload.py \
+  tests/performance/test_writer_durability.py -q
+```
+
+Expected: collection fails because `crypto_collector.benchmarks.workload` does not
+exist.
+
+- [ ] **Step 3: Commit the exact baseline YAML shape**
+
+Extend the already-created baseline values with these exact top-level keys:
+
+```yaml
+schema_version: 1
+name: research-default-v1
+generation_seed: 20260731
+exchanges: [binance, okx, bybit, bitget, kraken]
+markets: [spot, perpetual]
+symbols_per_market: 25
+derivative_logical_streams: [funding, open_interest]
+identity_algorithm: gate-identity-v1
+payload_algorithm: gate-payload-v1
+schedule_algorithm: gate-schedule-v2-full-second-burst
+stream_transports:
+  trade: websocket
+  book_live: websocket
+  ticker: websocket
+  bbo: websocket
+  funding: websocket
+  open_interest: websocket
+  candle_1m: websocket
+  book_deep_snapshot: rest
+  _control: internal
+```
+
+Retain the exact stream rates/sizes, payload fractions, queue settings, and
+qualification limits from the approved design and prior Task 7 snippet. Remove the
+redundant `exchange_workers` and `markets_per_worker` keys because the explicit tuples
+are authoritative.
+
+- [ ] **Step 4: Implement the strict loader**
+
+Use frozen strict Pydantic models and `ruamel.yaml.YAML(typ="safe", pure=True)`.
+Expose exactly this public shape:
+
+```text
+LoadedWorkload(workload: GateWorkloadV1, source_bytes: bytes, sha256: str)
+load_workload(path: Path) -> LoadedWorkload
+```
+
+`LoadedWorkload` is a frozen slotted dataclass. `load_workload` performs the byte read,
+hash, strict YAML parse, model validation, and cross-field reconciliation before
+constructing it.
+
+Reject symlinks, non-files, invalid UTF-8, duplicate YAML keys, multi-document YAML,
+non-mapping roots, extra fields, booleans-as-integers, and all cross-field cardinality
+errors. Compute SHA-256 over exact source bytes before parsing. Set
+`RESEARCH_DEFAULT_V1_SHA256` to the lowercase digest printed by:
+
+```bash
+shasum -a 256 benchmarks/workloads/research-default-v1.yaml
+```
+
+- [ ] **Step 5: Run focused tests and static checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_workload.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks tests/unit/benchmarks \
+  tests/performance/test_writer_durability.py
+.venv/bin/mypy src/crypto_collector/benchmarks
+git diff --check
+```
+
+Expected: PASS. Keep Task 2 oracle imports out of the performance test until Task 2
+Step 1 creates its next RED state.
+
+- [ ] **Step 6: Commit Task 1**
+
+```bash
+git add src/crypto_collector/benchmarks/__init__.py \
+  src/crypto_collector/benchmarks/workload.py \
+  benchmarks/workloads/research-default-v1.yaml \
+  tests/unit/benchmarks tests/performance/test_writer_durability.py
+git commit -m "feat: freeze writer gate workload contract"
+```
+
+### Task 2: Implement The Streaming Identity, Count, Schedule, And Payload Oracle
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/oracle.py`
+- Create: `benchmarks/workloads/research-default-v1.golden.json`
+- Create: `tests/unit/benchmarks/test_oracle.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write identity, count, and touched-cardinality RED tests**
+
+```python
+def test_multiplier_two_exact_counts_and_touched_files() -> None:
+    plan = build_workload_plan(load_workload(WORKLOAD), multiplier=2,
+                               duration_ns=10_000_000_000)
+    assert plan.expected_record_count == 417_677
+    assert plan.declared_file_identity_count == 3_505
+    assert plan.expected_touched_file_identity_count == 3_172
+    assert plan.stream("trade").expected_record_count == 250_000
+    assert plan.stream("book_deep_snapshot").expected_record_count == 167
+    assert plan.stream("control").expected_record_count == 10
+
+
+def test_qualification_plan_touches_every_declared_identity() -> None:
+    plan = build_workload_plan(load_workload(WORKLOAD), multiplier=2,
+                               duration_ns=600_000_000_000)
+    assert plan.expected_record_count == 25_060_620
+    assert plan.expected_touched_file_identity_count == 3_505
+```
+
+Assert the first ordinary identity is
+`gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:trade`, the first
+derivative identities are `funding` then `open_interest`, the final fixed identity is
+`gate-identity-v1:kraken:-:-:_control`, allocation is `q+1` for the first `r`
+identities, and local sequences are contiguous from zero.
+
+- [ ] **Step 2: Write schedule and payload RED tests**
+
+Use a compact strict test workload and assert:
+
+```python
+assert all(event.due_offset_ns == burst_start for event in burst_events)
+assert all(event.deadline_offset_ns == burst_start + 1_000_000_000
+           for event in burst_events)
+assert tuple(events) == tuple(sorted(events,
+                                    key=lambda item: (item.due_offset_ns,
+                                                      item.planned_event_id)))
+assert max(event.deadline_offset_ns for event in events) <= duration_ns
+assert len(encode_json(event.payload)) == event.payload_bytes
+assert sha256(encode_json(event.payload)).hexdigest() == event.payload_sha256
+```
+
+Cover `N > B`, `N == B`, functional `N < required_B`, burst seconds zero and the final
+schedulable second, equal-due event-ID ordering, multiplier/identity overflow, and
+non-integral/sub-10-second duration rejection.
+
+- [ ] **Step 3: Run tests and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_oracle.py \
+  tests/performance/test_writer_durability.py -q
+```
+
+Expected: FAIL because `build_workload_plan` and oracle types do not exist.
+
+- [ ] **Step 4: Implement immutable summaries and streaming iterators**
+
+Expose these exact public call shapes:
+
+```text
+build_workload_plan(loaded: LoadedWorkload, *, multiplier: int,
+                    duration_ns: int) -> WorkloadPlanV1
+iter_plan_events(plan: WorkloadPlanV1) -> Iterator[PlannedEventV1]
+build_native_draft(event: PlannedEventV1, *, admission_started_utc_ns: int)
+    -> tuple[NativeEventDraft, SourceContext, str]
+```
+
+Implement exact Decimal/ceiling math, explicit identity ordering, zero-based
+allocation, SHA event IDs, full-second burst schedule, payload selectors/padding, and
+the deterministic `NativeEventDraft`/source/shard profile in design sections 4.2-4.7.
+Use at most one per-stream burst tie group plus one event per stream in memory; merge
+the fixed stream iterators with `heapq.merge`.
+
+Hash `WorkloadPlanHeaderV1`, declared-order stream summaries, and globally merged
+`PlannedEventV1` canonical lines. Never materialize the 10-minute plan.
+
+- [ ] **Step 5: Add literal golden vectors**
+
+The JSON file must contain exact 10-second and 10-minute summary counts, the fixed
+3,172/3,505 touched counts, per-stream burst seconds/counts, selected identity/event/
+payload hashes, and complete payloads only for the <=1,024-byte micro profile. Generate
+candidate values with a one-off independent reference command, review each against the
+design formula, then type the literals into JSON. Production code must not contain a
+golden-file writer.
+
+Normal unit tests validate micro and 10-second vectors. Mark the full 10-minute
+streamed plan-hash test `@pytest.mark.performance` so the offline suite stays bounded.
+
+- [ ] **Step 6: Run focused and property tests**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_oracle.py -q
+.venv/bin/python -m pytest tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/oracle.py \
+  tests/unit/benchmarks/test_oracle.py
+.venv/bin/mypy src/crypto_collector/benchmarks/oracle.py
+git diff --check
+```
+
+Expected: PASS, including exact `417677`, `25060620`, `3172`, and `3505` facts.
+
+- [ ] **Step 7: Commit Task 2**
+
+```bash
+git add src/crypto_collector/benchmarks/oracle.py \
+  benchmarks/workloads/research-default-v1.golden.json \
+  tests/unit/benchmarks/test_oracle.py tests/performance/test_writer_durability.py
+git commit -m "feat: add deterministic writer gate oracle"
+```
+
+### Task 3: Define Primary Artifacts And The One-Way Hash DAG
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/contracts.py`
+- Create: `src/crypto_collector/benchmarks/artifacts.py`
+- Create: `tests/unit/benchmarks/test_artifacts.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write strict-model and canonical-codec RED tests**
+
+Create model fixtures and assert:
+
+```python
+def test_trace_identity_status_and_timestamps_are_strict() -> None:
+    accepted = trace_row(enqueue_status="accepted", accepted_identity=identity())
+    assert GateAdmissionTraceV1.model_validate(accepted).accepted_identity is not None
+    with pytest.raises(ValidationError):
+        GateAdmissionTraceV1.model_validate({**accepted,
+            "admission_completed_monotonic_ns":
+                accepted["attempt_started_monotonic_ns"] - 1})
+    with pytest.raises(ValidationError):
+        GateAdmissionTraceV1.model_validate({**accepted,
+            "enqueue_status": "overflow", "accepted_identity": identity()})
+
+
+def test_semantic_hash_ignores_zstd_frame_variation(tmp_path: Path) -> None:
+    first = write_trace(tmp_path / "a.zst", rows(), zstd_level=3)
+    second = write_trace(tmp_path / "b.zst", rows(), zstd_level=19)
+    assert first.content_sha256 == second.content_sha256
+    assert first.compressed_sha256 != second.compressed_sha256
+```
+
+Reject bool/int confusion, extra fields, invalid SHA/image IDs, duplicate/sorted-key
+violations, noncanonical JSON bytes, missing final newline, trailing bytes, malformed
+zstd, and accepted/nonaccepted identity disagreement.
+
+- [ ] **Step 2: Write hash-DAG and no-replace RED tests**
+
+Assert the exact predecessor chain:
+
+```python
+assert runtime_receipt.run_index_sha256 == run_index.sha256
+assert runtime_index.runtime_receipt_sha256 == runtime_receipt.sha256
+assert provenance.runtime_index_sha256 == runtime_index.sha256
+assert acceptance.provenance_receipt_sha256 == provenance.sha256
+assert disclosure.acceptance_receipt_sha256 == acceptance.sha256
+```
+
+Test that a later node cannot refer to itself/future nodes, existing destinations are
+never overwritten, temp sync precedes hard-link publication, directory sync follows,
+and partial files never parse as completed evidence.
+
+- [ ] **Step 3: Run tests and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_artifacts.py -q
+```
+
+Expected: FAIL because contracts and artifact writers do not exist.
+
+- [ ] **Step 4: Implement frozen contracts and canonical artifacts**
+
+Define strict version-one models for:
+
+```text
+GateAdmissionTraceV1, GateSecondBucketV1, GateWorkerSampleV1,
+GateSamplingRoundV1, GateResourceSampleV1, GateStorageHealthSampleV1,
+GateCandidateReportV1, GateRunIndexV1, GateRuntimeReceiptV1,
+GateRuntimeIndexV1, GateFileInventoryV1, GateArchiveManifestV1,
+GateArchiveAttestationV1, GateProvenanceReceiptV1,
+GateAcceptanceReceiptV1, GateEvidenceDisclosureV1
+```
+
+Each SHA-bearing model exposes `canonical_bytes()` and computes its digest with its own
+digest field omitted. Paths stored in evidence are normalized POSIX-relative strings;
+private absolute target paths appear only in target/report models.
+
+Implement streaming JSONL/zstd read/write with content and compressed SHA-256 values,
+where canonical JSONL is exactly `encode_json(model_dump(mode="json")) + b"\n"`.
+Require strict canonical-byte comparison after model parsing, bounded decompression, and
+same-parent sync/hard-link/directory-sync publication. Reuse the production
+`NoReplaceCapability.HARDLINK` semantics; do not add rename-overwrite fallbacks.
+
+- [ ] **Step 5: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_artifacts.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/contracts.py \
+  src/crypto_collector/benchmarks/artifacts.py tests/unit/benchmarks/test_artifacts.py
+.venv/bin/mypy src/crypto_collector/benchmarks/contracts.py \
+  src/crypto_collector/benchmarks/artifacts.py
+git diff --check
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit Task 3**
+
+```bash
+git add src/crypto_collector/benchmarks/contracts.py \
+  src/crypto_collector/benchmarks/artifacts.py \
+  tests/unit/benchmarks/test_artifacts.py tests/performance/test_writer_durability.py
+git commit -m "feat: add writer gate evidence artifacts"
+```
+
+### Task 4: Validate Worker Rounds, Final-Only Aggregation, And Resource Samples
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/aggregation.py`
+- Create: `tests/unit/benchmarks/test_aggregation.py`
+- Modify: `src/crypto_collector/benchmarks/contracts.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write worker-sequence RED tests**
+
+Build five two-sample sequences plus final CLOSED snapshots. Assert only final
+cumulative facts are summed, gauge peaks come from same-round sums, bucket vectors are
+elementwise sums, max is the maximum final worker max, and p50/p95/p99 are recomputed
+with production histogram bounds.
+
+Mutation tests must reject worker/config replacement, missing/sixth/duplicate workers,
+round overlap, duplicate/missing samples, decreasing counters/buckets/maxima, removed
+series, equal observed time with changed bytes, and every nonzero final gauge. Permit
+byte-identical cache repeats and decreasing quantiles with monotonic cumulative buckets.
+
+- [ ] **Step 2: Write resource/health RED tests**
+
+```python
+def test_rss_ols_and_fd_growth_use_only_post_warmup_samples() -> None:
+    summary = summarize_resources(samples(), warmup_ended_monotonic_ns=120)
+    assert summary.rss_slope_bytes_per_minute == Decimal("120")
+    assert summary.fd_growth_after_warmup == 3
+
+
+def test_storage_health_rejects_burst_sampling() -> None:
+    summary = summarize_storage_health(bunched_samples(), duration_ns=600,
+                                       interval_ns=10)
+    assert summary.sample_count >= summary.expected_min_sample_count
+    assert summary.coverage_valid is False
+```
+
+Cover negative OLS slope flooring to zero, one/zero post-warmup samples, exact Decimal
+conversion, scheduled-time gaps, completion coverage, two independent root `statvfs`
+facts, and shared-root free-space treatment.
+
+- [ ] **Step 3: Run tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_aggregation.py -q`
+
+Expected: FAIL because aggregation functions do not exist.
+
+- [ ] **Step 4: Implement aggregation**
+
+Expose these exact public call shapes:
+
+```text
+validate_worker_rounds(rounds: Iterable[GateSamplingRoundV1], *,
+                       expected_workers: Sequence[WorkerKey])
+    -> ValidatedWorkerSequences
+aggregate_final_worker_snapshots(sequences: ValidatedWorkerSequences)
+    -> FinalWorkerAggregateV1
+summarize_resources(samples: Iterable[GateResourceSampleV1], *,
+                    warmup_ended_monotonic_ns: int)
+    -> GateResourceSummaryV1
+summarize_storage_health(samples: Iterable[GateStorageHealthSampleV1], *,
+                         duration_ns: int, interval_ns: int)
+    -> GateStorageHealthSummaryV1
+```
+
+Use canonical snapshot bytes for equal-time comparisons, explicit cumulative/max/gauge
+field tuples, and the repository durability histogram bounds. Do not introspect
+`RawWriterService` internals.
+
+Define `FinalWorkerAggregateV1`, `GateResourceSummaryV1`, and
+`GateStorageHealthSummaryV1` as frozen strict models in `contracts.py`. Keep
+`WorkerKey` and `ValidatedWorkerSequences` as immutable internal aggregation types.
+
+- [ ] **Step 5: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_aggregation.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/aggregation.py \
+  tests/unit/benchmarks/test_aggregation.py
+.venv/bin/mypy src/crypto_collector/benchmarks/aggregation.py
+git diff --check
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit Task 4**
+
+```bash
+git add src/crypto_collector/benchmarks/aggregation.py \
+  src/crypto_collector/benchmarks/contracts.py \
+  tests/unit/benchmarks/test_aggregation.py tests/performance/test_writer_durability.py
+git commit -m "feat: aggregate writer gate primary samples"
+```
+
+### Task 5: Build The Fresh-Process Runtime Verifier
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/runtime_verifier.py`
+- Create: `tests/unit/benchmarks/test_runtime_verifier.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write a passing micro-evidence fixture and mutation RED tests**
+
+The fixture must contain committed workload bytes, plan rows, canonical trace/buckets,
+five worker sequences, resource/health samples, raw zstd parts, and valid manifests.
+Do not construct a verdict boolean directly.
+
+```python
+def test_runtime_verifier_recomputes_acceptance(tmp_path: Path) -> None:
+    evidence = write_passing_micro_evidence(tmp_path)
+    receipt = validate_runtime_evidence(evidence.run_index_path,
+                                        target_probe=passing_probe)
+    assert receipt.runtime_evidence_valid is True
+    assert receipt.qualification_runtime_accepted is True
+
+
+@pytest.mark.parametrize("mutation", RUNTIME_EVIDENCE_MUTATIONS)
+def test_runtime_verifier_rejects_primary_fact_mutation(tmp_path: Path,
+                                                        mutation: Mutation) -> None:
+    evidence = write_passing_micro_evidence(tmp_path)
+    mutation.apply(evidence)
+    receipt = validate_runtime_evidence(evidence.run_index_path,
+                                        target_probe=passing_probe)
+    assert receipt.runtime_evidence_valid is False
+    assert receipt.qualification_runtime_accepted is False
+```
+
+Mutations cover every workload/plan/trace/bucket/sample/report/inventory hash, due time,
+payload byte/SHA, attempt/completion boundary, accepted identity, duplicate ordinal,
+raw row, manifest count/hash, UTC hour, final worker field, resource limit, storage
+health gap/coverage, target claim, and serialized candidate summary.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_runtime_verifier.py -q`
+
+Expected: FAIL because the verifier does not exist.
+
+- [ ] **Step 3: Implement disk-backed streaming validation**
+
+Expose this exact public call shape:
+
+```text
+validate_runtime_evidence(run_index_path: Path, *,
+                          target_probe: TargetProbePort | None)
+    -> GateRuntimeReceiptV1
+```
+
+Qualification evidence requires a non-null target probe. Functional evidence forbids
+one, can set `runtime_evidence_valid=true`, and must always set
+`qualification_runtime_accepted=false`.
+
+Open a temporary SQLite database beneath the declared state root with
+`journal_mode=WAL`, `synchronous=FULL`, strict tables, and primary keys for planned
+event ID, exact accepted identity tuple, and durable row identity. Stream-join oracle
+rows and trace rows, then stream manifests/raw rows through `load_raw_manifest` and
+`validate_local_source`. Reject missing/extra/duplicate facts and noncontiguous
+per-worker acceptance ordinals.
+
+Recompute buckets, counts, payload bytes, rates, bursts, UTC hours, worker aggregation,
+resource/health predicates, and target re-probe facts. Compare candidate summaries
+only to reject disagreement. Publish the receipt and runtime index without replacement;
+remove the temporary SQLite files only after a successful directory sync.
+
+- [ ] **Step 4: Prove bounded memory and fail-closed interruption**
+
+Add a marked performance test that validates a generated million-row synthetic trace
+under a test RSS bound. Unit tests use 10,000 rows. Interrupt after each artifact
+boundary, rerun from a fresh verifier, and prove no partial receipt is accepted or
+overwritten.
+
+- [ ] **Step 5: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_runtime_verifier.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/runtime_verifier.py \
+  tests/unit/benchmarks/test_runtime_verifier.py
+.venv/bin/mypy src/crypto_collector/benchmarks/runtime_verifier.py
+git diff --check
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit Task 5**
+
+```bash
+git add src/crypto_collector/benchmarks/runtime_verifier.py \
+  tests/unit/benchmarks/test_runtime_verifier.py \
+  tests/performance/test_writer_durability.py
+git commit -m "feat: independently verify writer gate runtime evidence"
+```
+
+### Task 6: Declare And Re-Probe The Linux Target
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/target.py`
+- Create: `tests/unit/benchmarks/test_target.py`
+- Modify: `src/crypto_collector/benchmarks/contracts.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write mount/probe/declaration RED tests**
+
+Test decoded mountinfo escapes (`\040`, `\011`, `\134`), component-boundary matching,
+longest mount selection, independent data/state lookups, sorted prefixed mount/super
+options, major/minor device facts, exact 100 GiB floors, and one 200 GiB requirement
+when device and mount are shared.
+
+Test absolute real symlink-free distinct directories, non-Linux rejection, regular-file
+sync, production hard-link no-replace, directory sync, cleanup plus cleanup-parent sync,
+capability mismatch, target-ID mismatch, declaration SHA tampering, and no-replace
+declaration publication.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_target.py -q`
+
+Expected: FAIL because target APIs do not exist.
+
+- [ ] **Step 3: Implement exact Linux probes**
+
+Expose these exact public call shapes:
+
+```text
+declare_target(*, target_id: str, data_root: Path, state_root: Path,
+               output: Path) -> GateTargetV1
+reprobe_target(declaration: GateTargetV1, *, expected_target_id: str)
+    -> GateTargetReprobeV1
+```
+
+Parse `/proc/self/mountinfo` without shell commands, unescape octal fields, and match
+resolved paths on component boundaries. Probe the actual hard-link primitive used by
+`RawWriterService`; do not accept `renameat2` as a substitute. Use `os.open` with
+directory/file flags, `os.fsync`, `os.link`, and explicit cleanup syncs. Hash the
+declaration with its digest omitted, then publish once through the artifact publisher.
+
+- [ ] **Step 4: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_target.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/target.py \
+  tests/unit/benchmarks/test_target.py
+.venv/bin/mypy src/crypto_collector/benchmarks/target.py
+git diff --check
+```
+
+Expected: PASS on macOS through injected Linux fixtures; real declaration remains
+Linux-only.
+
+- [ ] **Step 5: Commit Task 6**
+
+```bash
+git add src/crypto_collector/benchmarks/target.py \
+  src/crypto_collector/benchmarks/contracts.py \
+  tests/unit/benchmarks/test_target.py tests/performance/test_writer_durability.py
+git commit -m "feat: bind writer gate Linux target"
+```
+
+### Task 7: Run The Production Writer And Publish Candidate Evidence
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/runner.py`
+- Create: `src/crypto_collector/benchmarks/writer.py`
+- Create: `tests/unit/benchmarks/test_runner.py`
+- Create: `tests/integration/benchmarks/__init__.py`
+- Create: `tests/integration/benchmarks/test_writer_functional.py`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write CLI mode and preflight RED tests**
+
+Use Typer's test runner to assert exact mode rules:
+
+```text
+functional: --functional-only required; target declaration forbidden; roots optional;
+qualification: data/state/declaration/expected target/image IDs required;
+both: workload, multiplier, integral duration, report/evidence root required.
+```
+
+Reject multiplier below one, functional duration below 10 seconds, qualification
+duration below 10 minutes, nonintegral durations, UTC-hour capacity below
+`duration + 30s`, existing raw/recovery exchange subtrees, malformed image IDs, and
+wrong target IDs. Functional reports must never expose authoritative acceptance.
+
+- [ ] **Step 2: Write a micro production-path integration RED test**
+
+Inject clocks and a tiny workload, open five real `RawWriterService` instances, run
+events, close them, validate manifests/raw rows, then invoke the fresh runtime verifier.
+Assert exact record/payload conservation, five stable workers, expected touched files,
+zero error counters, and a passing runtime receipt.
+
+- [ ] **Step 3: Run tests and verify RED**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_runner.py \
+  tests/integration/benchmarks/test_writer_functional.py -q
+```
+
+Expected: FAIL because runner/CLI APIs do not exist.
+
+- [ ] **Step 4: Implement runner orchestration**
+
+Open one service per explicit exchange using public `RawWriterService.open` arguments:
+data/state roots, exchange, deterministic worker ID, canonical config SHA, generation
+zero, writer/ingress configs, exact metric-stream allowlist, and production clock.
+Derive the config digest from the fully resolved benchmark writer/ingress configs.
+
+Use a heap-merged oracle iterator. Sleep until due time, call only
+`try_accept(draft, source=source, shard=shard)`, record trace timing/status/identity,
+and continue after overflow only to retain complete failure evidence. Run complete
+sampling rounds concurrently. At the admission boundary, stop attempts, call
+`sync_now`, `close_all(CloseReason.SHUTDOWN, deadline)`, validate returned manifests,
+capture final CLOSED snapshots, inventories, buckets, candidate report, and run index.
+
+All artifacts use same-parent no-replace publication. On failure after artifact
+publisher initialization, publish a failed successor index when the state root remains
+writable; always retain partial/raw state. Never inspect service private fields or
+delete/reuse target exchange trees.
+
+Expose CLI commands:
+
+```text
+python -m crypto_collector.benchmarks.writer run --workload PATH --multiplier INT
+  --duration DURATION --evidence-root PATH --report PATH [qualification options]
+python -m crypto_collector.benchmarks.writer validate-runtime --run-index PATH
+  --output PATH --expected-target-id ID
+python -m crypto_collector.benchmarks.writer declare-target --target-id ID
+  --data-root PATH --state-root PATH --output PATH
+```
+
+Keep backward-compatible default invocation equivalent to `run` for the documented
+functional command.
+
+- [ ] **Step 5: Run the exact short functional gate**
+
+Run:
+
+```bash
+GATE_FUNCTIONAL_ROOT="$(mktemp -d /tmp/writer-gate-functional.XXXXXX)"
+.venv/bin/python -m crypto_collector.benchmarks.writer \
+  --workload benchmarks/workloads/research-default-v1.yaml \
+  --multiplier 2 --duration 10s \
+  --evidence-root "$GATE_FUNCTIONAL_ROOT/evidence" \
+  --report "$GATE_FUNCTIONAL_ROOT/writer-short.json" --functional-only
+test -f "$GATE_FUNCTIONAL_ROOT/writer-short.json"
+```
+
+Expected: exit 0; `candidate_runtime_passed=true`; no authoritative acceptance field;
+417,677 attempted/accepted/durable/sampled/manifest rows; exact planned payload bytes;
+3,172 touched files; valid raw/manifests; runtime receipt has
+`runtime_evidence_valid=true` and `qualification_runtime_accepted=false`; every error
+count is zero. Record the printed `GATE_FUNCTIONAL_ROOT` for inspection; functional
+temporary data/state roots remain owned for the entire verification lifecycle.
+
+- [ ] **Step 6: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_runner.py \
+  tests/integration/benchmarks/test_writer_functional.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/runner.py \
+  src/crypto_collector/benchmarks/writer.py tests/unit/benchmarks/test_runner.py \
+  tests/integration/benchmarks/test_writer_functional.py
+.venv/bin/mypy src/crypto_collector/benchmarks/runner.py \
+  src/crypto_collector/benchmarks/writer.py
+git diff --check
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit Task 7**
+
+```bash
+git add src/crypto_collector/benchmarks/runner.py \
+  src/crypto_collector/benchmarks/writer.py tests/unit/benchmarks/test_runner.py \
+  tests/integration/benchmarks tests/performance/test_writer_durability.py
+git commit -m "feat: run auditable writer durability workload"
+```
+
+### Task 8: Reproduce Provenance, Acceptance, And Disclosure
+
+**Files:**
+- Create: `src/crypto_collector/benchmarks/provenance.py`
+- Create: `tests/unit/benchmarks/test_provenance.py`
+- Create: `scripts/reproduce-writer-image.sh`
+- Create: `requirements/build.in`
+- Modify: `src/crypto_collector/benchmarks/writer.py`
+- Modify: `src/crypto_collector/benchmarks/contracts.py`
+- Create: `requirements/build.lock`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write source/image/container/archive RED tests**
+
+Mock Git/Docker/provider command ports and assert two `git archive` source contexts,
+identical commit/epoch/lock/workload/Docker hashes, complete build lock including
+Hatchling, identical wheel/image IDs, exact OCI labels/provenance file, platform,
+builder/frontend facts, `65532:65532`, retained successful writer/verifier containers,
+and `.Image` equality.
+
+Reject dirty checkout inputs, untracked/ignored build inputs, mismatched builds,
+caller-only image claims, removed/failed containers, mutable/unversioned archives,
+WebDAV-only evidence, inventory mismatch, receipt/index disagreement, private paths in
+disclosure, and any attempt to qualify functional mode.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_provenance.py -q`
+
+Expected: FAIL because provenance APIs do not exist.
+
+- [ ] **Step 3: Implement host-side provenance ports and receipts**
+
+Expose these exact public call shapes:
+
+```text
+validate_provenance(*, source_commit: str, runtime_index: Path,
+                    archive_attestation: Path, writer_container: str,
+                    verifier_container: str, docker: DockerPort, git: GitPort)
+    -> GateAcceptanceReceiptV1
+build_disclosure(acceptance: GateAcceptanceReceiptV1)
+    -> GateEvidenceDisclosureV1
+```
+
+Treat every subprocess/API response as untrusted structured input. Validate exact
+digests and container image IDs before writing receipts. The disclosure allowlist must
+exclude absolute paths, hostnames, raw locators, credentials, environment values, and
+mount facts; include only safe plan/result/provenance facts and opaque locator digest.
+
+Add `validate-provenance` and `build-disclosure` CLI commands. Do not add boto3/oss2 to
+the collector image. Accept a strict operator-side S3 Object Lock or OSS WORM
+attestation; WebDAV is represented only as an optional verified backup.
+
+- [ ] **Step 4: Lock deterministic build dependencies**
+
+Create `requirements/build.in` containing exactly the existing build-system constraint
+`hatchling>=1.27,<2`, then compile its transitive dependencies:
+
+```bash
+.venv/bin/pip-compile --generate-hashes \
+  --output-file=requirements/build.lock requirements/build.in
+.venv/bin/python -m pip install --dry-run --require-hashes \
+  -r requirements/build.lock
+.venv/bin/python -m pip install --dry-run --require-hashes \
+  -r requirements/collector.lock
+```
+
+Keep `requirements/collector.lock` unchanged and runtime-only. Verify neither lock
+contains archive/materializer SDKs and every non-comment requirement has hashes.
+
+- [ ] **Step 5: Implement the reproducibility script**
+
+The script must use `set -euo pipefail`, explicit temporary directories from `mktemp
+-d`, trap cleanup, `git archive <exact-commit>`, fixed `linux/amd64`, pinned BuildKit/
+frontend facts, `--provenance=false`, `--sbom=false`, exact `SOURCE_DATE_EPOCH`, two
+`--no-cache` builds, and structured `docker image/container inspect`. It writes a
+canonical transcript but no acceptance receipt; Python validates that transcript.
+
+- [ ] **Step 6: Run focused tests and checks**
+
+Run:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks/test_provenance.py \
+  tests/performance/test_writer_durability.py -q
+.venv/bin/ruff check src/crypto_collector/benchmarks/provenance.py \
+  tests/unit/benchmarks/test_provenance.py
+.venv/bin/mypy src/crypto_collector/benchmarks/provenance.py
+sh -n scripts/reproduce-writer-image.sh
+git diff --check
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit Task 8**
+
+```bash
+git add src/crypto_collector/benchmarks/provenance.py \
+  src/crypto_collector/benchmarks/writer.py \
+  src/crypto_collector/benchmarks/contracts.py \
+  tests/unit/benchmarks/test_provenance.py \
+  tests/performance/test_writer_durability.py scripts/reproduce-writer-image.sh \
+  requirements/build.in requirements/build.lock
+git commit -m "feat: verify writer gate provenance"
+```
+
+### Task 9: Pin The Image, Write Operations, And Pass Implementation Gates
+
+**Files:**
+- Create: `Dockerfile`
+- Create: `.dockerignore`
+- Create: `docs/operations/writer-benchmark.md`
+- Modify: `tests/performance/test_writer_durability.py`
+
+- [ ] **Step 1: Write Docker/runbook contract RED tests**
+
+Parse the Dockerfile and runbook as text plus structured Docker inspect fixtures.
+Require digest-pinned Linux base, lock-only installs, deterministic wheel build,
+read-only `/app/build-provenance-v1.json`, workload copy, final `USER 65532:65532`, no
+archive/materializer SDKs, fixed CLI entry behavior, no secret values, and exact
+runner/runtime/provenance/archive/disclosure command order.
+
+The runbook must distinguish implementation PASS, Docker reproducibility PASS, target
+pending, runtime failure, provenance failure, immutable archive failure, and accepted
+evidence. It must prohibit redacting canonical originals and prohibit WebDAV-only
+qualification evidence.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run: `.venv/bin/python -m pytest tests/performance/test_writer_durability.py -q`
+
+Expected: FAIL on missing Dockerfile/runbook contracts.
+
+- [ ] **Step 3: Implement the pinned multi-stage image**
+
+Use a Python base pinned by registry SHA-256 digest and a fixed `# syntax=` frontend.
+Build a wheel from the exact source archive using `requirements/build.lock`, install
+only `requirements/collector.lock` dependencies into the runtime stage, copy the
+immutable workload/golden files, emit labels and canonical provenance, remove build
+caches, and switch to numeric UID/GID 65532. `.dockerignore` excludes Git metadata,
+worktrees, virtualenvs, caches, raw/evidence outputs, secrets, and unrelated local
+files.
+
+- [ ] **Step 4: Write the complete runbook**
+
+Document prerequisites, fresh root provisioning, target declaration, fixed named
+writer container, fresh-process runtime verifier container, private file inventory,
+S3 Object Lock/OSS WORM archival attestation, two-build provenance validation,
+acceptance/disclosure generation, WebDAV backup, cleanup ordering, and evidence commit
+rules. Commands retain containers until host inspection succeeds.
+
+- [ ] **Step 5: Run all precommit gates**
+
+Run fresh:
+
+```bash
+.venv/bin/python -m pytest tests/unit/benchmarks \
+  tests/integration/benchmarks tests/performance/test_writer_durability.py -q
+GATE_FUNCTIONAL_ROOT="$(mktemp -d /tmp/writer-gate-functional.XXXXXX)"
+.venv/bin/python -m crypto_collector.benchmarks.writer \
+  --workload benchmarks/workloads/research-default-v1.yaml \
+  --multiplier 2 --duration 10s \
+  --evidence-root "$GATE_FUNCTIONAL_ROOT/evidence" \
+  --report "$GATE_FUNCTIONAL_ROOT/writer-short.json" --functional-only
+test -f "$GATE_FUNCTIONAL_ROOT/writer-short.json"
+.venv/bin/python -m pytest -q -m "not live and not performance" --ignore=tests/smoke
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/mypy src
+git diff --check
+```
+
+Expected: every command exits 0; functional candidate/runtime receipt pass but no
+acceptance receipt exists and `qualification_runtime_accepted` remains false.
+
+- [ ] **Step 6: Commit the implementation gate**
+
+```bash
+git add Dockerfile .dockerignore docs/operations/writer-benchmark.md \
+  tests/performance/test_writer_durability.py
+git commit -m "test: establish auditable writer durability gate"
+```
+
+- [ ] **Step 7: Perform final two-stage branch review**
+
+Dispatch one plan/spec reviewer and one code-quality reviewer over every Task 1-9
+commit and the approved design. Fix every P0/P1/P2 with separate commits, rerun the
+full precommit gate, and push only after both reviewers report no remaining P0/P1/P2.
+
+- [ ] **Step 8: Reproduce the image when Docker is available**
+
+From the exact clean implementation commit run:
+
+```bash
+scripts/reproduce-writer-image.sh "$(git rev-parse HEAD)"
+```
+
+Expected: two clean `git archive` builds have identical wheel SHA and image ID; image
+user is `65532:65532`; labels/provenance/workload match. If Docker is unavailable,
+record this gate as pending without reverting or withholding reviewed implementation
+commits. A build fix is a new implementation commit and restarts this step.
+
+### Task 10: Run Real Linux Qualification And Commit Disclosure Separately
+
+**Files:**
+- Create after successful target run: `docs/operations/evidence/gate-b-disclosure-v1.json`
+- Create after successful target run: `docs/operations/evidence/gate-b-acceptance-public-v1.json`
+- Create after successful target run: `docs/operations/evidence/gate-b-validation-transcript.txt`
+- Modify after successful target run: `docs/operations/writer-benchmark.md`
+
+- [ ] **Step 1: Provision a real Linux target and immutable evidence backend**
+
+Use the runbook with fresh data/state roots, each exact 100 GiB floor (or exact 200 GiB
+combined floor on one shared mount), Docker access, S3 Object Lock or OSS WORM
+retention, and optional WebDAV backup. Do not use macOS Docker Desktop as target
+evidence.
+
+- [ ] **Step 2: Execute immutable-image run and runtime verification**
+
+Declare the target, run the 10-minute multiplier-two workload in a fixed named
+container without network, retain the container, then run `validate-runtime` in a
+second fixed named container. Expected runtime receipt: exact 25,060,620 records,
+3,505 active/touched identities, full-second bursts, <=1s durability max, all equality/
+zero-error/resource/target predicates true.
+
+- [ ] **Step 3: Archive private evidence and validate provenance**
+
+Inventory every private file, upload under immutable provider retention, verify object
+version and inventory hash, make the WebDAV backup when enabled, then run two clean
+builds and `validate-provenance`. Inspect retained container `.Image` values before
+cleanup. Expected final acceptance receipt: `qualification_accepted=true`.
+
+- [ ] **Step 4: Generate and review the public disclosure**
+
+Run `build-disclosure`, scan it and the sanitized transcript for absolute paths,
+hostnames, credentials, private locators, environment values, and mount facts, and
+verify all are absent. Re-run receipt/disclosure validators from a clean checkout.
+
+- [ ] **Step 5: Commit evidence separately**
+
+```bash
+git add docs/operations/evidence docs/operations/writer-benchmark.md
+git commit -m "evidence: qualify auditable raw writer gate"
+```
+
+If any target/runtime/archive/provenance predicate fails, retain the private failure
+evidence, do not create this commit, and record qualification as pending/failed in the
+runbook. The reviewed Task 1-9 implementation remains valid.
+
+## Plan02 Merge Gate
+
+Before merging `codex/plan02-durable-storage` into master:
+
+1. Rebase/merge current master non-destructively and resolve only genuine conflicts.
+2. Re-run repository offline/full tests, benchmark contract tests, Ruff, format, mypy,
+   `git diff --check`, and image reproducibility when Docker is available.
+3. Obtain fresh plan/spec and code-quality reviews over the integrated diff.
+4. Confirm branch/remote clean and every Plan02 Task 1-9 implementation artifact is
+   present. Task 10 external evidence may remain explicitly pending when no real target
+   exists, as permitted by the approved design.
+5. Merge to master and push only after all required implementation gates pass. Never
+   rewrite or discard unrelated master/user changes.

@@ -4873,6 +4873,14 @@ git commit -m "feat: reconcile crashed raw parts"
 
 ### Task 7: Durability Performance Gate
 
+> **Superseded on 2026-08-02:** Do not execute the legacy Task 7 steps below. The
+> authoritative approved design is
+> `docs/superpowers/specs/2026-08-02-writer-gate-b-auditable-evidence-design.md`, and
+> the executable replacement plan is
+> `docs/superpowers/plans/2026-08-02-writer-gate-b-auditable-evidence.md`. The legacy
+> text remains only as historical context; where it conflicts, the 2026-08-02 design
+> and plan control.
+
 **Files:**
 - Create: `src/crypto_collector/benchmarks/__init__.py`
 - Create: `src/crypto_collector/benchmarks/writer.py`
