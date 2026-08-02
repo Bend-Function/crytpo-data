@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import re
 from collections import Counter
 from copy import deepcopy
@@ -20,6 +21,7 @@ from crypto_collector.benchmarks.oracle import (
     WorkloadPlanV1,
     build_native_draft,
     build_workload_plan,
+    iter_exchange_plan_events,
     iter_plan_events,
 )
 from crypto_collector.benchmarks.workload import (
@@ -28,7 +30,12 @@ from crypto_collector.benchmarks.workload import (
     load_workload,
 )
 from crypto_collector.domain.json_codec import decode_json, encode_json
-from crypto_collector.domain.types import CoverageMode, IntegrityMode, Transport
+from crypto_collector.domain.types import (
+    CoverageMode,
+    Exchange,
+    IntegrityMode,
+    Transport,
+)
 from crypto_collector.storage.models import validate_control_draft
 
 WORKLOAD = Path("benchmarks/workloads/research-default-v1.yaml")
@@ -45,6 +52,13 @@ STREAM_GROUPS = (
     "book_deep_snapshot",
     "control",
 )
+CANONICAL_EXCHANGES = (
+    Exchange.BINANCE,
+    Exchange.OKX,
+    Exchange.BYBIT,
+    Exchange.BITGET,
+    Exchange.KRAKEN,
+)
 
 
 def _baseline_data() -> dict[str, Any]:
@@ -54,18 +68,23 @@ def _baseline_data() -> dict[str, Any]:
     )
 
 
-def _micro_loaded(*, seed: int = 20260731) -> LoadedWorkload:
+def _micro_loaded(
+    *,
+    seed: int = 20260731,
+    exchanges: tuple[str, ...] = ("binance",),
+) -> LoadedWorkload:
+    exchange_count = len(exchanges)
     data = _baseline_data()
     data.update(
         {
             "name": "research-micro-v1",
             "generation_seed": seed,
-            "exchanges": ["binance"],
+            "exchanges": list(exchanges),
             "markets": ["spot", "perpetual"],
             "symbols_per_market": 1,
-            "fixed_scope_file_count": 1,
-            "scalable_file_count": 14,
-            "active_file_count": 15,
+            "fixed_scope_file_count": exchange_count,
+            "scalable_file_count": 14 * exchange_count,
+            "active_file_count": 15 * exchange_count,
         }
     )
     streams = cast(dict[str, dict[str, Any]], data["streams"])
@@ -80,12 +99,12 @@ def _micro_loaded(*, seed: int = 20260731) -> LoadedWorkload:
             }
         )
         if name == "derivative":
-            stream["instrument_instances"] = 1
-            stream["file_instances"] = 2
+            stream["instrument_instances"] = exchange_count
+            stream["file_instances"] = 2 * exchange_count
         elif name == "control":
-            stream["instances"] = 1
+            stream["instances"] = exchange_count
         else:
-            stream["instances"] = 2
+            stream["instances"] = 2 * exchange_count
     streams["trade"]["mean_records_per_second"] = "1"
     streams["trade"]["burst_records_in_1s"] = 2
     streams["ticker"]["mean_records_per_second"] = "0.05"
@@ -432,6 +451,123 @@ def test_schedule_payload_and_global_order_are_exact() -> None:
         identity.canonical_identity: [0, 1]
         for identity in plan.stream("trade").iter_identities()
     }
+
+
+def test_exchange_partitions_merge_exactly_to_global_plan() -> None:
+    plan = build_workload_plan(
+        _micro_loaded(exchanges=("binance", "okx")),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    )
+    global_events = tuple(iter_plan_events(plan))
+    partitions = {
+        exchange: tuple(iter_exchange_plan_events(plan, exchange))
+        for exchange in (Exchange.BINANCE, Exchange.OKX)
+    }
+
+    for exchange, events in partitions.items():
+        assert events
+        assert {event.exchange for event in events} == {exchange}
+        expected_count = sum(
+            identity.allocated_event_count
+            for summary in plan.streams
+            for identity in summary.iter_identities()
+            if identity.exchange is exchange
+        )
+        assert len(events) == expected_count
+    merged = tuple(
+        heapq.merge(
+            *partitions.values(),
+            key=lambda event: (event.due_offset_ns, event.planned_event_id),
+        )
+    )
+    assert merged == global_events
+    assert b"".join(event.canonical_bytes() for event in merged) == b"".join(
+        event.canonical_bytes() for event in global_events
+    )
+    assert {event.stream_group for event in merged} == set(STREAM_GROUPS)
+    assert not any(
+        event.exchange is Exchange.OKX and event.stream_group == "ticker"
+        for event in merged
+    )
+
+
+def test_five_exchange_partitions_merge_exactly_to_global_plan() -> None:
+    plan = build_workload_plan(
+        _micro_loaded(
+            exchanges=tuple(exchange.value for exchange in CANONICAL_EXCHANGES)
+        ),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    )
+    global_events = tuple(iter_plan_events(plan))
+    partitions = tuple(
+        tuple(iter_exchange_plan_events(plan, exchange))
+        for exchange in CANONICAL_EXCHANGES
+    )
+
+    assert all(partition for partition in partitions)
+    assert (
+        tuple(
+            heapq.merge(
+                *partitions,
+                key=lambda event: (event.due_offset_ns, event.planned_event_id),
+            )
+        )
+        == global_events
+    )
+
+
+def test_exchange_partition_never_scans_another_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_workload_plan(
+        _micro_loaded(exchanges=("binance", "okx")),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    )
+    original_event_facts = oracle_module._event_facts_at
+    original_identity_facts = oracle_module._identity_facts_at
+    observed_events: list[Exchange] = []
+    observed_identities: list[Exchange] = []
+
+    def rejecting_other_identity(
+        summary: StreamPlanV1, identity_index: int
+    ) -> oracle_module._IdentityFacts:
+        result = original_identity_facts(summary, identity_index)
+        if result.exchange is not Exchange.OKX:
+            raise AssertionError("partition scanned another exchange identity")
+        observed_identities.append(result.exchange)
+        return result
+
+    def recording_event_facts(
+        summary: StreamPlanV1, ordinal: int
+    ) -> tuple[str, oracle_module._IdentityFacts, int]:
+        result = original_event_facts(summary, ordinal)
+        observed_events.append(result[1].exchange)
+        return result
+
+    monkeypatch.setattr(oracle_module, "_identity_facts_at", rejecting_other_identity)
+    monkeypatch.setattr(oracle_module, "_event_facts_at", recording_event_facts)
+
+    events = tuple(iter_exchange_plan_events(plan, Exchange.OKX))
+
+    assert events
+    assert set(observed_events) == {Exchange.OKX}
+    assert set(observed_identities) == {Exchange.OKX}
+
+
+def test_exchange_partition_rejects_invalid_or_absent_exchange() -> None:
+    plan = build_workload_plan(
+        _micro_loaded(exchanges=("binance", "okx")),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    )
+
+    with pytest.raises(TypeError, match="exchange must be Exchange"):
+        tuple(iter_exchange_plan_events(plan, cast(Any, "binance")))
+    with pytest.raises(ValueError, match="exchange is absent from the plan"):
+        tuple(iter_exchange_plan_events(plan, Exchange.KRAKEN))
 
 
 def test_qualification_burst_is_evenly_distributed_across_identities() -> None:

@@ -909,33 +909,88 @@ def _burst_quota_per_identity(summary: StreamPlanV1) -> int:
     return summary.burst_records_in_1s * multiplier
 
 
-def _iter_burst_ordinals(summary: StreamPlanV1) -> Iterator[int]:
-    ordinal_start = 0
+def _identity_ordinal_start(summary: StreamPlanV1, identity_index: int) -> int:
+    if not 0 <= identity_index <= summary.identity_count:
+        raise IndexError(identity_index)
+    quotient, remainder = divmod(summary.expected_record_count, summary.identity_count)
+    return identity_index * quotient + min(identity_index, remainder)
+
+
+def _exchange_identity_span(
+    summary: StreamPlanV1, exchange: Exchange
+) -> tuple[int, int]:
+    exchange_index = summary.exchanges.index(exchange)
+    per_exchange, remainder = divmod(summary.identity_count, len(summary.exchanges))
+    if remainder:
+        raise AssertionError("exchange identity spans must be equal and contiguous")
+    identity_start = exchange_index * per_exchange
+    return identity_start, identity_start + per_exchange
+
+
+def _iter_burst_ordinals_for_identity_span(
+    summary: StreamPlanV1,
+    identity_start: int,
+    identity_stop: int,
+) -> Iterator[int]:
+    ordinal_start = _identity_ordinal_start(summary, identity_start)
     quota = _burst_quota_per_identity(summary)
-    selected_count = 0
-    for identity_index in range(summary.identity_count):
+    for identity_index in range(identity_start, identity_stop):
         allocated_count = _allocated_count(summary, identity_index)
         selected_for_identity = min(allocated_count, quota)
         yield from range(ordinal_start, ordinal_start + selected_for_identity)
-        selected_count += selected_for_identity
         ordinal_start += allocated_count
+
+
+def _iter_burst_ordinals(summary: StreamPlanV1) -> Iterator[int]:
+    selected_count = 0
+    for ordinal in _iter_burst_ordinals_for_identity_span(
+        summary, 0, summary.identity_count
+    ):
+        selected_count += 1
+        yield ordinal
     if selected_count != summary.scheduled_burst_count:
         raise AssertionError("distributed burst count does not match stream plan")
 
 
-def _iter_smooth_ordinals(summary: StreamPlanV1) -> Iterator[int]:
-    ordinal_start = 0
+def _smooth_count_before_identity(summary: StreamPlanV1, identity_index: int) -> int:
+    if not 0 <= identity_index <= summary.identity_count:
+        raise IndexError(identity_index)
+    quotient, remainder = divmod(summary.expected_record_count, summary.identity_count)
     quota = _burst_quota_per_identity(summary)
-    selected_count = 0
-    for identity_index in range(summary.identity_count):
+    longer_identity_count = min(identity_index, remainder)
+    shorter_identity_count = identity_index - longer_identity_count
+    return longer_identity_count * max(
+        quotient + 1 - quota, 0
+    ) + shorter_identity_count * max(quotient - quota, 0)
+
+
+def _iter_indexed_smooth_ordinals_for_identity_span(
+    summary: StreamPlanV1,
+    identity_start: int,
+    identity_stop: int,
+) -> Iterator[tuple[int, int]]:
+    ordinal_start = _identity_ordinal_start(summary, identity_start)
+    smooth_index = _smooth_count_before_identity(summary, identity_start)
+    quota = _burst_quota_per_identity(summary)
+    for identity_index in range(identity_start, identity_stop):
         allocated_count = _allocated_count(summary, identity_index)
         selected_for_identity = min(allocated_count, quota)
-        yield from range(
+        for ordinal in range(
             ordinal_start + selected_for_identity,
             ordinal_start + allocated_count,
-        )
-        selected_count += allocated_count - selected_for_identity
+        ):
+            yield smooth_index, ordinal
+            smooth_index += 1
         ordinal_start += allocated_count
+
+
+def _iter_smooth_ordinals(summary: StreamPlanV1) -> Iterator[int]:
+    selected_count = 0
+    for _, ordinal in _iter_indexed_smooth_ordinals_for_identity_span(
+        summary, 0, summary.identity_count
+    ):
+        selected_count += 1
+        yield ordinal
     expected_count = summary.expected_record_count - summary.scheduled_burst_count
     if selected_count != expected_count:
         raise AssertionError("smooth event count does not match stream plan")
@@ -1084,10 +1139,16 @@ def _build_event(scheduled: _ScheduledEvent) -> PlannedEventV1:
     return PlannedEventV1.model_construct(**values)
 
 
-def _iter_burst_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+def _iter_burst_schedule_for_identity_span(
+    summary: StreamPlanV1,
+    identity_start: int,
+    identity_stop: int,
+) -> Iterator[_ScheduledEvent]:
     burst_rows = [
         (_event_facts_at(summary, ordinal)[0], ordinal)
-        for ordinal in _iter_burst_ordinals(summary)
+        for ordinal in _iter_burst_ordinals_for_identity_span(
+            summary, identity_start, identity_stop
+        )
     ]
     burst_rows.sort(key=lambda row: row[0])
     for event_id, ordinal in burst_rows:
@@ -1099,7 +1160,17 @@ def _iter_burst_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
         )
 
 
-def _iter_smooth_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+def _iter_burst_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+    yield from _iter_burst_schedule_for_identity_span(
+        summary, 0, summary.identity_count
+    )
+
+
+def _iter_smooth_schedule_for_identity_span(
+    summary: StreamPlanV1,
+    identity_start: int,
+    identity_stop: int,
+) -> Iterator[_ScheduledEvent]:
     remaining_count = summary.expected_record_count - summary.scheduled_burst_count
     if remaining_count == 0:
         return
@@ -1107,7 +1178,9 @@ def _iter_smooth_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
     outside_ns = schedulable_ns - ONE_SECOND_NS
     tie_group: list[tuple[str, int, int]] = []
     prior_due: int | None = None
-    for index, ordinal in enumerate(_iter_smooth_ordinals(summary)):
+    for index, ordinal in _iter_indexed_smooth_ordinals_for_identity_span(
+        summary, identity_start, identity_stop
+    ):
         compressed = index * outside_ns // remaining_count
         due_offset_ns = (
             compressed
@@ -1137,11 +1210,27 @@ def _iter_smooth_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
         )
 
 
-def _iter_stream_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+def _iter_smooth_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+    yield from _iter_smooth_schedule_for_identity_span(
+        summary, 0, summary.identity_count
+    )
+
+
+def _iter_stream_schedule_for_identity_span(
+    summary: StreamPlanV1,
+    identity_start: int,
+    identity_stop: int,
+) -> Iterator[_ScheduledEvent]:
     yield from heapq.merge(
-        _iter_burst_schedule(summary),
-        _iter_smooth_schedule(summary),
+        _iter_burst_schedule_for_identity_span(summary, identity_start, identity_stop),
+        _iter_smooth_schedule_for_identity_span(summary, identity_start, identity_stop),
         key=lambda event: (event.due_offset_ns, event.event_id),
+    )
+
+
+def _iter_stream_schedule(summary: StreamPlanV1) -> Iterator[_ScheduledEvent]:
+    yield from _iter_stream_schedule_for_identity_span(
+        summary, 0, summary.identity_count
     )
 
 
@@ -1152,10 +1241,40 @@ def _iter_plan_schedule(plan: WorkloadPlanV1) -> Iterator[_ScheduledEvent]:
     )
 
 
+def _iter_exchange_plan_schedule(
+    plan: WorkloadPlanV1, exchange: Exchange
+) -> Iterator[_ScheduledEvent]:
+    schedules: list[Iterator[_ScheduledEvent]] = []
+    for summary in plan.streams:
+        identity_start, identity_stop = _exchange_identity_span(summary, exchange)
+        schedules.append(
+            _iter_stream_schedule_for_identity_span(
+                summary, identity_start, identity_stop
+            )
+        )
+    yield from heapq.merge(
+        *schedules,
+        key=lambda event: (event.due_offset_ns, event.event_id),
+    )
+
+
 def iter_plan_events(plan: WorkloadPlanV1) -> Iterator[PlannedEventV1]:
     if type(plan) is not WorkloadPlanV1:
         raise TypeError("plan must be WorkloadPlanV1")
     for scheduled in _iter_plan_schedule(plan):
+        yield _build_event(scheduled)
+
+
+def iter_exchange_plan_events(
+    plan: WorkloadPlanV1, exchange: Exchange
+) -> Iterator[PlannedEventV1]:
+    if type(plan) is not WorkloadPlanV1:
+        raise TypeError("plan must be WorkloadPlanV1")
+    if type(exchange) is not Exchange:
+        raise TypeError("exchange must be Exchange")
+    if any(exchange not in summary.exchanges for summary in plan.streams):
+        raise ValueError("exchange is absent from the plan")
+    for scheduled in _iter_exchange_plan_schedule(plan, exchange):
         yield _build_event(scheduled)
 
 
@@ -1249,5 +1368,6 @@ __all__ = [
     "WorkloadPlanV1",
     "build_native_draft",
     "build_workload_plan",
+    "iter_exchange_plan_events",
     "iter_plan_events",
 ]
