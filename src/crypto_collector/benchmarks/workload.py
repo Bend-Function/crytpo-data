@@ -59,6 +59,16 @@ def _tuple(value: object) -> object:
     return value
 
 
+def _is_canonical_ordered_subset(
+    values: tuple[str, ...],
+    canonical: tuple[str, ...],
+) -> bool:
+    positions = {value: index for index, value in enumerate(canonical)}
+    return all(value in positions for value in values) and [
+        positions[value] for value in values
+    ] == sorted(positions[value] for value in values)
+
+
 def _positive_decimal_string(value: object) -> Decimal:
     if type(value) is not str or _CANONICAL_DECIMAL.fullmatch(value) is None:
         raise ValueError("value must be a canonical positive decimal string")
@@ -326,10 +336,10 @@ class GateWorkloadV1(_FrozenStrictModel):
 
     @model_validator(mode="after")
     def validate_scope_and_cardinalities(self) -> Self:
-        if self.exchanges != _CANONICAL_EXCHANGES:
-            raise ValueError("exchanges must use the canonical version-one order")
-        if self.markets != _CANONICAL_MARKETS:
-            raise ValueError("markets must use the canonical version-one order")
+        if not _is_canonical_ordered_subset(self.exchanges, _CANONICAL_EXCHANGES):
+            raise ValueError("exchanges must use canonical relative order")
+        if not _is_canonical_ordered_subset(self.markets, _CANONICAL_MARKETS):
+            raise ValueError("markets must use canonical relative order")
         if self.derivative_logical_streams != _CANONICAL_DERIVATIVE_STREAMS:
             raise ValueError(
                 "derivative logical streams must use the canonical version-one order"
@@ -370,6 +380,8 @@ class GateWorkloadV1(_FrozenStrictModel):
             raise TypeError("derivative must use a derivative stream definition")
         if tuple(derivative.markets) != ("perpetual",):
             raise ValueError("derivative markets must be exactly perpetual")
+        if "perpetual" not in self.markets:
+            raise ValueError("workload markets must include derivative perpetual")
         expected_derivative_instruments = (
             len(self.exchanges) * len(derivative.markets) * self.symbols_per_market
         )
@@ -413,6 +425,24 @@ class LoadedWorkload:
     workload: GateWorkloadV1
     source_bytes: bytes
     sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.workload) is not GateWorkloadV1:
+            raise TypeError("loaded workload model must be GateWorkloadV1")
+        if type(self.source_bytes) is not bytes:
+            raise TypeError("loaded workload source bytes must be bytes")
+        if type(self.sha256) is not str:
+            raise TypeError("loaded workload source SHA must be a string")
+        if sha256(self.source_bytes).hexdigest() != self.sha256:
+            raise ValueError("loaded workload source SHA does not match its bytes")
+        parsed = GateWorkloadV1.model_validate(
+            _parse_yaml_mapping(
+                self.source_bytes,
+                path=Path("<loaded-workload-source>"),
+            )
+        )
+        if parsed.model_dump(mode="json") != self.workload.model_dump(mode="json"):
+            raise ValueError("loaded workload model does not match its source bytes")
 
 
 def _yaml() -> YAML:

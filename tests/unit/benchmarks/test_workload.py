@@ -114,6 +114,41 @@ def test_workload_rejects_duplicate_scope_names(
         GateWorkloadV1.model_validate(data)
 
 
+def test_workload_schema_allows_canonical_ordered_subscope() -> None:
+    data = _workload_data()
+    data.update(
+        {
+            "exchanges": ["binance"],
+            "symbols_per_market": 1,
+            "fixed_scope_file_count": 1,
+            "scalable_file_count": 14,
+            "active_file_count": 15,
+        }
+    )
+    streams = cast(dict[str, dict[str, Any]], data["streams"])
+    for name, stream in streams.items():
+        if name == "derivative":
+            stream["instrument_instances"] = 1
+            stream["file_instances"] = 2
+        elif name == "control":
+            stream["instances"] = 1
+        else:
+            stream["instances"] = 2
+
+    workload = GateWorkloadV1.model_validate(data)
+
+    assert workload.exchanges == ("binance",)
+    assert workload.active_file_count == 15
+
+
+def test_workload_schema_rejects_noncanonical_relative_scope_order() -> None:
+    data = _workload_data()
+    data["exchanges"] = ["okx", "binance"]
+
+    with pytest.raises(ValidationError, match="canonical relative order"):
+        GateWorkloadV1.model_validate(data)
+
+
 @pytest.mark.parametrize("value", [1, 1.0, True, Decimal(1)])
 def test_workload_rejects_non_string_rates(value: object) -> None:
     data = _workload_data()

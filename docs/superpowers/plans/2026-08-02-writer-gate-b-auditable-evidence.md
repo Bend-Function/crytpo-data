@@ -304,7 +304,7 @@ build_native_draft(event: PlannedEventV1, *, admission_started_utc_ns: int)
 
 Implement exact Decimal/ceiling math, explicit identity ordering, zero-based
 allocation, SHA event IDs, full-second burst schedule, payload selectors/padding, and
-the deterministic `NativeEventDraft`/source/shard profile in design sections 4.2-4.7.
+the deterministic `NativeEventDraft`/source/shard profile in design sections 4.2-4.8.
 Use at most one per-stream burst tie group plus one event per stream in memory; merge
 the fixed stream iterators with `heapq.merge`.
 
@@ -321,7 +321,9 @@ design formula, then type the literals into JSON. Production code must not conta
 golden-file writer.
 
 Normal unit tests validate micro and 10-second vectors. Mark the full 10-minute
-streamed plan-hash test `@pytest.mark.performance` so the offline suite stays bounded.
+streamed plan-hash test `@pytest.mark.performance` and require
+`CRYPTO_COLLECTOR_FULL_GATE_ORACLE=1` so the offline suite stays bounded. Golden
+maintenance and qualification verification run that opt-in test explicitly.
 
 - [ ] **Step 6: Run focused and property tests**
 
@@ -337,6 +339,12 @@ git diff --check
 ```
 
 Expected: PASS, including exact `417677`, `25060620`, `3172`, and `3505` facts.
+For the reviewed full-hash maintenance run, additionally execute:
+
+```bash
+CRYPTO_COLLECTOR_FULL_GATE_ORACLE=1 .venv/bin/python -m pytest \
+  tests/performance/test_writer_durability.py::test_qualification_plan_matches_literal_golden_hash -q
+```
 
 - [ ] **Step 7: Commit Task 2**
 

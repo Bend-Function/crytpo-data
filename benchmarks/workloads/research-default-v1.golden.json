@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "workload_name": "research-default-v1",
+  "workload_sha256": "4a1594dc8e0b05c56465207218631b8c57f26b6a1918468c6d1121126a64f69b",
+  "algorithms": {
+    "identity": "gate-identity-v1",
+    "event": "gate-event-v1",
+    "payload": "gate-payload-v1",
+    "schedule": "gate-schedule-v2-full-second-burst"
+  },
+  "identity_vectors": [
+    {
+      "name": "ordinary_first",
+      "stream_group": "trade",
+      "identity_index": 0,
+      "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:trade",
+      "allocated_event_count": 500
+    },
+    {
+      "name": "ordinary_lane_boundary",
+      "stream_group": "trade",
+      "identity_index": 25,
+      "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0001-S0000:trade",
+      "allocated_event_count": 500
+    },
+    {
+      "name": "ordinary_market_boundary",
+      "stream_group": "trade",
+      "identity_index": 50,
+      "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:trade",
+      "allocated_event_count": 500
+    },
+    {
+      "name": "ordinary_exchange_boundary",
+      "stream_group": "trade",
+      "identity_index": 100,
+      "canonical_identity": "gate-identity-v1:okx:spot:GATE-OKX-SPOT-L0000-S0000:trade",
+      "allocated_event_count": 500
+    },
+    {
+      "name": "ordinary_last",
+      "stream_group": "trade",
+      "identity_index": 499,
+      "canonical_identity": "gate-identity-v1:kraken:perpetual:GATE-KRAKEN-PERPETUAL-L0001-S0024:trade",
+      "allocated_event_count": 500
+    },
+    {
+      "name": "derivative_first_funding",
+      "stream_group": "derivative",
+      "identity_index": 0,
+      "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:funding",
+      "allocated_event_count": 20
+    },
+    {
+      "name": "derivative_first_open_interest",
+      "stream_group": "derivative",
+      "identity_index": 1,
+      "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:open_interest",
+      "allocated_event_count": 20
+    },
+    {
+      "name": "derivative_lane_boundary",
+      "stream_group": "derivative",
+      "identity_index": 50,
+      "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0001-S0000:funding",
+      "allocated_event_count": 20
+    },
+    {
+      "name": "derivative_exchange_boundary",
+      "stream_group": "derivative",
+      "identity_index": 100,
+      "canonical_identity": "gate-identity-v1:okx:perpetual:GATE-OKX-PERPETUAL-L0000-S0000:funding",
+      "allocated_event_count": 20
+    },
+    {
+      "name": "derivative_last",
+      "stream_group": "derivative",
+      "identity_index": 499,
+      "canonical_identity": "gate-identity-v1:kraken:perpetual:GATE-KRAKEN-PERPETUAL-L0001-S0024:open_interest",
+      "allocated_event_count": 20
+    },
+    {
+      "name": "control_first",
+      "stream_group": "control",
+      "identity_index": 0,
+      "canonical_identity": "gate-identity-v1:binance:-:-:_control",
+      "allocated_event_count": 2
+    },
+    {
+      "name": "control_last",
+      "stream_group": "control",
+      "identity_index": 4,
+      "canonical_identity": "gate-identity-v1:kraken:-:-:_control",
+      "allocated_event_count": 2
+    }
+  ],
+  "plans": {
+    "functional_10s_multiplier_2": {
+      "duration_ns": 10000000000,
+      "multiplier": 2,
+      "expected_record_count": 417677,
+      "declared_file_identity_count": 3505,
+      "expected_touched_file_identity_count": 3172,
+      "expected_payload_byte_count": 3666721024,
+      "workload_plan_sha256": "5619377d452c70f05337a55ba4cf277edfd8835cae3d2c76a88949d25fb59429",
+      "streams": {
+        "trade": {
+          "summary": {"expected_record_count": 250000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 250000, "scheduled_burst_count": 250000, "burst_second": 4, "expected_payload_byte_count": 334776688},
+          "selected_event": {"planned_event_id": "73833497be24f40faf60b647aa86345407852b5e80396b99d8bf4ff986689bed", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:trade", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 1400, "payload_sha256": "bcd67658d77eff5b95f638cf11ab0eaaccb76bf66628f7135aa29268282619bc"}
+        },
+        "book_live": {
+          "summary": {"expected_record_count": 100000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 50000, "scheduled_burst_count": 50000, "burst_second": 7, "expected_payload_byte_count": 3203702784},
+          "selected_event": {"planned_event_id": "0e0f493e592df6815a808019031890087b7c2742616d529fab5879c398bdd662", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_live", "local_sequence": 0, "due_offset_ns": 7000000000, "deadline_offset_ns": 8000000000, "payload_bytes": 32768, "payload_sha256": "2c5496ada5d8585e92bf36e5bf46c0e51fe8ade8f171384814f80a18a62482a6"}
+        },
+        "ticker": {
+          "summary": {"expected_record_count": 5000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 2500, "scheduled_burst_count": 2500, "burst_second": 0, "expected_payload_byte_count": 10194992},
+          "selected_event": {"planned_event_id": "7b33b24bcf443ad770466cb8843e3e8db35d832d748cada127f0abd0fb5f844c", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:ticker", "local_sequence": 0, "due_offset_ns": 0, "deadline_offset_ns": 1000000000, "payload_bytes": 2400, "payload_sha256": "140179f61868dfc46436c7a6e1f05b6bd363e185324ae693db23852bb2cd243d"}
+        },
+        "bbo": {
+          "summary": {"expected_record_count": 50000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 25000, "scheduled_burst_count": 25000, "burst_second": 4, "expected_payload_byte_count": 45135192},
+          "selected_event": {"planned_event_id": "41dfbb3c18d4f127934234dc162c4ee6296d6cc8913a4f14d9b92f3415e5766a", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:bbo", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 500, "payload_sha256": "f4692caef166dc896213e72560280d58db8195c5ab02b957c99cc316209038c5"}
+        },
+        "derivative": {
+          "summary": {"expected_record_count": 10000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 5000, "scheduled_burst_count": 5000, "burst_second": 5, "expected_payload_byte_count": 28615200},
+          "selected_event": {"planned_event_id": "c33d7aa2303483442809d61ea1922eb986711d6ab27d856359cf146858b1e9fa", "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:funding", "local_sequence": 0, "due_offset_ns": 5000000000, "deadline_offset_ns": 6000000000, "payload_bytes": 3000, "payload_sha256": "a4cc951cfba9a97176ad329ea8433f81cbe1e3d3c789c78f4693b8c5316f77a4"}
+        },
+        "candle_1m": {
+          "summary": {"expected_record_count": 2500, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 1000, "scheduled_burst_count": 1000, "burst_second": 4, "expected_payload_byte_count": 4041864},
+          "selected_event": {"planned_event_id": "a302ad56b081c8f84b89ee8ff060628a897eaa6073547053432e86b64d9350fd", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:candle_1m", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 4096, "payload_sha256": "05106e44a75e88d742cf4dd3753fcc0ababfff93996a5ee3c48fed370ae912fc"}
+        },
+        "book_deep_snapshot": {
+          "summary": {"expected_record_count": 167, "identity_count": 500, "expected_touched_file_identity_count": 167, "required_burst_count": 500, "scheduled_burst_count": 167, "burst_second": 7, "expected_payload_byte_count": 40239104},
+          "selected_event": {"planned_event_id": "ddd1098fd95d49132012e52116f911085e9edf0f865f73b7f1a971326a1b6dad", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_deep_snapshot", "local_sequence": 0, "due_offset_ns": 7000000000, "deadline_offset_ns": 8000000000, "payload_bytes": 262144, "payload_sha256": "3602351ffc50cf69ea4c953048cf63139ab1171dc9849d1d6ee0f84e8c0a5432"}
+        },
+        "control": {
+          "summary": {"expected_record_count": 10, "identity_count": 5, "expected_touched_file_identity_count": 5, "required_burst_count": 100, "scheduled_burst_count": 10, "burst_second": 4, "expected_payload_byte_count": 15200},
+          "selected_event": {"planned_event_id": "d1afad02a9851accac4e3725f8eae01e88e377962dfd75e4d16bd64901a4ce88", "canonical_identity": "gate-identity-v1:binance:-:-:_control", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 2000, "payload_sha256": "99a1a9b12a7358bf9bffe9ed807e84e6e540d6b9c14c5d53319ea854654df855"}
+        }
+      }
+    },
+    "qualification_10m_multiplier_2": {
+      "duration_ns": 600000000000,
+      "multiplier": 2,
+      "expected_record_count": 25060620,
+      "declared_file_identity_count": 3505,
+      "expected_touched_file_identity_count": 3505,
+      "expected_payload_byte_count": 219164642984,
+      "workload_plan_sha256": "0f29b8c50dbed9ca12899b74339e6dd45ef441678c49e202b50718c3e5738518",
+      "streams": {
+        "trade": {"summary": {"expected_record_count": 15000000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 250000, "scheduled_burst_count": 250000, "burst_second": 86, "expected_payload_byte_count": 20106023944}},
+        "book_live": {"summary": {"expected_record_count": 6000000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 50000, "scheduled_burst_count": 50000, "burst_second": 217, "expected_payload_byte_count": 191396044800}},
+        "ticker": {"summary": {"expected_record_count": 300000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 2500, "scheduled_burst_count": 2500, "burst_second": 81, "expected_payload_byte_count": 625200128}},
+        "bbo": {"summary": {"expected_record_count": 3000000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 25000, "scheduled_burst_count": 25000, "burst_second": 268, "expected_payload_byte_count": 2716712456}},
+        "derivative": {"summary": {"expected_record_count": 600000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 5000, "scheduled_burst_count": 5000, "burst_second": 223, "expected_payload_byte_count": 1722086680}},
+        "candle_1m": {"summary": {"expected_record_count": 150000, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 1000, "scheduled_burst_count": 1000, "burst_second": 488, "expected_payload_byte_count": 240781744}},
+        "book_deep_snapshot": {"summary": {"expected_record_count": 10020, "identity_count": 500, "expected_touched_file_identity_count": 500, "required_burst_count": 500, "scheduled_burst_count": 500, "burst_second": 596, "expected_payload_byte_count": 2356805632}},
+        "control": {"summary": {"expected_record_count": 600, "identity_count": 5, "expected_touched_file_identity_count": 5, "required_burst_count": 100, "scheduled_burst_count": 100, "burst_second": 225, "expected_payload_byte_count": 987600}}
+      }
+    }
+  },
+  "micro_profile": {
+    "workload_sha256": "8cd5c8557c14830f64cab866f755372cb3d9f4ff8d1d0a93ba2beaa7dddc9329",
+    "duration_ns": 10000000000,
+    "multiplier": 1,
+    "expected_record_count": 32,
+    "declared_file_identity_count": 15,
+    "expected_touched_file_identity_count": 14,
+    "expected_payload_byte_count": 11648,
+    "workload_plan_sha256": "2854f091be40a190ff419d4559316cdaa49d8bea1ae05c90d905a07f16f0ba65",
+    "streams": {
+      "trade": {
+        "summary": {"expected_record_count": 20, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 4, "scheduled_burst_count": 4, "burst_second": 4, "expected_payload_byte_count": 7168},
+        "selected_event": {"planned_event_id": "73833497be24f40faf60b647aa86345407852b5e80396b99d8bf4ff986689bed", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:trade", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 384, "payload_sha256": "4833019a5ff30bc59f2ea057e82405082dff52163a1e30475de8c66739a5d2cd", "payload": {"algorithm": "gate-payload-v1", "event_id": "73833497be24f40faf60b647aa86345407852b5e80396b99d8bf4ff986689bed", "stream": "trade", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:trade", "local_sequence": 0, "value": 85007970, "padding": "iaCK5O-Gmzxu0XlM3MxvJ8TDSY-PFAFHoBSiTXqt4TcOMz0yjInjEgBSqHNQLi2JcwgDc1Fa7kmiqhvAw5t7aG4pkIP_5GJ0zZXxoGUXFPOmO2_ei9pTNEVS04xryb_btA"}}
+      },
+      "book_live": {
+        "summary": {"expected_record_count": 2, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 2, "scheduled_burst_count": 2, "burst_second": 7, "expected_payload_byte_count": 704},
+        "selected_event": {"planned_event_id": "0e0f493e592df6815a808019031890087b7c2742616d529fab5879c398bdd662", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_live", "local_sequence": 0, "due_offset_ns": 7000000000, "deadline_offset_ns": 8000000000, "payload_bytes": 384, "payload_sha256": "e32488475cdf3e605ef3c5da5200b2c5ca8e8fb8aaaee877ecee454e05c1a295", "payload": {"algorithm": "gate-payload-v1", "event_id": "0e0f493e592df6815a808019031890087b7c2742616d529fab5879c398bdd662", "stream": "book_live", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_live", "local_sequence": 0, "value": 53487565, "padding": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+      },
+      "ticker": {
+        "summary": {"expected_record_count": 1, "identity_count": 2, "expected_touched_file_identity_count": 1, "required_burst_count": 4, "scheduled_burst_count": 1, "burst_second": 0, "expected_payload_byte_count": 384},
+        "selected_event": {"planned_event_id": "7b33b24bcf443ad770466cb8843e3e8db35d832d748cada127f0abd0fb5f844c", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:ticker", "local_sequence": 0, "due_offset_ns": 0, "deadline_offset_ns": 1000000000, "payload_bytes": 384, "payload_sha256": "c46580cd7127a2377b2db26a68a89cab166abdff16574687514b3932aea15f07", "payload": {"algorithm": "gate-payload-v1", "event_id": "7b33b24bcf443ad770466cb8843e3e8db35d832d748cada127f0abd0fb5f844c", "stream": "ticker", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:ticker", "local_sequence": 0, "value_00": "1910182.47718826", "padding": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+      },
+      "bbo": {
+        "summary": {"expected_record_count": 2, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 2, "scheduled_burst_count": 2, "burst_second": 4, "expected_payload_byte_count": 640},
+        "selected_event": {"planned_event_id": "41dfbb3c18d4f127934234dc162c4ee6296d6cc8913a4f14d9b92f3415e5766a", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:bbo", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 320, "payload_sha256": "73ebed6952848c969a62b63e73a25dbef1977168e80a6c0a10cc5a85c6417e5e", "payload": {"algorithm": "gate-payload-v1", "event_id": "41dfbb3c18d4f127934234dc162c4ee6296d6cc8913a4f14d9b92f3415e5766a", "stream": "bbo", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:bbo", "local_sequence": 0, "value": "90757860.36841283", "padding": "RpkiR8BQq25DuR_ROwVpkD_xlF-PsJPepOwZdf_4lwe6UdLwsjYLWchFF-f"}}
+      },
+      "derivative": {
+        "summary": {"expected_record_count": 2, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 2, "scheduled_burst_count": 2, "burst_second": 5, "expected_payload_byte_count": 768},
+        "selected_event": {"planned_event_id": "c33d7aa2303483442809d61ea1922eb986711d6ab27d856359cf146858b1e9fa", "canonical_identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:funding", "local_sequence": 0, "due_offset_ns": 5000000000, "deadline_offset_ns": 6000000000, "payload_bytes": 384, "payload_sha256": "934c01c03c08df6bad7a6d614b2d3f8d7f50a32bab9d7a6babe65334a2756aea", "payload": {"algorithm": "gate-payload-v1", "event_id": "c33d7aa2303483442809d61ea1922eb986711d6ab27d856359cf146858b1e9fa", "stream": "funding", "identity": "gate-identity-v1:binance:perpetual:GATE-BINANCE-PERPETUAL-L0000-S0000:funding", "local_sequence": 0, "value": "7084979.62484959", "padding": "ZzCLD1dOQniDJf8CZ7900l7NsiCo49j8b3DvPESfvZ4S7mvNkCoLkA2fOje92iNtw5LuKP7itDBPHjz5j9gi_QWiUn7puV3XsXC_TbfdWB"}}
+      },
+      "candle_1m": {
+        "summary": {"expected_record_count": 2, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 2, "scheduled_burst_count": 2, "burst_second": 4, "expected_payload_byte_count": 896},
+        "selected_event": {"planned_event_id": "a302ad56b081c8f84b89ee8ff060628a897eaa6073547053432e86b64d9350fd", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:candle_1m", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 512, "payload_sha256": "468c5c954f77d5d1cbfe555e0c26c89d0bbdab4b890a33c1425c732808957313", "payload": {"algorithm": "gate-payload-v1", "event_id": "a302ad56b081c8f84b89ee8ff060628a897eaa6073547053432e86b64d9350fd", "stream": "candle_1m", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:candle_1m", "local_sequence": 0, "value": 81917937, "padding": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+      },
+      "book_deep_snapshot": {
+        "summary": {"expected_record_count": 2, "identity_count": 2, "expected_touched_file_identity_count": 2, "required_burst_count": 2, "scheduled_burst_count": 2, "burst_second": 7, "expected_payload_byte_count": 704},
+        "selected_event": {"planned_event_id": "ddd1098fd95d49132012e52116f911085e9edf0f865f73b7f1a971326a1b6dad", "canonical_identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_deep_snapshot", "local_sequence": 0, "due_offset_ns": 7000000000, "deadline_offset_ns": 8000000000, "payload_bytes": 384, "payload_sha256": "2c960a37eb5b96a5d25d71ce3e6e417c64f666da7524d3425cd39b768398291e", "payload": {"algorithm": "gate-payload-v1", "event_id": "ddd1098fd95d49132012e52116f911085e9edf0f865f73b7f1a971326a1b6dad", "stream": "book_deep_snapshot", "identity": "gate-identity-v1:binance:spot:GATE-BINANCE-SPOT-L0000-S0000:book_deep_snapshot", "local_sequence": 0, "value": "33703957.39941507", "padding": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+      },
+      "control": {
+        "summary": {"expected_record_count": 1, "identity_count": 1, "expected_touched_file_identity_count": 1, "required_burst_count": 1, "scheduled_burst_count": 1, "burst_second": 4, "expected_payload_byte_count": 384},
+        "selected_event": {"planned_event_id": "d1afad02a9851accac4e3725f8eae01e88e377962dfd75e4d16bd64901a4ce88", "canonical_identity": "gate-identity-v1:binance:-:-:_control", "local_sequence": 0, "due_offset_ns": 4000000000, "deadline_offset_ns": 5000000000, "payload_bytes": 384, "payload_sha256": "451a839f89af3b4b69f690adf938b6acc96d213428e967bfe82639f3541281f9", "payload": {"algorithm": "gate-payload-v1", "event_id": "d1afad02a9851accac4e3725f8eae01e88e377962dfd75e4d16bd64901a4ce88", "stream": "_control", "identity": "gate-identity-v1:binance:-:-:_control", "local_sequence": 0, "value": "87239986.54299850", "kind": "writer_gate_control", "affected_markets": ["spot", "perpetual"], "padding": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}
+      }
+    }
+  }
+}

@@ -134,12 +134,20 @@ peak.
 ### 4.3 Exact counts and allocation
 
 Rates are strict decimal strings parsed as `Decimal`. Binary float input is rejected.
+Every Decimal used by the oracle is converted to its exact integer numerator and
+denominator before multiplication, ceiling, or selector-threshold floor. The process
+Decimal context therefore cannot affect any count, payload, or hash.
 For each stream group:
 
 ```
 required_rate = base_instances * mean_records_per_second * M
 N = ceil(required_rate * duration_ns / 1_000_000_000)
 ```
+
+`base_instances` is the stream's `instances` for ordinary/control groups and
+`file_instances` for the derivative group. Derivative `instrument_instances` exists
+only to prove that each instrument expands to exactly the declared `funding` and
+`open_interest` files; it is not the rate multiplier.
 
 Ordinary and derivative rows allocate `N` over their scaled identity count. Control
 allocates `N` over five fixed identities; multiplier affects its rate, not its files.
@@ -227,8 +235,9 @@ Independent selector names `size`, `decimal`, `common-key`, `incompressible`,
 - common-key layout using the exact repeated-key fraction threshold;
 - pseudorandom padding using the exact incompressible fraction threshold.
 
-Fraction thresholds are `floor(Decimal(fraction) * 2**64)`, and a feature is selected
-when its lane is strictly below its threshold. Common layouts use the key `value`;
+Fraction thresholds are computed as exact integer division
+`numerator(fraction) * 2**64 // denominator(fraction)`, and a feature is selected when
+its lane is strictly below its threshold. Common layouts use the key `value`;
 uncommon layouts use `value_00` through `value_15`, selected by
 `uncommon-key % 16`. The selected value is the integer `decimal-whole % 100000000`
 unless decimal layout is selected, in which case it is the string
@@ -236,8 +245,15 @@ unless decimal layout is selected, in which case it is the string
 
 The payload mapping insertion order is exactly `algorithm`, `event_id`, `stream`,
 `identity`, `local_sequence`, the selected value key, then `padding`. Control payloads
-insert `affected_markets: ["spot", "perpetual"]` immediately before `padding`. The
-repository encoder preserves that order. No other optional field is omitted.
+insert `kind: "writer_gate_control"` and
+`affected_markets: ["spot", "perpetual"]`, in that order, immediately before
+`padding`. This makes the generated draft valid under the production control-ingress
+contract without changing the payload after its SHA is bound. The repository encoder
+preserves that order. No other optional field is omitted.
+
+The payload `stream` value is always the expanded identity's logical stream. In
+particular derivative payloads use `funding` or `open_interest`, never the
+`derivative` stream-group name.
 
 The encoder first measures the base payload with an empty `padding` string. It rejects
 a target smaller than that encoding. Padding is then exactly the remaining number of
@@ -251,7 +267,56 @@ contract error.
 lengths. Raw envelope bytes and compressed file bytes are separate observations and
 cannot satisfy this predicate.
 
-### 4.6 Golden vectors
+### 4.6 Canonical workload-plan rows
+
+Every workload-plan record is repository canonical JSON followed by one ASCII newline.
+Enums use their string values, Decimal fields use their canonical strings, null fields
+remain explicit JSON `null`, and no key sorting is applied. The hash input is exactly
+one header row, eight stream-summary rows in declared stream-group order, and every
+event row globally ordered by `(due_offset_ns, planned_event_id)`. The payload body is
+not embedded in an event row; its exact byte count and SHA bind it instead.
+
+The header key order is exactly:
+
+```text
+schema_version, record_type, workload_sha256, workload_name, generation_seed,
+identity_algorithm, event_algorithm, payload_algorithm, schedule_algorithm,
+multiplier, duration_ns, duration_seconds, declared_file_identity_count,
+expected_touched_file_identity_count, expected_record_count
+```
+
+The stream-summary key order is exactly:
+
+```text
+schema_version, record_type, stream_group, logical_streams, transports, exchanges,
+markets, symbols_per_market, generation_seed, identity_algorithm, event_algorithm,
+payload_algorithm, schedule_algorithm, multiplier, duration_ns, base_instance_count,
+identity_count, mean_records_per_second, burst_records_in_1s, payload_p50_bytes,
+payload_p95_bytes, payload_max_bytes, decimal_string_fraction,
+repeated_key_fraction, incompressible_fraction, expected_record_count,
+expected_touched_file_identity_count, required_burst_count, scheduled_burst_count,
+burst_second, burst_start_ns, expected_payload_byte_count
+```
+
+The event key order is exactly:
+
+```text
+schema_version, record_type, identity_algorithm, event_algorithm, payload_algorithm,
+schedule_algorithm, planned_event_id, stream_group, logical_stream, exchange, market,
+lane_index, symbol_index, instrument_key, canonical_identity, identity_index,
+local_sequence, transport, due_offset_ns, deadline_offset_ns, payload_bytes,
+payload_sha256
+```
+
+`PlannedEventV1` validates the standalone row shape, identity grammar, transport,
+deadline, and canonical payload binding. It cannot by itself prove the seed-derived
+event ID, allocation index, or plan-derived due time because those inputs are not
+duplicated into each row. Only events emitted by `iter_plan_events(plan)` may be passed
+to `build_native_draft`; evidence deserialization is never an authenticity boundary.
+The runtime verifier establishes authenticity by rebuilding the bound plan and
+requiring an exact canonical-line match in global order.
+
+### 4.7 Golden vectors
 
 A committed `research-default-v1.golden.json` contains literal, reviewable values:
 
@@ -269,7 +334,7 @@ Tests compare oracle output with these literals. Tests must not generate or upda
 golden file through the production oracle. A separate reviewed maintenance command may
 print candidate vectors, but it cannot overwrite the committed file.
 
-### 4.7 Deterministic draft and source profile
+### 4.8 Deterministic draft and source profile
 
 Every exchange worker ID is exactly `gate-worker-v1-<exchange>`. The workload declares
 these stream transports:
