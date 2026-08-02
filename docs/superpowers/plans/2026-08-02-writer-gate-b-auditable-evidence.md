@@ -423,7 +423,7 @@ git commit -m "feat: add deterministic writer gate oracle"
 - Modify: `src/crypto_collector/benchmarks/oracle.py`
 - Modify: `tests/unit/benchmarks/test_oracle.py`
 
-- [ ] **Step 1: Write partition-equivalence RED tests**
+- [x] **Step 1: Write partition-equivalence RED tests**
 
 Build a strict two-exchange micro plan. Assert every partition contains only its
 requested exchange and this merge is exact at the model and canonical-byte levels:
@@ -442,7 +442,7 @@ stream groups, invalid exchange type, and an exchange absent from the plan. Asse
 each partition count equals the sum of allocations for that exchange. The test must
 fail because `iter_exchange_plan_events` does not exist.
 
-- [ ] **Step 2: Implement bounded partition iteration**
+- [x] **Step 2: Implement bounded partition iteration**
 
 Expose:
 
@@ -458,7 +458,7 @@ exchange's burst tie group and same-due smooth group; heap-merge the fixed eight
 iterators. The five exchange iterators must merge exactly to the existing global
 iterator, so this addition cannot change any workload-plan or golden hash.
 
-- [ ] **Step 3: Run focused and full oracle gates**
+- [x] **Step 3: Run focused and full oracle gates**
 
 ```bash
 .venv/bin/python -m pytest tests/unit/benchmarks/test_oracle.py -q
@@ -470,7 +470,7 @@ iterator, so this addition cannot change any workload-plan or golden hash.
 git diff --check
 ```
 
-- [ ] **Step 4: Review, commit, and push**
+- [x] **Step 4: Review, commit, and push**
 
 ```bash
 git add src/crypto_collector/benchmarks/oracle.py \
