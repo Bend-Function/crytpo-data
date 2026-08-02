@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from typing import Annotated, Literal, Self
@@ -55,6 +56,7 @@ LogicalStream = Literal[
     "_control",
 ]
 ProcessRole = Literal["supervisor", "exchange_worker"]
+EvidenceMode = Literal["functional", "qualification"]
 
 CANONICAL_EXCHANGES = (
     Exchange.BINANCE,
@@ -66,6 +68,9 @@ CANONICAL_EXCHANGES = (
 EMPTY_SHA256 = sha256(b"").hexdigest()
 _CANONICAL_NONNEGATIVE_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
 _NORMALIZED_ABSOLUTE_POSIX_PATH = re.compile(r"/(?:[^/\x00]+(?:/[^/\x00]+)*)?\Z")
+_RUNTIME_DAG_RESERVED_PATHS = frozenset(
+    {"run-index.json", "runtime-receipt.json", "runtime-index.json"}
+)
 
 
 def _worker_instance_id(exchange: Exchange) -> str:
@@ -80,6 +85,19 @@ def _validate_artifact_relative_path(value: str) -> str:
 
 
 ArtifactRelativePath = Annotated[str, AfterValidator(_validate_artifact_relative_path)]
+
+
+def _validate_document_relative_path(value: str) -> str:
+    normalized = validate_normalized_data_relative_path(value)
+    if not normalized.endswith((".json", ".yaml")):
+        raise ValueError("evidence document path must end with .json or .yaml")
+    return normalized
+
+
+DocumentRelativePath = Annotated[
+    str,
+    AfterValidator(_validate_document_relative_path),
+]
 
 
 def _normalize_nonnegative_decimal(value: object) -> Decimal:
@@ -112,6 +130,29 @@ TargetId = Annotated[
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
+]
+CanonicalRunId = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+    ),
+]
+GitCommitSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
+ImageId = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
+FailureCode = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
+    ),
+]
+UtcHour = Annotated[
+    str,
+    StringConstraints(pattern=r"^[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{2}$"),
 ]
 
 
@@ -960,22 +1001,542 @@ class GateTargetReprobeV1(_SelfHashingGateContract):
         return self
 
 
+class GateEvidenceDocumentRefV1(_GateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_evidence_document_ref_v1"] = (
+        "gate_evidence_document_ref_v1"
+    )
+    relative_path: DocumentRelativePath
+    content_size_bytes: PositiveInt
+    content_sha256: Sha256
+
+
+class GateManifestInventoryEntryV1(_GateContract):
+    ordinal: NonNegativeInt
+    manifest: GateEvidenceDocumentRefV1
+    data: GateArtifactRefV1
+    manifest_record_count: PositiveInt
+
+    @model_validator(mode="after")
+    def validate_entry(self) -> Self:
+        expected_manifest_path = (
+            self.data.relative_path.removesuffix(".jsonl.zst") + ".manifest.json"
+        )
+        if self.manifest.relative_path != expected_manifest_path:
+            raise ValueError("manifest inventory paths must be exact siblings")
+        if self.manifest_record_count != self.data.row_count:
+            raise ValueError("manifest and data record counts must agree")
+        return self
+
+
+class GateRawInventoryV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_raw_inventory_v1"] = "gate_raw_inventory_v1"
+    raw_files: tuple[GateArtifactRefV1, ...]
+    file_count: PositiveInt
+    record_count: PositiveInt
+    content_size_bytes: PositiveInt
+    compressed_size_bytes: PositiveInt
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> Self:
+        paths = tuple(item.relative_path for item in self.raw_files)
+        if not paths or paths != tuple(sorted(set(paths))):
+            raise ValueError("raw inventory paths must be nonempty, sorted, and unique")
+        content_hashes = tuple(item.content_sha256 for item in self.raw_files)
+        compressed_hashes = tuple(item.compressed_sha256 for item in self.raw_files)
+        if len(set(content_hashes)) != len(content_hashes) or len(
+            set(compressed_hashes)
+        ) != len(compressed_hashes):
+            raise ValueError("raw inventory content hashes must be unique")
+        expected = (
+            len(self.raw_files),
+            sum(item.row_count for item in self.raw_files),
+            sum(item.content_size_bytes for item in self.raw_files),
+            sum(item.compressed_size_bytes for item in self.raw_files),
+        )
+        observed = (
+            self.file_count,
+            self.record_count,
+            self.content_size_bytes,
+            self.compressed_size_bytes,
+        )
+        if observed != expected:
+            raise ValueError("raw inventory totals do not match its files")
+        return self
+
+
+class GateManifestInventoryV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_manifest_inventory_v1"] = "gate_manifest_inventory_v1"
+    manifests: tuple[GateManifestInventoryEntryV1, ...]
+    file_count: PositiveInt
+    record_count: PositiveInt
+    manifest_content_size_bytes: PositiveInt
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_inventory(self) -> Self:
+        paths = tuple(item.manifest.relative_path for item in self.manifests)
+        ordinals = tuple(item.ordinal for item in self.manifests)
+        data_paths = tuple(item.data.relative_path for item in self.manifests)
+        if not paths or paths != tuple(sorted(set(paths))):
+            raise ValueError(
+                "manifest inventory paths must be nonempty, sorted, and unique"
+            )
+        if ordinals != tuple(range(len(self.manifests))):
+            raise ValueError(
+                "manifest inventory ordinals must be zero-based consecutive"
+            )
+        if len(set(data_paths)) != len(data_paths):
+            raise ValueError("manifest inventory data paths must be unique")
+        hash_namespaces = (
+            tuple(item.manifest.content_sha256 for item in self.manifests),
+            tuple(item.data.content_sha256 for item in self.manifests),
+            tuple(item.data.compressed_sha256 for item in self.manifests),
+        )
+        if any(len(set(values)) != len(values) for values in hash_namespaces):
+            raise ValueError("manifest inventory hashes must be unique")
+        expected = (
+            len(self.manifests),
+            sum(item.manifest_record_count for item in self.manifests),
+            sum(item.manifest.content_size_bytes for item in self.manifests),
+        )
+        observed = (
+            self.file_count,
+            self.record_count,
+            self.manifest_content_size_bytes,
+        )
+        if observed != expected:
+            raise ValueError("manifest inventory totals do not match its entries")
+        return self
+
+
+class GateStreamRuntimeSummaryV1(_GateContract):
+    stream_group: StreamGroup
+    expected_record_count: PositiveInt
+    expected_payload_bytes: PositiveInt
+    scheduled_record_count: NonNegativeInt
+    scheduled_payload_bytes: NonNegativeInt
+    attempted_record_count: NonNegativeInt
+    attempted_payload_bytes: NonNegativeInt
+    accepted_record_count: NonNegativeInt
+    accepted_payload_bytes: NonNegativeInt
+    early_count: NonNegativeInt
+    late_count: NonNegativeInt
+    out_of_window_count: NonNegativeInt
+    required_burst_count: PositiveInt
+    scheduled_burst_count: PositiveInt
+    burst_second: NonNegativeInt
+    burst_scheduled_count: NonNegativeInt
+    burst_attempted_count: NonNegativeInt
+    burst_accepted_count: NonNegativeInt
+    burst_admitted_in_actual_second_count: NonNegativeInt
+    planned_values_match: bool
+    admission_values_match: bool
+    burst_valid: bool
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> Self:
+        if self.scheduled_burst_count != min(
+            self.expected_record_count,
+            self.required_burst_count,
+        ):
+            raise ValueError("scheduled burst count is inconsistent")
+        expected_planned = (
+            self.scheduled_record_count == self.expected_record_count
+            and self.scheduled_payload_bytes == self.expected_payload_bytes
+        )
+        if self.planned_values_match != expected_planned:
+            raise ValueError("planned-values match flag is inconsistent")
+        expected_admission = (
+            self.attempted_record_count
+            == self.accepted_record_count
+            == self.expected_record_count
+            and self.attempted_payload_bytes
+            == self.accepted_payload_bytes
+            == self.expected_payload_bytes
+            and self.early_count == 0
+            and self.late_count == 0
+            and self.out_of_window_count == 0
+        )
+        if self.admission_values_match != expected_admission:
+            raise ValueError("admission-values match flag is inconsistent")
+        expected_burst = all(
+            value == self.scheduled_burst_count
+            for value in (
+                self.burst_scheduled_count,
+                self.burst_attempted_count,
+                self.burst_accepted_count,
+                self.burst_admitted_in_actual_second_count,
+            )
+        )
+        if self.burst_valid != expected_burst:
+            raise ValueError("burst validity flag is inconsistent")
+        return self
+
+
+class GateRuntimeSummaryV1(_GateContract):
+    expected_record_count: PositiveInt
+    expected_payload_bytes: PositiveInt
+    scheduled_record_count: NonNegativeInt
+    scheduled_payload_bytes: NonNegativeInt
+    attempted_record_count: NonNegativeInt
+    attempted_payload_bytes: NonNegativeInt
+    accepted_record_count: NonNegativeInt
+    accepted_payload_bytes: NonNegativeInt
+    durable_record_count: NonNegativeInt
+    durable_payload_bytes: NonNegativeInt
+    durability_sample_count: NonNegativeInt
+    manifest_record_count: NonNegativeInt
+    raw_file_count: PositiveInt
+    manifest_file_count: PositiveInt
+    declared_file_identity_count: PositiveInt
+    expected_touched_file_identity_count: PositiveInt
+    observed_touched_file_identity_count: PositiveInt
+    accepted_identity_count: NonNegativeInt
+    unique_accepted_identity_count: NonNegativeInt
+    early_count: NonNegativeInt
+    late_count: NonNegativeInt
+    out_of_window_count: NonNegativeInt
+    received_utc_hours: tuple[UtcHour, ...]
+    stream_summaries: tuple[GateStreamRuntimeSummaryV1, ...]
+    final_worker_aggregate: FinalWorkerAggregateV1
+    resource_summary: GateResourceSummaryV1
+    storage_health_summary: GateStorageHealthSummaryV1
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> Self:
+        observed_streams = tuple(item.stream_group for item in self.stream_summaries)
+        expected_streams = (
+            "trade",
+            "book_live",
+            "ticker",
+            "bbo",
+            "derivative",
+            "candle_1m",
+            "book_deep_snapshot",
+            "control",
+        )
+        if observed_streams != expected_streams:
+            raise ValueError("runtime stream summaries must use canonical order")
+        field_pairs = (
+            ("expected_record_count", "expected_record_count"),
+            ("expected_payload_bytes", "expected_payload_bytes"),
+            ("scheduled_record_count", "scheduled_record_count"),
+            ("scheduled_payload_bytes", "scheduled_payload_bytes"),
+            ("attempted_record_count", "attempted_record_count"),
+            ("attempted_payload_bytes", "attempted_payload_bytes"),
+            ("accepted_record_count", "accepted_record_count"),
+            ("accepted_payload_bytes", "accepted_payload_bytes"),
+            ("early_count", "early_count"),
+            ("late_count", "late_count"),
+            ("out_of_window_count", "out_of_window_count"),
+        )
+        for summary_field, stream_field in field_pairs:
+            if getattr(self, summary_field) != sum(
+                getattr(item, stream_field) for item in self.stream_summaries
+            ):
+                raise ValueError(f"runtime {summary_field} total is inconsistent")
+        worker_facts = (
+            self.final_worker_aggregate.accepted_record_count,
+            self.final_worker_aggregate.durable_record_count,
+            self.final_worker_aggregate.durability_sample_count,
+        )
+        summary_facts = (
+            self.accepted_record_count,
+            self.durable_record_count,
+            self.durability_sample_count,
+        )
+        if summary_facts != worker_facts:
+            raise ValueError("runtime worker aggregate facts are inconsistent")
+        if self.accepted_identity_count != self.accepted_record_count:
+            raise ValueError("accepted identity count must equal accepted records")
+        if self.unique_accepted_identity_count > self.accepted_identity_count:
+            raise ValueError(
+                "unique accepted identities exceed all accepted identities"
+            )
+        if not self.received_utc_hours:
+            raise ValueError("received UTC hours must be nonempty")
+        if self.received_utc_hours != tuple(sorted(set(self.received_utc_hours))):
+            raise ValueError("received UTC hours must be sorted and unique")
+        for hour in self.received_utc_hours:
+            try:
+                parsed = datetime.strptime(hour, "%Y/%m/%d/%H").replace(tzinfo=UTC)
+            except ValueError as error:
+                raise ValueError("received UTC hour is not a real hour") from error
+            if parsed.strftime("%Y/%m/%d/%H") != hour:
+                raise ValueError("received UTC hour is not canonical")
+        return self
+
+
+class GateCandidateReportV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_candidate_report_v1"] = "gate_candidate_report_v1"
+    run_id: CanonicalRunId
+    mode: EvidenceMode
+    workload_sha256: Sha256
+    workload_plan_sha256: Sha256
+    multiplier: PositiveInt
+    duration_ns: PositiveInt
+    run_started_monotonic_ns: NonNegativeInt
+    admission_started_monotonic_ns: NonNegativeInt
+    admission_scheduled_end_monotonic_ns: NonNegativeInt
+    admission_ended_monotonic_ns: NonNegativeInt
+    run_ended_monotonic_ns: NonNegativeInt
+    admission_started_utc_ns: NonNegativeInt
+    admission_ended_utc_ns: NonNegativeInt
+    declared_admission_utc_hour: UtcHour
+    expected_target_id: TargetId | None
+    target_declaration_sha256: Sha256 | None
+    expected_image_id: ImageId | None
+    runtime_image_id: ImageId | None
+    runtime_summary: GateRuntimeSummaryV1
+    runtime_failure_codes: tuple[FailureCode, ...]
+    candidate_runtime_passed: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        if not (
+            self.run_started_monotonic_ns
+            <= self.admission_started_monotonic_ns
+            < self.admission_scheduled_end_monotonic_ns
+            <= self.admission_ended_monotonic_ns
+            <= self.run_ended_monotonic_ns
+        ):
+            raise ValueError("candidate monotonic boundaries are inconsistent")
+        if self.admission_scheduled_end_monotonic_ns != (
+            self.admission_started_monotonic_ns + self.duration_ns
+        ):
+            raise ValueError("candidate scheduled end does not match duration")
+        if self.admission_started_utc_ns > self.admission_ended_utc_ns:
+            raise ValueError("candidate UTC admission boundaries are reversed")
+        try:
+            expected_hour = datetime.fromtimestamp(
+                self.admission_started_utc_ns // 1_000_000_000,
+                tz=UTC,
+            ).strftime("%Y/%m/%d/%H")
+        except (OverflowError, OSError, ValueError) as error:
+            raise ValueError("candidate UTC admission start is out of range") from error
+        if self.declared_admission_utc_hour != expected_hour:
+            raise ValueError("declared admission UTC hour is inconsistent")
+        mode_claims = (
+            self.expected_target_id,
+            self.target_declaration_sha256,
+            self.expected_image_id,
+            self.runtime_image_id,
+        )
+        if self.mode == "functional":
+            if any(value is not None for value in mode_claims):
+                raise ValueError("functional candidate forbids target and image claims")
+            if self.duration_ns != 10_000_000_000:
+                raise ValueError("functional candidate duration must be ten seconds")
+        else:
+            if any(value is None for value in mode_claims):
+                raise ValueError("qualification candidate requires target/image claims")
+            if self.duration_ns < 600_000_000_000 or self.multiplier < 2:
+                raise ValueError("qualification candidate is underdriven")
+        if self.runtime_failure_codes != tuple(sorted(set(self.runtime_failure_codes))):
+            raise ValueError("candidate failure codes must be sorted and unique")
+        if self.candidate_runtime_passed != (not self.runtime_failure_codes):
+            raise ValueError("candidate runtime verdict is inconsistent")
+        return self
+
+
+class GateRunIndexV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_run_index_v1"] = "gate_run_index_v1"
+    run_id: CanonicalRunId
+    status: Literal["complete"]
+    mode: EvidenceMode
+    artifact_schema_version: SchemaVersion1
+    identity_algorithm: Literal["gate-identity-v1"]
+    event_algorithm: Literal["gate-event-v1"]
+    payload_algorithm: Literal["gate-payload-v1"]
+    schedule_algorithm: Literal["gate-schedule-v2-full-second-burst"]
+    data_root: NormalizedAbsolutePosixPath
+    state_root: NormalizedAbsolutePosixPath
+    workload_document: GateEvidenceDocumentRefV1
+    workload_sha256: Sha256
+    workload_plan_sha256: Sha256
+    admission_trace_set: GateAdmissionTraceSetV1
+    second_bucket_artifact: GateArtifactRefV1
+    worker_sampling_artifact: GateArtifactRefV1
+    resource_sampling_artifact: GateArtifactRefV1
+    storage_health_artifact: GateArtifactRefV1
+    raw_inventory: GateEvidenceDocumentRefV1
+    manifest_inventory: GateEvidenceDocumentRefV1
+    candidate_report: GateEvidenceDocumentRefV1
+    expected_target_id: TargetId | None
+    target_declaration: GateEvidenceDocumentRefV1 | None
+    implementation_source_commit: GitCommitSha | None
+    collector_wheel_sha256: Sha256 | None
+    requirements_lock_sha256: Sha256 | None
+    dockerfile_sha256: Sha256 | None
+    expected_image_id: ImageId | None
+    runtime_image_id: ImageId | None
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_index(self) -> Self:
+        if self.data_root == "/" or self.state_root == "/":
+            raise ValueError("run index roots may not be filesystem root")
+        if self.data_root == self.state_root:
+            raise ValueError("run index data and state roots must be distinct")
+        if self.workload_document.content_sha256 != self.workload_sha256:
+            raise ValueError("workload document SHA must equal workload SHA")
+        document_paths = (
+            self.workload_document.relative_path,
+            self.raw_inventory.relative_path,
+            self.manifest_inventory.relative_path,
+            self.candidate_report.relative_path,
+            *(
+                ()
+                if self.target_declaration is None
+                else (self.target_declaration.relative_path,)
+            ),
+        )
+        artifact_paths = (
+            *(
+                part.artifact.relative_path
+                for part in self.admission_trace_set.partitions
+            ),
+            self.second_bucket_artifact.relative_path,
+            self.worker_sampling_artifact.relative_path,
+            self.resource_sampling_artifact.relative_path,
+            self.storage_health_artifact.relative_path,
+        )
+        all_paths = (*document_paths, *artifact_paths)
+        if len(set(all_paths)) != len(all_paths):
+            raise ValueError("run index evidence paths must be unique")
+        if _RUNTIME_DAG_RESERVED_PATHS.intersection(all_paths):
+            raise ValueError("run index evidence may not use reserved DAG paths")
+        mode_claims = (
+            self.expected_target_id,
+            self.target_declaration,
+            self.implementation_source_commit,
+            self.collector_wheel_sha256,
+            self.requirements_lock_sha256,
+            self.dockerfile_sha256,
+            self.expected_image_id,
+            self.runtime_image_id,
+        )
+        if self.mode == "functional":
+            if any(value is not None for value in mode_claims):
+                raise ValueError("functional run index forbids qualification claims")
+        elif any(value is None for value in mode_claims):
+            raise ValueError("qualification run index requires provenance claims")
+        return self
+
+
+class GateRuntimeReceiptV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_runtime_receipt_v1"] = "gate_runtime_receipt_v1"
+    verifier_version: Literal["gate-runtime-verifier-v1"] = "gate-runtime-verifier-v1"
+    verified_at_unix_ns: NonNegativeInt
+    run_id: CanonicalRunId
+    mode: EvidenceMode
+    run_index_sha256: Sha256
+    run_index_content_sha256: Sha256
+    expected_target_id: TargetId | None
+    recomputed_summary: GateRuntimeSummaryV1 | None
+    target_reprobe: GateTargetReprobeV1 | None
+    failure_codes: tuple[FailureCode, ...]
+    evidence_integrity_valid: bool
+    candidate_summary_matches: bool
+    runtime_predicates_passed: bool
+    runtime_evidence_valid: bool
+    qualification_runtime_accepted: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> Self:
+        if self.failure_codes != tuple(sorted(set(self.failure_codes))):
+            raise ValueError("runtime failure codes must be sorted and unique")
+        if self.recomputed_summary is None and (
+            self.candidate_summary_matches or self.runtime_predicates_passed
+        ):
+            raise ValueError("absent recomputation cannot support runtime claims")
+        target_valid = True
+        if self.mode == "functional":
+            if self.expected_target_id is not None or self.target_reprobe is not None:
+                raise ValueError("functional runtime receipt forbids target evidence")
+        else:
+            if self.expected_target_id is None or self.target_reprobe is None:
+                raise ValueError(
+                    "qualification runtime receipt requires target evidence"
+                )
+            if self.target_reprobe.expected_target_id != self.expected_target_id:
+                raise ValueError("target re-probe expected ID differs from receipt")
+            target_valid = self.target_reprobe.reprobe_valid
+        expected_runtime_valid = (
+            self.evidence_integrity_valid
+            and self.candidate_summary_matches
+            and self.runtime_predicates_passed
+            and self.recomputed_summary is not None
+            and target_valid
+        )
+        if self.runtime_evidence_valid != expected_runtime_valid:
+            raise ValueError("runtime evidence validity is inconsistent")
+        expected_qualification = (
+            self.mode == "qualification" and self.runtime_evidence_valid
+        )
+        if self.qualification_runtime_accepted != expected_qualification:
+            raise ValueError("qualification runtime verdict is inconsistent")
+        if (not self.failure_codes) != self.runtime_evidence_valid:
+            raise ValueError("runtime failure codes and validity must agree")
+        return self
+
+
+class GateRuntimeIndexV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_runtime_index_v1"] = "gate_runtime_index_v1"
+    run_id: CanonicalRunId
+    status: Literal["complete"]
+    mode: EvidenceMode
+    run_index: GateEvidenceDocumentRefV1
+    runtime_receipt: GateEvidenceDocumentRefV1
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_index(self) -> Self:
+        if self.run_index.relative_path != "run-index.json":
+            raise ValueError("runtime index must bind canonical run-index.json")
+        if self.runtime_receipt.relative_path != "runtime-receipt.json":
+            raise ValueError("runtime index must bind canonical runtime-receipt.json")
+        if self.run_index.relative_path == self.runtime_receipt.relative_path:
+            raise ValueError("runtime index document paths must be distinct")
+        return self
+
+
 __all__ = [
     "CANONICAL_EXCHANGES",
     "FinalWorkerAggregateV1",
     "GateAdmissionTraceSetV1",
     "GateAdmissionTraceV1",
     "GateArtifactRefV1",
+    "GateCandidateReportV1",
+    "GateEvidenceDocumentRefV1",
     "GateExchangeArtifactPartitionV1",
+    "GateManifestInventoryEntryV1",
+    "GateManifestInventoryV1",
     "GateProcessKeyV1",
     "GateProcessResourceSampleV1",
+    "GateRawInventoryV1",
     "GateResourceSamplingRoundV1",
     "GateResourceSummaryV1",
     "GateRootProbeV1",
+    "GateRunIndexV1",
+    "GateRuntimeIndexV1",
+    "GateRuntimeReceiptV1",
+    "GateRuntimeSummaryV1",
     "GateSamplingRoundV1",
     "GateSecondBucketV1",
     "GateStorageHealthSampleV1",
     "GateStorageHealthSummaryV1",
+    "GateStreamRuntimeSummaryV1",
     "GateTargetReprobeV1",
     "GateTargetV1",
     "GateWorkerHealthV1",
