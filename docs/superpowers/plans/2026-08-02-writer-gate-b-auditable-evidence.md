@@ -766,9 +766,9 @@ a verdict boolean directly.
 def test_runtime_verifier_recomputes_acceptance(tmp_path: Path) -> None:
     evidence = write_passing_micro_evidence(tmp_path)
     receipt = validate_runtime_evidence(evidence.run_index_path,
-                                        target_probe=passing_probe)
+                                        target_probe=None)
     assert receipt.runtime_evidence_valid is True
-    assert receipt.qualification_runtime_accepted is True
+    assert receipt.qualification_runtime_accepted is False
 
 
 @pytest.mark.parametrize("mutation", RUNTIME_EVIDENCE_MUTATIONS)
@@ -777,7 +777,7 @@ def test_runtime_verifier_rejects_primary_fact_mutation(tmp_path: Path,
     evidence = write_passing_micro_evidence(tmp_path)
     mutation.apply(evidence)
     receipt = validate_runtime_evidence(evidence.run_index_path,
-                                        target_probe=passing_probe)
+                                        target_probe=None)
     assert receipt.runtime_evidence_valid is False
     assert receipt.qualification_runtime_accepted is False
 ```
@@ -788,6 +788,13 @@ raw row, manifest count/hash, UTC hour, final worker field, resource limit, stor
 health gap/coverage, resource prefix/gap/coverage, target claim, and serialized
 candidate summary. Resource rounds must cover the bound admission-plus-drain sampling
 interval; two valid post-warmup points followed by a truncated artifact are rejected.
+
+The micro fixture is functional evidence. It cannot claim qualification because the
+only qualifying workload is the compiled research-default workload at multiplier at
+least two and duration at least 600 seconds (25,060,620 events). Test the qualification
+receipt truth table with exact model facts here; the full verifier qualification path
+is exercised only by the opt-in target-host test and Task 10. No test-only workload or
+target bypass is permitted.
 
 - [ ] **Step 2: Run tests and verify RED**
 
@@ -809,6 +816,14 @@ Qualification evidence requires a non-null target probe. Functional evidence for
 one, can set `runtime_evidence_valid=true`, and must always set
 `qualification_runtime_accepted=false`.
 
+`TargetProbePort` accepts the loaded `GateTargetV1` plus the expected target ID and
+returns a concrete `GateTargetReprobeV1`; an untyped mapping or boolean result is
+forbidden. The real adapter is `reprobe_target`. The input path must be the canonical
+`run-index.json`; outputs are its same-parent `runtime-receipt.json` and
+`runtime-index.json`, so no caller-provided output can escape the trusted evidence
+root. Use a unique attempt suffix for partial output. Reuse and validate an existing
+receipt after interruption; never overwrite either final node.
+
 Open a temporary SQLite database beneath the declared state root with
 `journal_mode=WAL`, `synchronous=FULL`, strict tables, and primary keys for planned
 event ID, exact accepted identity tuple, and durable row identity. Open the exact five
@@ -827,9 +842,10 @@ remove the temporary SQLite files only after a successful directory sync.
 
 Add a marked performance test that validates five generated partitions totaling one
 million synthetic rows under a test RSS bound. Unit tests use 10,000 rows. Interrupt
-after each artifact
-boundary, rerun from a fresh verifier, and prove no partial receipt is accepted or
-overwritten.
+after each artifact boundary, rerun from a fresh verifier, and prove no partial
+receipt is accepted or overwritten. An interruption before the receipt may retain its
+unique partial; an interruption after receipt publication reuses that exact receipt
+and publishes only the missing runtime index.
 
 - [ ] **Step 5: Run focused tests and checks**
 
@@ -1010,12 +1026,11 @@ At the admission boundary, stop attempts in every child, call `sync_now`,
 final CLOSED snapshots. The supervisor validates the five trace parts and virtual
 merge, then publishes inventories, buckets, candidate report, and run index. Any child
 exit, IPC timeout, missing round, or anchor/config disagreement stops the others,
-marks the run failed, and forbids restart or exchange-subtree reuse.
+publishes no authoritative run index, and forbids restart or exchange-subtree reuse.
 
 All artifacts use same-parent no-replace publication. On failure after artifact
-publisher initialization, publish a failed successor index when the state root remains
-writable; always retain partial/raw state. Never inspect service private fields or
-delete/reuse target exchange trees.
+publisher initialization, retain partial/raw state and emit only non-DAG diagnostics.
+Never inspect service private fields or delete/reuse target exchange trees.
 
 Expose CLI commands:
 
@@ -1023,7 +1038,7 @@ Expose CLI commands:
 python -m crypto_collector.benchmarks.writer run --workload PATH --multiplier INT
   --duration DURATION --evidence-root PATH --report PATH [qualification options]
 python -m crypto_collector.benchmarks.writer validate-runtime --run-index PATH
-  --output PATH --expected-target-id ID
+  --expected-target-id ID
 python -m crypto_collector.benchmarks.writer declare-target --target-id ID
   --data-root PATH --state-root PATH --output PATH
 ```

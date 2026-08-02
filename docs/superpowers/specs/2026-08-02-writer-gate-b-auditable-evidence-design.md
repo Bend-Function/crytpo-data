@@ -507,6 +507,123 @@ The required `GateRunIndexV1` binding set is:
 - source commit, wheel, lock, Dockerfile, workload, and image identifiers;
 - the artifact schema and algorithm versions.
 
+Authoritative run and runtime indexes are terminal complete nodes, not mutable status
+logs. `GateRunIndexV1.status` and `GateRuntimeIndexV1.status` are literal `complete`.
+A failed or interrupted runner publishes no run index; it retains partial artifacts
+and emits ordinary diagnostics outside the accepted hash DAG. A stale complete index
+cannot therefore be followed by a failed "successor" that a verifier might overlook.
+Every evidence root owns exactly `run-index.json`, `runtime-receipt.json`, and
+`runtime-index.json`; the latter two names are fixed outputs derived from the trusted
+parent of the canonical run-index path. Unique attempt-suffixed partial files may be
+retained, but final names are never replaced. If a receipt already exists after an
+interruption, a fresh verifier validates and reuses it before publishing the missing
+runtime index.
+
+Task 5 adds the following exact helper and evidence-document field orders. A document
+reference hashes the complete published bytes, while every model whose last field is
+`sha256` hashes its preceding canonical fields plus one newline.
+
+```text
+GateEvidenceDocumentRefV1:
+schema_version, record_type, relative_path, content_size_bytes, content_sha256
+
+GateManifestInventoryEntryV1:
+ordinal, manifest, data, manifest_record_count
+
+GateRawInventoryV1:
+schema_version, record_type, raw_files, file_count, record_count,
+content_size_bytes, compressed_size_bytes, sha256
+
+GateManifestInventoryV1:
+schema_version, record_type, manifests, file_count, record_count,
+manifest_content_size_bytes, sha256
+
+GateStreamRuntimeSummaryV1:
+stream_group, expected_record_count, expected_payload_bytes, scheduled_record_count,
+scheduled_payload_bytes, attempted_record_count, attempted_payload_bytes,
+accepted_record_count, accepted_payload_bytes, early_count, late_count,
+out_of_window_count, required_burst_count, scheduled_burst_count, burst_second,
+burst_scheduled_count, burst_attempted_count, burst_accepted_count,
+burst_admitted_in_actual_second_count, planned_values_match,
+admission_values_match, burst_valid
+
+GateRuntimeSummaryV1:
+expected_record_count, expected_payload_bytes, scheduled_record_count,
+scheduled_payload_bytes, attempted_record_count, attempted_payload_bytes,
+accepted_record_count, accepted_payload_bytes, durable_record_count,
+durable_payload_bytes, durability_sample_count, manifest_record_count,
+raw_file_count, manifest_file_count, declared_file_identity_count,
+expected_touched_file_identity_count, observed_touched_file_identity_count,
+accepted_identity_count, unique_accepted_identity_count, early_count, late_count,
+out_of_window_count, received_utc_hours, stream_summaries,
+final_worker_aggregate, resource_summary, storage_health_summary
+
+GateCandidateReportV1:
+schema_version, record_type, run_id, mode, workload_sha256,
+workload_plan_sha256, multiplier, duration_ns, run_started_monotonic_ns,
+admission_started_monotonic_ns, admission_scheduled_end_monotonic_ns,
+admission_ended_monotonic_ns, run_ended_monotonic_ns,
+admission_started_utc_ns, admission_ended_utc_ns, declared_admission_utc_hour,
+expected_target_id, target_declaration_sha256, expected_image_id,
+runtime_image_id, runtime_summary, runtime_failure_codes,
+candidate_runtime_passed, sha256
+
+GateRunIndexV1:
+schema_version, record_type, run_id, status, mode, artifact_schema_version,
+identity_algorithm, event_algorithm, payload_algorithm, schedule_algorithm,
+data_root, state_root, workload_document, workload_sha256,
+workload_plan_sha256, admission_trace_set, second_bucket_artifact,
+worker_sampling_artifact, resource_sampling_artifact, storage_health_artifact,
+raw_inventory, manifest_inventory, candidate_report, expected_target_id,
+target_declaration, implementation_source_commit, collector_wheel_sha256,
+requirements_lock_sha256, dockerfile_sha256, expected_image_id,
+runtime_image_id, sha256
+
+GateRuntimeReceiptV1:
+schema_version, record_type, verifier_version, verified_at_unix_ns, run_id, mode,
+run_index_sha256, run_index_content_sha256, expected_target_id,
+recomputed_summary, target_reprobe, failure_codes, evidence_integrity_valid,
+candidate_summary_matches, runtime_predicates_passed, runtime_evidence_valid,
+qualification_runtime_accepted, sha256
+
+GateRuntimeIndexV1:
+schema_version, record_type, run_id, status, mode, run_index, runtime_receipt,
+sha256
+```
+
+Document paths are normalized POSIX-relative paths. `GateEvidenceDocumentRefV1`
+accepts canonical `.json` or `.yaml` files and binds nonzero size plus full-file SHA.
+Raw entries are ordered strictly by data path; manifest entries are ordered strictly
+by manifest path and each binds its exact sibling data ref. Ordinals are zero-based
+and consecutive. Inventory totals equal their entry sums, all paths and hashes are
+unique in their respective namespaces, and neither inventory is empty for a complete
+run.
+
+`GateRuntimeSummaryV1` totals equal the eight ordered stream summaries and the nested
+aggregate facts. Received UTC hours are sorted, unique `YYYY/MM/DD/HH` strings. Stream
+planned/admission/burst booleans are exact functions of their preceding counts, not
+caller-selected verdicts. The candidate report has a sorted unique failure-code tuple
+and `candidate_runtime_passed` is exactly true when that tuple is empty. Its monotonic
+boundaries satisfy run start <= admission start < scheduled end <= actual admission
+end <= run end, with scheduled end exactly start plus duration; UTC start does not
+follow UTC end.
+
+Functional mode forbids all four target/image claims. Qualification mode requires all
+four plus the provenance claims in the run index. Both modes always bind absolute
+normalized distinct data/state roots, the copied workload document, every primary
+artifact, both inventories, and the candidate report. The workload document content
+SHA equals `workload_sha256`. Run/index/report modes and run IDs must agree.
+
+The receipt distinguishes integrity, candidate agreement, and measured predicates.
+`runtime_evidence_valid` is exactly integrity AND candidate agreement AND measured
+predicates AND, in qualification mode, a valid concrete `GateTargetReprobeV1`.
+Functional mode forbids a target re-probe and always has
+`qualification_runtime_accepted=false`; qualification acceptance is exactly mode is
+qualification AND runtime evidence is valid. A structural failure before the run
+index establishes safe evidence/data/state roots raises without publishing. Once the
+trust root is established, a complete validation disagreement publishes a rejecting
+receipt with sorted unique failure codes.
+
 Every node is published without replacement. Existing bytes are never edited, and a
 later node may refer only to earlier nodes.
 
@@ -665,6 +782,16 @@ maximum gap uses consecutive scheduled times, with zero for one round. Task 5 al
 these facts with the bound admission-plus-drain sampling interval and rejects a
 truncated prefix even when that prefix contains two valid post-warmup points.
 
+Worker, resource, and health periodic sampling reuse the workload's
+`storage_health_sample_interval_seconds` and `storage_health_max_gap_seconds`; Task 7
+does not introduce a looser runner-selected cadence. For resource rounds, the first
+request must start no later than `admission_started + interval`, the final completion
+must be at or after `admission_scheduled_end`, coverage must be at least
+`duration - interval`, and measured scheduled-time maximum gap must not exceed the
+workload maximum. Warmup ends exactly at
+`admission_started + warmup_seconds * 1_000_000_000`. These inequalities, plus the
+existing complete six-process rounds, reject both prefix and suffix truncation.
+
 Health summaries require at least one sample. The exact predicates are
 `max(2, ceil(duration_ns / interval_ns) - 1)` and required coverage
 `max(0, duration_ns - 2 * interval_ns)`. `sample_max_gap_ns` is only the measured
@@ -730,9 +857,9 @@ That report contains `candidate_runtime_passed`, but it has no authoritative
 `qualification_accepted=true` field. Runner exit zero means only that candidate runtime
 checks passed and all required primary artifacts were published.
 
-All runner errors fail closed. The runner records the failure in a successor index if
-possible, retains completed/partial artifacts, and does not delete or reuse target raw
-state.
+All runner errors fail closed. The runner publishes no authoritative run index,
+retains completed/partial artifacts, emits non-DAG diagnostics, and does not delete or
+reuse target raw state.
 
 ## 7. Target Declaration
 
