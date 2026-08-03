@@ -965,7 +965,7 @@ git commit -m "feat: bind writer gate Linux target"
 - Create: `tests/integration/benchmarks/test_writer_functional.py`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write CLI mode and preflight RED tests**
+- [x] **Step 1: Write CLI mode and preflight RED tests**
 
 Use Typer's test runner to assert exact mode rules:
 
@@ -980,7 +980,7 @@ duration below 10 minutes, nonintegral durations, UTC-hour capacity below
 `duration + 30s`, existing raw/recovery exchange subtrees, malformed image IDs, and
 wrong target IDs. Functional reports must never expose authoritative acceptance.
 
-- [ ] **Step 2: Write a micro production-path integration RED test**
+- [x] **Step 2: Write a micro production-path integration RED test**
 
 Use a real spawn context and a tiny workload. Start one supervisor and five child
 processes, have each child open its real `RawWriterService`, run its exchange iterator,
@@ -995,7 +995,7 @@ Inject one periodic `statvfs` failure and one worker-health sampling failure. Ea
 must stop the run, retain its completed/partial health artifact, and forbid candidate
 report publication even if a later probe would succeed.
 
-- [ ] **Step 3: Run tests and verify RED**
+- [x] **Step 3: Run tests and verify RED**
 
 Run:
 
@@ -1006,14 +1006,16 @@ Run:
 
 Expected: FAIL because runner/CLI APIs do not exist.
 
-- [ ] **Step 4: Implement runner orchestration**
+- [x] **Step 4: Implement runner orchestration**
 
 Use `multiprocessing.get_context("spawn")` to create exactly five canonical exchange
 children. Inside each child, open one service using public `RawWriterService.open`
 arguments: data/state roots, exchange, deterministic worker ID, canonical config SHA,
 generation zero, writer/ingress configs, exact metric-stream allowlist, and production
 clock. Derive the config digest from the fully resolved benchmark writer/ingress
-configs and require every child to report the same digest and workload-plan hash.
+configs and require every child to report the same digest and workload-plan hash. Set
+the raw-frame bound to `max(1 MiB, workload payload maximum + 256 KiB)` so a
+maximum-size payload plus its canonical envelope remains one bounded frame.
 
 Compute the 25-million-row global workload-plan hash once in the supervisor before
 spawn/admission. Each child validates the exact workload source SHA and canonical plan
@@ -1028,8 +1030,10 @@ overflow only to retain complete failure evidence. No planned event or trace row
 IPC. The supervisor issues bounded sample commands and accepts a round only when all
 five worker samples and all six process resource samples are complete and stable.
 
-At the admission boundary, stop attempts in every child, call `sync_now`,
-`close_all(CloseReason.SHUTDOWN, deadline)`, validate returned manifests, and capture
+Qualification stops attempts at the admission boundary. Functional mode continues
+until every planned event has an admission result, recording lateness instead of
+dropping the tail. Each child then calls `sync_now`,
+`close_all(CloseReason.SHUTDOWN, deadline)`, validates returned manifests, and captures
 final CLOSED snapshots. The supervisor validates the five trace parts and virtual
 merge, then publishes inventories, buckets, candidate report, and run index. Any child
 exit, IPC timeout, missing round, or anchor/config disagreement stops the others,
@@ -1038,6 +1042,14 @@ publishes no authoritative run index, and forbids restart or exchange-subtree re
 All artifacts use same-parent no-replace publication. On failure after artifact
 publisher initialization, retain partial/raw state and emit only non-DAG diagnostics.
 Never inspect service private fields or delete/reuse target exchange trees.
+
+Functional mode is an eventual-correctness check. It records scheduling lateness,
+durability SLO/resource limits, sampling gaps, and sampled topology peaks but does not
+use them as pass predicates. It still requires exact record/byte/identity
+conservation, readable canonical raw files, final CLOSED workers, no critical worker
+observation, and zero data-path errors or loss. Qualification retains all schedule,
+SLO, coverage, resource, and peak limits. Use a 24-hour functional liveness watchdog
+only to terminate a deadlock; do not describe it as a throughput requirement.
 
 Expose CLI commands:
 
@@ -1053,7 +1065,7 @@ python -m crypto_collector.benchmarks.writer declare-target --target-id ID
 Keep backward-compatible default invocation equivalent to `run` for the documented
 functional command.
 
-- [ ] **Step 5: Run the exact short functional gate**
+- [x] **Step 5: Run the exact short functional gate**
 
 Run:
 
@@ -1074,7 +1086,7 @@ Expected: exit 0; `candidate_runtime_passed=true`; no authoritative acceptance f
 count is zero. Record the printed `GATE_FUNCTIONAL_ROOT` for inspection; functional
 temporary data/state roots remain owned for the entire verification lifecycle.
 
-- [ ] **Step 6: Run focused tests and checks**
+- [x] **Step 6: Run focused tests and checks**
 
 Run:
 
@@ -1092,7 +1104,7 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 7**
+- [x] **Step 7: Commit Task 7**
 
 ```bash
 git add src/crypto_collector/benchmarks/runner.py \
@@ -1113,7 +1125,7 @@ git commit -m "feat: run auditable writer durability workload"
 - Create: `requirements/build.lock`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write source/image/container/archive RED tests**
+- [x] **Step 1: Write source/image/container/archive RED tests**
 
 Mock Git/Docker/provider command ports and assert two `git archive` source contexts,
 identical commit/epoch/lock/workload/Docker hashes, complete build lock including
@@ -1140,20 +1152,21 @@ assert disclosure.acceptance_receipt_sha256 == acceptance.sha256
 Reject self/future references, a predecessor of the wrong schema or mode, and any node
 whose last `sha256` field does not equal the digest of its preceding canonical fields.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/unit/benchmarks/test_provenance.py -q`
 
 Expected: FAIL because provenance APIs do not exist.
 
-- [ ] **Step 3: Implement host-side provenance ports and receipts**
+- [x] **Step 3: Implement host-side provenance ports and receipts**
 
 Expose these exact public call shapes:
 
 ```text
 validate_provenance(*, source_commit: str, runtime_index: Path,
                     archive_attestation: Path, writer_container: str,
-                    verifier_container: str, docker: DockerPort, git: GitPort)
+                    verifier_container: str, docker: DockerPort, git: GitPort,
+                    archive_provider: ArchiveProviderPort)
     -> GateAcceptanceReceiptV1
 build_disclosure(acceptance: GateAcceptanceReceiptV1)
     -> GateEvidenceDisclosureV1
@@ -1168,7 +1181,7 @@ Add `validate-provenance` and `build-disclosure` CLI commands. Do not add boto3/
 the collector image. Accept a strict operator-side S3 Object Lock or OSS WORM
 attestation; WebDAV is represented only as an optional verified backup.
 
-- [ ] **Step 4: Lock deterministic build dependencies**
+- [x] **Step 4: Lock deterministic build dependencies**
 
 Create `requirements/build.in` containing exactly the existing build-system constraint
 `hatchling>=1.27,<2`, then compile its transitive dependencies:
@@ -1185,7 +1198,7 @@ Create `requirements/build.in` containing exactly the existing build-system cons
 Keep `requirements/collector.lock` unchanged and runtime-only. Verify neither lock
 contains archive/materializer SDKs and every non-comment requirement has hashes.
 
-- [ ] **Step 5: Implement the reproducibility script**
+- [x] **Step 5: Implement the reproducibility script**
 
 The script must use `set -euo pipefail`, explicit temporary directories from `mktemp
 -d`, trap cleanup, `git archive <exact-commit>`, fixed `linux/amd64`, pinned BuildKit/
@@ -1193,7 +1206,7 @@ frontend facts, `--provenance=false`, `--sbom=false`, exact `SOURCE_DATE_EPOCH`,
 `--no-cache` builds, and structured `docker image/container inspect`. It writes a
 canonical transcript but no acceptance receipt; Python validates that transcript.
 
-- [ ] **Step 6: Run focused tests and checks**
+- [x] **Step 6: Run focused tests and checks**
 
 Run:
 
@@ -1209,7 +1222,7 @@ git diff --check
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 8**
+- [x] **Step 7: Commit Task 8**
 
 ```bash
 git add src/crypto_collector/benchmarks/provenance.py \
@@ -1229,7 +1242,7 @@ git commit -m "feat: verify writer gate provenance"
 - Create: `docs/operations/writer-benchmark.md`
 - Modify: `tests/performance/test_writer_durability.py`
 
-- [ ] **Step 1: Write Docker/runbook contract RED tests**
+- [x] **Step 1: Write Docker/runbook contract RED tests**
 
 Parse the Dockerfile and runbook as text plus structured Docker inspect fixtures.
 Require digest-pinned Linux base, lock-only installs, deterministic wheel build,
@@ -1242,13 +1255,13 @@ pending, runtime failure, provenance failure, immutable archive failure, and acc
 evidence. It must prohibit redacting canonical originals and prohibit WebDAV-only
 qualification evidence.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run: `.venv/bin/python -m pytest tests/performance/test_writer_durability.py -q`
 
 Expected: FAIL on missing Dockerfile/runbook contracts.
 
-- [ ] **Step 3: Implement the pinned multi-stage image**
+- [x] **Step 3: Implement the pinned multi-stage image**
 
 Use a Python base pinned by registry SHA-256 digest and a fixed `# syntax=` frontend.
 Build a wheel from the exact source archive using `requirements/build.lock`, install
@@ -1258,7 +1271,7 @@ caches, and switch to numeric UID/GID 65532. `.dockerignore` excludes Git metada
 worktrees, virtualenvs, caches, raw/evidence outputs, secrets, and unrelated local
 files.
 
-- [ ] **Step 4: Write the complete runbook**
+- [x] **Step 4: Write the complete runbook**
 
 Document prerequisites, fresh root provisioning, target declaration, fixed named
 writer container, fresh-process runtime verifier container, private file inventory,
@@ -1266,7 +1279,7 @@ S3 Object Lock/OSS WORM archival attestation, two-build provenance validation,
 acceptance/disclosure generation, WebDAV backup, cleanup ordering, and evidence commit
 rules. Commands retain containers until host inspection succeeds.
 
-- [ ] **Step 5: Run all precommit gates**
+- [x] **Step 5: Run all precommit gates**
 
 Run fresh:
 
@@ -1290,7 +1303,7 @@ git diff --check
 Expected: every command exits 0; functional candidate/runtime receipt pass but no
 acceptance receipt exists and `qualification_runtime_accepted` remains false.
 
-- [ ] **Step 6: Commit the implementation gate**
+- [x] **Step 6: Commit the implementation gate**
 
 ```bash
 git add Dockerfile .dockerignore docs/operations/writer-benchmark.md \
@@ -1298,7 +1311,7 @@ git add Dockerfile .dockerignore docs/operations/writer-benchmark.md \
 git commit -m "test: establish auditable writer durability gate"
 ```
 
-- [ ] **Step 7: Perform final two-stage branch review**
+- [x] **Step 7: Perform final two-stage branch review**
 
 Dispatch one plan/spec reviewer and one code-quality reviewer over every Task 1-9
 commit and the approved design. Fix every P0/P1/P2 with separate commits, rerun the

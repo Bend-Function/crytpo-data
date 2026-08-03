@@ -960,15 +960,19 @@ recomputed facts.
 
 1. creates two source contexts using `git archive` from the exact clean commit, so
    ignored and untracked files cannot enter either build;
-2. verifies the pinned Linux platform, base digest, Docker/BuildKit/frontend versions,
-   disabled ambient provenance/SBOM metadata, and complete runtime/build locks;
+2. verifies the pinned Linux platform, base digest, Docker Engine, Buildx, BuildKit,
+   and frontend versions, disabled ambient provenance/SBOM metadata, and complete
+   runtime/build locks;
 3. builds twice with the exact commit timestamp as `SOURCE_DATE_EPOCH`;
 4. requires identical wheel hashes and immutable image IDs;
 5. verifies OCI labels, read-only provenance file, workload, dependency boundary, and
    final numeric user `65532:65532`;
 6. inspects the retained writer and runtime-verifier containers and proves their
    `.Image` value equals the reproduced image ID and their exit states are successful;
-7. verifies the runtime receipt and external evidence archive identity;
+7. verifies `runtime receipt <= archive attestation <= provider observation <= final
+   receipts`, rejects future timestamps, and independently queries the provider for
+   the exact object version, COMPLIANCE/WORM retention, and a complete archive
+   read-back whose tar inventory and bytes match the local inventory;
 8. writes `GateProvenanceReceiptV1` and final `GateAcceptanceReceiptV1` without
    replacement.
 
@@ -1012,6 +1016,22 @@ say where authorized operators can resolve the private evidence. A redacted repo
 declaration must never be fed to the canonical verifier or described as the original.
 
 ## 10. Acceptance Predicates
+
+Functional acceptance proves eventual correctness, not target throughput. It requires
+exact scheduled, attempted, accepted, durable, sample, manifest, payload, identity,
+and raw-file conservation; canonical readable evidence; final CLOSED workers; and
+zero overflow, rejection, uncertainty, unpersisted records, or write/sync/publication
+failures. Lateness, out-of-window completion, durability SLO breaches, sampled active
+or retiring generation peaks, resource limits/trends, and sample coverage/gaps remain
+recorded facts but do not reject functional evidence. A writer critical observation
+remains a correctness failure in every mode.
+Sampling structure, stable identities, monotonic counters, and per-request causal
+ordering remain mandatory. Functional orchestration uses a 24-hour safety watchdog to
+terminate deadlocks; it is not a processing-time acceptance target.
+
+The Gate writer derives `max_plain_frame_bytes` from the bound workload as
+`max(1 MiB, maximum payload bytes + 256 KiB envelope allowance)`. Both the runner and
+independent verifier derive this value rather than trusting manifest declarations.
 
 Runtime acceptance is recomputed from primary artifacts and requires every following
 predicate:
