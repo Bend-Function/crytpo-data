@@ -1097,6 +1097,26 @@ def _mutate_manifest_frame_bound_below_physical(
         )
 
 
+def _mutate_manifest_frame_bound_above_expected(
+    evidence: PassingMicroEvidence,
+) -> None:
+    for entry_index in range(evidence.manifest_inventory.file_count):
+        run_index = _current_run_index(evidence)
+        inventory_path = evidence.root / run_index.manifest_inventory.relative_path
+        inventory = GateManifestInventoryV1.model_validate_json(
+            inventory_path.read_bytes()
+        )
+        entry = inventory.manifests[entry_index]
+        manifest_path = evidence.data_root / entry.manifest.relative_path
+        manifest = load_raw_manifest(manifest_path).manifest
+        _publish_raw_metadata(
+            evidence,
+            entry_index=entry_index,
+            manifest=_updated(manifest, max_plain_frame_bytes=2 * 1024 * 1024),
+            data_ref=entry.data,
+        )
+
+
 def _mutate_unlisted_closed_raw(evidence: PassingMicroEvidence) -> None:
     entry = evidence.manifest_inventory.manifests[0]
     source = evidence.data_root / entry.data.relative_path
@@ -1261,6 +1281,23 @@ def _mutate_candidate_utc_hour(evidence: PassingMicroEvidence) -> None:
     _rewrite_document(evidence, "candidate_report", replacement)
 
 
+def _mutate_candidate_admission_end(evidence: PassingMicroEvidence) -> None:
+    run_index = _current_run_index(evidence)
+    path = evidence.root / run_index.candidate_report.relative_path
+    candidate = GateCandidateReportV1.model_validate_json(path.read_bytes())
+    unsigned = candidate.model_dump(mode="json", exclude={"sha256"})
+    unsigned.update(
+        {
+            "admission_ended_monotonic_ns": (
+                candidate.admission_ended_monotonic_ns + 1
+            ),
+            "admission_ended_utc_ns": candidate.admission_ended_utc_ns + 1,
+        }
+    )
+    replacement = _self_hashed(GateCandidateReportV1, unsigned)
+    _rewrite_document(evidence, "candidate_report", replacement)
+
+
 def _mutate_candidate_summary(evidence: PassingMicroEvidence) -> None:
     run_index = _current_run_index(evidence)
     path = evidence.root / run_index.candidate_report.relative_path
@@ -1372,6 +1409,10 @@ RUNTIME_EVIDENCE_MUTATIONS: tuple[RuntimeEvidenceMutation, ...] = (
         "manifest_frame_bound_below_physical",
         _mutate_manifest_frame_bound_below_physical,
     ),
+    RuntimeEvidenceMutation(
+        "manifest_frame_bound_above_expected",
+        _mutate_manifest_frame_bound_above_expected,
+    ),
     RuntimeEvidenceMutation("unlisted_closed_raw", _mutate_unlisted_closed_raw),
     RuntimeEvidenceMutation(
         "unlisted_final_manifest",
@@ -1408,6 +1449,7 @@ RUNTIME_EVIDENCE_MUTATIONS: tuple[RuntimeEvidenceMutation, ...] = (
     RuntimeEvidenceMutation("manifest_sync_summary", _mutate_manifest_sync_summary),
     RuntimeEvidenceMutation("manifest_config_reload", _mutate_manifest_config_reload),
     RuntimeEvidenceMutation("utc_hour", _mutate_candidate_utc_hour),
+    RuntimeEvidenceMutation("admission_end", _mutate_candidate_admission_end),
     RuntimeEvidenceMutation(
         "final_worker_field",
         _mutate_final_worker_field,
@@ -1428,25 +1470,33 @@ RUNTIME_EVIDENCE_MUTATIONS: tuple[RuntimeEvidenceMutation, ...] = (
     RuntimeEvidenceMutation(
         "resource_limit",
         _mutate_resource_limit,
-        ("candidate_summary_mismatch", "runtime_predicate_failed"),
+        ("candidate_summary_mismatch",),
     ),
     RuntimeEvidenceMutation("resource_prefix", _mutate_resource_prefix),
     RuntimeEvidenceMutation(
         "resource_gap",
         _mutate_resource_gap,
-        ("candidate_summary_mismatch", "runtime_predicate_failed"),
+        ("candidate_summary_mismatch",),
     ),
     RuntimeEvidenceMutation(
         "resource_coverage",
         _mutate_resource_coverage,
-        ("candidate_summary_mismatch", "runtime_predicate_failed"),
+        ("candidate_summary_mismatch",),
     ),
     RuntimeEvidenceMutation(
         "resource_truncated_after_post_warmup",
         _mutate_truncated_resource_tail,
     ),
-    RuntimeEvidenceMutation("storage_health_gap", _mutate_health_gap),
-    RuntimeEvidenceMutation("storage_health_coverage", _mutate_health_coverage),
+    RuntimeEvidenceMutation(
+        "storage_health_gap",
+        _mutate_health_gap,
+        ("candidate_summary_mismatch",),
+    ),
+    RuntimeEvidenceMutation(
+        "storage_health_coverage",
+        _mutate_health_coverage,
+        ("candidate_summary_mismatch",),
+    ),
     RuntimeEvidenceMutation(
         "candidate_summary",
         _mutate_candidate_summary,

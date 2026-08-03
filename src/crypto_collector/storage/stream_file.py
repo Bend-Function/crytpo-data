@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -12,6 +14,7 @@ import zstandard
 from crypto_collector.storage.phases import StoragePhaseHook, notify_storage_phase
 
 _MAX_SIGNED_INT64 = 2**63 - 1
+_DEFAULT_DIRECTORY_PROOF_LIMIT = 65_536
 
 
 def _integer(value: object, *, field: str, minimum: int = 0) -> int:
@@ -130,7 +133,52 @@ def _close_quietly(fd: int) -> None:
         pass
 
 
-def _open_durable_parent(path: Path) -> int:
+class DirectoryDurabilityProofCache:
+    """Bind proofs to one writer whose layout directories remain in place."""
+
+    __slots__ = ("_entries", "_limit", "_lock")
+
+    def __init__(self, *, max_entries: int = _DEFAULT_DIRECTORY_PROOF_LIMIT) -> None:
+        self._limit = _integer(max_entries, field="max_entries", minimum=1)
+        self._entries: OrderedDict[tuple[int, int, str, int, int], None] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def sync_entry(
+        self,
+        parent_fd: int,
+        *,
+        entry_name: str,
+        child_fd: int,
+        force: bool,
+    ) -> None:
+        parent_stat = os.fstat(parent_fd)
+        child_stat = os.fstat(child_fd)
+        cache_key = (
+            parent_stat.st_dev,
+            parent_stat.st_ino,
+            entry_name,
+            child_stat.st_dev,
+            child_stat.st_ino,
+        )
+        if not force:
+            with self._lock:
+                if cache_key in self._entries:
+                    self._entries.move_to_end(cache_key)
+                    return
+
+        os.fsync(parent_fd)
+        with self._lock:
+            self._entries[cache_key] = None
+            self._entries.move_to_end(cache_key)
+            while len(self._entries) > self._limit:
+                self._entries.popitem(last=False)
+
+
+def _open_durable_parent(
+    path: Path,
+    *,
+    directory_proofs: DirectoryDurabilityProofCache | None,
+) -> int:
     parent = path.parent
     anchor = parent.anchor
     if not anchor:
@@ -143,10 +191,12 @@ def _open_durable_parent(path: Path) -> int:
             if part in {"", ".", ".."}:
                 raise ValueError("stream file parent path must be normalized")
             child_fd: int | None = None
+            entry_may_be_new = False
             try:
                 try:
                     child_fd = os.open(part, _directory_flags(), dir_fd=current_fd)
                 except FileNotFoundError:
+                    entry_may_be_new = True
                     try:
                         os.mkdir(part, mode=0o750, dir_fd=current_fd)
                     except FileExistsError:
@@ -156,9 +206,15 @@ def _open_durable_parent(path: Path) -> int:
                         _directory_flags(),
                         dir_fd=current_fd,
                     )
-                # Sync existing entries too: a prior allocator may have observed mkdir
-                # success but failed before proving the entry durable.
-                os.fsync(current_fd)
+                if directory_proofs is None:
+                    os.fsync(current_fd)
+                else:
+                    directory_proofs.sync_entry(
+                        current_fd,
+                        entry_name=part,
+                        child_fd=child_fd,
+                        force=entry_may_be_new,
+                    )
                 current_owned = False
                 os.close(current_fd)
             except BaseException:
@@ -241,9 +297,17 @@ class StreamFile:
         max_plain_frame_bytes: int,
         generation_id: str | None = None,
         phase_hook: StoragePhaseHook | None = None,
+        directory_proofs: DirectoryDurabilityProofCache | None = None,
     ) -> StreamFile:
         if phase_hook is not None and not callable(phase_hook):
             raise TypeError("phase_hook must be callable or None")
+        if directory_proofs is not None and not isinstance(
+            directory_proofs,
+            DirectoryDurabilityProofCache,
+        ):
+            raise TypeError(
+                "directory_proofs must be DirectoryDurabilityProofCache or None"
+            )
         level = _integer(zstd_level, field="zstd_level", minimum=1)
         if level > 22:
             raise ValueError("zstd_level must be at most 22")
@@ -268,7 +332,10 @@ class StreamFile:
             write_checksum=True,
             write_content_size=True,
         )
-        parent_fd = _open_durable_parent(absolute_path)
+        parent_fd = _open_durable_parent(
+            absolute_path,
+            directory_proofs=directory_proofs,
+        )
         fd: int | None = None
         try:
             flags = (

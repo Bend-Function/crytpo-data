@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,10 +37,13 @@ from crypto_collector.benchmarks.contracts import (
 from crypto_collector.benchmarks.runtime_verifier import (
     RuntimeEvidenceValidationError,
     TargetProbePort,
+    evaluate_runtime_candidate,
     validate_runtime_evidence,
 )
 from crypto_collector.benchmarks.target import GATE_B_ROOT_MINIMUM_AVAILABLE_BYTES
+from crypto_collector.benchmarks.workload import load_workload
 from crypto_collector.domain.json_codec import encode_json
+from crypto_collector.storage.manifest import RawManifestV1, load_raw_manifest
 from crypto_collector.storage.raw_writer import NoReplaceCapability
 from crypto_collector.storage.stats import DURABILITY_BUCKET_UPPER_BOUNDS_NS
 from tests.support.writer_gate_evidence import write_passing_micro_evidence
@@ -57,6 +61,66 @@ _STREAMS: tuple[StreamGroup, ...] = (
     "book_deep_snapshot",
     "control",
 )
+
+
+def test_precommit_evaluation_matches_fresh_verifier_without_publication(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+    candidate_source = evidence.candidate_report.canonical_bytes()
+    candidate_path = evidence.root / "candidate-report.json"
+    candidate_path.unlink()
+    evidence.run_index_path.unlink()
+
+    evaluation = evaluate_runtime_candidate(
+        evidence_root=evidence.root,
+        run_index=evidence.run_index,
+        candidate_source=candidate_source,
+        target_probe=None,
+    )
+
+    assert evaluation.runtime_evidence_valid is True
+    assert evaluation.recomputed_summary == evidence.candidate_report.runtime_summary
+    assert evaluation.failure_codes == ()
+    assert not candidate_path.exists()
+    assert not evidence.run_index_path.exists()
+    assert not (evidence.root / "runtime-receipt.json").exists()
+    assert not (evidence.root / "runtime-index.json").exists()
+
+    candidate_path.write_bytes(candidate_source)
+    evidence.run_index_path.write_bytes(evidence.run_index.canonical_bytes())
+    receipt = validate_runtime_evidence(evidence.run_index_path, target_probe=None)
+
+    assert receipt.runtime_evidence_valid == evaluation.runtime_evidence_valid
+    assert receipt.recomputed_summary == evaluation.recomputed_summary
+    assert receipt.failure_codes == evaluation.failure_codes
+    assert receipt.evidence_integrity_valid == evaluation.evidence_integrity_valid
+    assert receipt.candidate_summary_matches == evaluation.candidate_summary_matches
+    assert receipt.runtime_predicates_passed == evaluation.runtime_predicates_passed
+
+
+def test_precommit_evaluation_rejects_candidate_ref_mismatch_without_publication(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(tmp_path / "evidence")
+    candidate_path = evidence.root / "candidate-report.json"
+    candidate_path.unlink()
+    evidence.run_index_path.unlink()
+
+    evaluation = evaluate_runtime_candidate(
+        evidence_root=evidence.root,
+        run_index=evidence.run_index,
+        candidate_source=evidence.candidate_report.canonical_bytes() + b" ",
+        target_probe=None,
+    )
+
+    assert evaluation.runtime_evidence_valid is False
+    assert evaluation.failure_codes == ("evidence_integrity_invalid",)
+    assert not candidate_path.exists()
+    assert not evidence.run_index_path.exists()
+    assert not (evidence.root / "runtime-receipt.json").exists()
+    assert not (evidence.root / "runtime-index.json").exists()
+
 
 _EXPECTED_FIELDS: dict[type[BaseModel], tuple[str, ...]] = {
     GateEvidenceDocumentRefV1: (
@@ -363,6 +427,344 @@ def test_runtime_verifier_recomputes_functional_acceptance(tmp_path: Path) -> No
         source = path.read_bytes()
         assert reference.content_size_bytes == len(source)
         assert reference.content_sha256 == hashlib.sha256(source).hexdigest()
+
+
+def test_functional_runtime_allows_unavailable_post_warmup_trend(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence(
+        tmp_path / "evidence",
+        warmup_seconds=120,
+    )
+
+    receipt = validate_runtime_evidence(evidence.run_index_path, target_probe=None)
+
+    assert receipt.recomputed_summary is not None
+    resource = receipt.recomputed_summary.resource_summary
+    assert resource.resource_trend_valid is False
+    assert resource.rss_slope_bytes_per_minute is None
+    assert receipt.runtime_evidence_valid is True
+
+
+def test_functional_runtime_predicate_accepts_complete_late_admission(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    summary = evidence.candidate_report.runtime_summary
+    streams = list(summary.stream_summaries)
+    stream = streams[0]
+    streams[0] = type(stream).model_validate(
+        {
+            **stream.model_dump(mode="python"),
+            "late_count": 1,
+            "out_of_window_count": 1,
+            "admission_values_match": False,
+        }
+    )
+    late_summary = GateRuntimeSummaryV1.model_validate(
+        {
+            **summary.model_dump(mode="python"),
+            "late_count": 1,
+            "out_of_window_count": 1,
+            "stream_summaries": tuple(streams),
+        }
+    )
+    documents = SimpleNamespace(
+        workload=SimpleNamespace(workload=evidence.workload),
+        candidate=evidence.candidate_report,
+    )
+
+    assert runtime_verifier._runtime_predicates_pass(  # type: ignore[attr-defined,arg-type]
+        evidence.run_index,
+        documents,
+        evidence.plan,
+        late_summary,
+        None,
+    )
+
+
+def test_functional_runtime_predicate_records_performance_breaches(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    summary = evidence.candidate_report.runtime_summary
+    aggregate = summary.final_worker_aggregate
+    resource = summary.resource_summary
+    health = summary.storage_health_summary
+    degraded = GateRuntimeSummaryV1.model_validate(
+        {
+            **summary.model_dump(mode="python"),
+            "final_worker_aggregate": type(aggregate).model_validate(
+                {
+                    **aggregate.model_dump(mode="python"),
+                    "slo_breach_count": 1,
+                    "active_logical_generation_count_peak": 1,
+                    "retiring_generation_count_peak": 1,
+                }
+            ),
+            "resource_summary": type(resource).model_validate(
+                {
+                    **resource.model_dump(mode="python"),
+                    "sample_max_gap_ns": resource.coverage_ns,
+                    "rss_peak_bytes": 10**12,
+                    "open_fds_peak": 10**6,
+                }
+            ),
+            "storage_health_summary": type(health).model_validate(
+                {
+                    **health.model_dump(mode="python"),
+                    "sample_max_gap_ns": health.coverage_ns,
+                }
+            ),
+        }
+    )
+    documents = SimpleNamespace(
+        workload=SimpleNamespace(workload=evidence.workload),
+        candidate=evidence.candidate_report,
+    )
+
+    assert runtime_verifier._runtime_predicates_pass(  # type: ignore[attr-defined,arg-type]
+        evidence.run_index,
+        documents,
+        evidence.plan,
+        degraded,
+        None,
+    )
+
+
+def test_functional_runtime_predicate_rejects_critical_worker_observation(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    summary = evidence.candidate_report.runtime_summary
+    health = summary.storage_health_summary
+    changed = GateRuntimeSummaryV1.model_validate(
+        {
+            **summary.model_dump(mode="python"),
+            "storage_health_summary": type(health).model_validate(
+                {
+                    **health.model_dump(mode="python"),
+                    "critical_worker_observation_count": 1,
+                    "workers_healthy": False,
+                }
+            ),
+        }
+    )
+    documents = SimpleNamespace(
+        workload=SimpleNamespace(workload=evidence.workload),
+        candidate=evidence.candidate_report,
+    )
+
+    assert not runtime_verifier._runtime_predicates_pass(  # type: ignore[attr-defined,arg-type]
+        evidence.run_index,
+        documents,
+        evidence.plan,
+        changed,
+        None,
+    )
+
+
+def test_functional_runtime_predicate_rejects_extra_rotated_files(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    summary = evidence.candidate_report.runtime_summary
+    changed = GateRuntimeSummaryV1.model_validate(
+        {
+            **summary.model_dump(mode="python"),
+            "raw_file_count": summary.raw_file_count + 1,
+            "manifest_file_count": summary.manifest_file_count + 1,
+        }
+    )
+    documents = SimpleNamespace(
+        workload=SimpleNamespace(workload=evidence.workload),
+        candidate=evidence.candidate_report,
+    )
+
+    assert not runtime_verifier._runtime_predicates_pass(  # type: ignore[attr-defined,arg-type]
+        evidence.run_index,
+        documents,
+        evidence.plan,
+        changed,
+        None,
+    )
+
+
+def test_functional_sample_validation_records_large_sampling_gaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    delayed_ns = 100_000_000_000
+
+    worker_rounds = list(evidence.worker_rounds)
+    final_worker_round = worker_rounds[-1]
+    delayed_worker_samples = tuple(
+        type(sample).model_validate(
+            {
+                **sample.model_dump(mode="python"),
+                "scheduled_monotonic_ns": delayed_ns,
+                "request_started_monotonic_ns": delayed_ns,
+                "request_completed_monotonic_ns": delayed_ns,
+                "snapshot": type(sample.snapshot).model_validate(
+                    {
+                        **sample.snapshot.model_dump(mode="python"),
+                        "observed_monotonic_ns": delayed_ns,
+                    }
+                ),
+            }
+        )
+        for sample in final_worker_round.samples
+    )
+    worker_rounds[-1] = type(final_worker_round).model_validate(
+        {
+            **final_worker_round.model_dump(mode="python"),
+            "scheduled_monotonic_ns": delayed_ns,
+            "samples": delayed_worker_samples,
+        }
+    )
+
+    resource_rounds = list(evidence.resource_rounds)
+    final_resource_round = resource_rounds[-1]
+    delayed_resource_samples = tuple(
+        type(sample).model_validate(
+            {
+                **sample.model_dump(mode="python"),
+                "scheduled_monotonic_ns": delayed_ns,
+                "request_started_monotonic_ns": delayed_ns,
+                "request_completed_monotonic_ns": delayed_ns,
+            }
+        )
+        for sample in final_resource_round.samples
+    )
+    resource_rounds[-1] = type(final_resource_round).model_validate(
+        {
+            **final_resource_round.model_dump(mode="python"),
+            "scheduled_monotonic_ns": delayed_ns,
+            "samples": delayed_resource_samples,
+        }
+    )
+
+    health_samples = list(evidence.health_samples)
+    final_health_sample = health_samples[-1]
+    health_samples[-1] = type(final_health_sample).model_validate(
+        {
+            **final_health_sample.model_dump(mode="python"),
+            "scheduled_monotonic_ns": delayed_ns,
+            "request_started_monotonic_ns": delayed_ns,
+            "request_completed_monotonic_ns": delayed_ns,
+        }
+    )
+
+    def artifact_rows(
+        _root: Path,
+        _reference: object,
+        model_type: type[BaseModel],
+        **_kwargs: object,
+    ) -> tuple[BaseModel, ...]:
+        if model_type is type(worker_rounds[0]):
+            return tuple(worker_rounds)
+        if model_type is type(resource_rounds[0]):
+            return tuple(resource_rounds)
+        if model_type is type(health_samples[0]):
+            return tuple(health_samples)
+        raise AssertionError(f"unexpected sample model: {model_type}")
+
+    monkeypatch.setattr(runtime_verifier, "_artifact_rows", artifact_rows)
+    documents = runtime_verifier._PrimaryDocuments(  # type: ignore[attr-defined]
+        workload=load_workload(evidence.root / "workload.json"),
+        candidate=evidence.candidate_report,
+        raw_inventory=evidence.raw_inventory,
+        manifest_inventory=evidence.manifest_inventory,
+    )
+    database = runtime_verifier._ScratchDatabase.open(  # type: ignore[attr-defined]
+        evidence.state_root
+    )
+    try:
+        runtime_verifier._validate_trace(  # type: ignore[attr-defined]
+            evidence.root,
+            evidence.run_index,
+            evidence.candidate_report,
+            evidence.plan,
+            database,
+        )
+        samples = runtime_verifier._validate_sample_artifacts(  # type: ignore[attr-defined]
+            evidence.root,
+            evidence.run_index,
+            documents,
+            database,
+        )
+    finally:
+        database.close()
+        database.cleanup()
+
+    assert samples.resource_summary.sample_max_gap_ns > 2_000_000_000
+    assert samples.storage_health_summary.sample_max_gap_ns > 2_000_000_000
+
+
+def test_functional_raw_validation_accepts_recorded_manifest_slo_breach(
+    tmp_path: Path,
+) -> None:
+    evidence = write_passing_micro_evidence((tmp_path / "evidence").resolve())
+    entry = evidence.manifest_inventory.manifests[0]
+    manifest_path = evidence.data_root / entry.manifest.relative_path
+    manifest = load_raw_manifest(manifest_path).manifest
+    changed = RawManifestV1.model_validate(
+        {
+            **manifest.model_dump(mode="python"),
+            "slo_breach_count": 1,
+        }
+    )
+    source = changed.canonical_bytes()
+    manifest_path.write_bytes(source)
+    changed_entry = GateManifestInventoryEntryV1(
+        ordinal=entry.ordinal,
+        manifest=GateEvidenceDocumentRefV1(
+            relative_path=entry.manifest.relative_path,
+            content_size_bytes=len(source),
+            content_sha256=hashlib.sha256(source).hexdigest(),
+        ),
+        data=entry.data,
+        manifest_record_count=entry.manifest_record_count,
+    )
+    entries = list(evidence.manifest_inventory.manifests)
+    entries[0] = changed_entry
+    inventory_unsigned = evidence.manifest_inventory.model_dump(
+        mode="json", exclude={"sha256"}
+    )
+    inventory_unsigned["manifests"] = [item.model_dump(mode="json") for item in entries]
+    manifest_inventory = _self_hashed(
+        GateManifestInventoryV1,
+        inventory_unsigned,
+    )
+    documents = runtime_verifier._PrimaryDocuments(  # type: ignore[attr-defined]
+        workload=load_workload(evidence.root / "workload.json"),
+        candidate=evidence.candidate_report,
+        raw_inventory=evidence.raw_inventory,
+        manifest_inventory=manifest_inventory,
+    )
+    database = runtime_verifier._ScratchDatabase.open(  # type: ignore[attr-defined]
+        evidence.state_root
+    )
+    try:
+        runtime_verifier._validate_trace(  # type: ignore[attr-defined]
+            evidence.root,
+            evidence.run_index,
+            evidence.candidate_report,
+            evidence.plan,
+            database,
+        )
+        validated = runtime_verifier._validate_raw_evidence(  # type: ignore[attr-defined]
+            evidence.data_root,
+            documents,
+            database,
+            evidence.plan,
+        )
+    finally:
+        database.close()
+        database.cleanup()
+
+    assert validated.durable_record_count == evidence.plan.expected_record_count
 
 
 def _artifact(path: str, *, rows: int = 1) -> GateArtifactRefV1:

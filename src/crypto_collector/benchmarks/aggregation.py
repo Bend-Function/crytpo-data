@@ -251,13 +251,17 @@ class ValidatedWorkerSequences:
     expected_workers: tuple[GateWorkerKeyV1, ...]
     rounds: tuple[GateSamplingRoundV1, ...]
     worker_sequences: tuple[tuple[GateWorkerSampleV1, ...], ...]
+    require_nonoverlap: bool
 
 
 def validate_worker_rounds(
     rounds: Iterable[GateSamplingRoundV1],
     *,
     expected_workers: Sequence[GateWorkerKeyV1],
+    require_nonoverlap: bool = True,
 ) -> ValidatedWorkerSequences:
+    if type(require_nonoverlap) is not bool:
+        raise TypeError("require_nonoverlap must be a boolean")
     workers = _validate_expected_workers(expected_workers)
     materialized = tuple(rounds)
     if not materialized:
@@ -357,7 +361,11 @@ def validate_worker_rounds(
 
         assert interval_start is not None
         assert interval_end is not None
-        if previous_interval_end is not None and interval_start < previous_interval_end:
+        if (
+            require_nonoverlap
+            and previous_interval_end is not None
+            and interval_start < previous_interval_end
+        ):
             raise ValueError("worker sampling round intervals overlap")
         _revalidate(round_, GateSamplingRoundV1, label="worker round")
         previous_scheduled = round_.scheduled_monotonic_ns
@@ -367,6 +375,7 @@ def validate_worker_rounds(
         expected_workers=workers,
         rounds=materialized,
         worker_sequences=tuple(tuple(sequence) for sequence in sequences),
+        require_nonoverlap=require_nonoverlap,
     )
 
 
@@ -395,6 +404,7 @@ def aggregate_final_worker_snapshots(
     validated = validate_worker_rounds(
         sequences.rounds,
         expected_workers=sequences.expected_workers,
+        require_nonoverlap=sequences.require_nonoverlap,
     )
     final_snapshots = tuple(
         sequence[-1].snapshot for sequence in validated.worker_sequences
@@ -541,7 +551,10 @@ def summarize_resources(
     *,
     expected_processes: Sequence[GateProcessKeyV1],
     warmup_ended_monotonic_ns: int,
+    require_nonoverlap: bool = True,
 ) -> GateResourceSummaryV1:
+    if type(require_nonoverlap) is not bool:
+        raise TypeError("require_nonoverlap must be a boolean")
     warmup_ended = _strict_integer(
         warmup_ended_monotonic_ns,
         field_name="warmup_ended_monotonic_ns",
@@ -630,7 +643,11 @@ def summarize_resources(
             )
         assert interval_start is not None
         assert interval_end is not None
-        if previous_interval_end is not None and interval_start < previous_interval_end:
+        if (
+            require_nonoverlap
+            and previous_interval_end is not None
+            and interval_start < previous_interval_end
+        ):
             raise ValueError("resource sampling round intervals overlap")
         _revalidate(round_, GateResourceSamplingRoundV1, label="resource round")
         total_rss = sum(sample.rss_bytes for sample in round_.samples)
@@ -684,7 +701,10 @@ def summarize_storage_health(
     *,
     duration_ns: int,
     interval_ns: int,
+    require_nonoverlap: bool = True,
 ) -> GateStorageHealthSummaryV1:
+    if type(require_nonoverlap) is not bool:
+        raise TypeError("require_nonoverlap must be a boolean")
     duration = _strict_integer(duration_ns, field_name="duration_ns", minimum=1)
     interval = _strict_integer(interval_ns, field_name="interval_ns", minimum=1)
     materialized = tuple(samples)
@@ -713,7 +733,8 @@ def summarize_storage_health(
         ):
             raise ValueError("health sample request timing is invalid")
         if (
-            previous_completion is not None
+            require_nonoverlap
+            and previous_completion is not None
             and sample.request_started_monotonic_ns < previous_completion
         ):
             raise ValueError("health sample intervals overlap")

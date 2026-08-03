@@ -45,6 +45,7 @@ from crypto_collector.storage.phases import (
 from crypto_collector.storage.stats import CumulativeDurabilityHistogram
 from crypto_collector.storage.stream_file import (
     BufferedRow,
+    DirectoryDurabilityProofCache,
     PendingRows,
     SealedFileWork,
     StreamFile,
@@ -1125,6 +1126,7 @@ class _ActivePart:
         durability_slo_ns: int,
         created_at_ns: int | None = None,
         phase_hook: StoragePhaseHook | None = None,
+        directory_proofs: DirectoryDurabilityProofCache | None = None,
     ) -> _ActivePart:
         root = Path(os.path.abspath(os.fspath(data_root)))
         generation = _nonempty(generation_id, field_name="generation_id")
@@ -1140,6 +1142,7 @@ class _ActivePart:
             zstd_level=zstd_level,
             max_plain_frame_bytes=max_plain_frame_bytes,
             phase_hook=phase_hook,
+            directory_proofs=directory_proofs,
         )
         try:
             accumulator = _PartAccumulator(
@@ -1179,6 +1182,7 @@ class _ActivePart:
         durability_slo_ns: int,
         created_at_ns: int,
         phase_hook: StoragePhaseHook | None = None,
+        directory_proofs: DirectoryDurabilityProofCache | None = None,
     ) -> _ActivePart:
         if type(current) is not _ActivePart:
             raise TypeError("current must be _ActivePart")
@@ -1190,6 +1194,7 @@ class _ActivePart:
             zstd_level=zstd_level,
             max_plain_frame_bytes=max_plain_frame_bytes,
             phase_hook=phase_hook,
+            directory_proofs=directory_proofs,
         )
         try:
             return cls(
@@ -1632,6 +1637,7 @@ class _ActivePartSet:
             field_name="durability_slo_ns",
         )
         self._phase_hook = phase_hook
+        self._directory_proofs = DirectoryDurabilityProofCache()
         if any(
             value == 0
             for value in (
@@ -1679,6 +1685,65 @@ class _ActivePartSet:
             .as_posix(),
             created_at_ns=record.envelope.received_at_ns,
         )
+
+    def begin_initial_reservation(
+        self,
+        record: AcceptedRecord,
+    ) -> _ActivePartReservation:
+        if type(record) is not AcceptedRecord:
+            raise TypeError("record must be AcceptedRecord")
+        key = self._key(record.envelope)
+        if key in self._active:
+            raise ValueError("logical identity already has an active raw part")
+        reservation = self.reserve_part(record)
+        self._active[key] = reservation
+        return reservation
+
+    def commit_reserved_batch(
+        self,
+        materialized: tuple[tuple[_ActivePartReservation, _ActivePart], ...],
+    ) -> None:
+        if type(materialized) is not tuple or not materialized:
+            raise ValueError("materialized reservation batch must be nonempty")
+        keys: list[_LogicalPartKey] = []
+        for reservation, part in materialized:
+            if (
+                type(reservation) is not _ActivePartReservation
+                or type(part) is not _ActivePart
+            ):
+                raise TypeError("materialized reservation batch has invalid members")
+            keys.append(reservation.key)
+            if self._active.get(reservation.key) is not reservation:
+                raise ValueError("initial reservation is no longer logical-active")
+            if (
+                part.generation_id != reservation.generation_id
+                or part.partial_path != reservation.partial_path
+                or part.received_hour != reservation.received_hour
+                or part.record_count != 0
+            ):
+                raise ValueError("materialized part does not match its reservation")
+        if len(set(keys)) != len(keys):
+            raise ValueError("materialized reservation batch has duplicate identities")
+        for reservation, part in materialized:
+            self._active[reservation.key] = part
+
+    def rollback_reserved_batch(
+        self,
+        reservations: tuple[_ActivePartReservation, ...],
+    ) -> None:
+        if type(reservations) is not tuple or not reservations:
+            raise ValueError("reservation rollback batch must be nonempty")
+        keys: list[_LogicalPartKey] = []
+        for reservation in reservations:
+            if type(reservation) is not _ActivePartReservation:
+                raise TypeError("reservation rollback batch has invalid members")
+            keys.append(reservation.key)
+            if self._active.get(reservation.key) is not reservation:
+                raise ValueError("initial reservation is no longer logical-active")
+        if len(set(keys)) != len(keys):
+            raise ValueError("reservation rollback batch has duplicate identities")
+        for reservation in reservations:
+            del self._active[reservation.key]
 
     def _reserve_replacement(
         self,
@@ -1773,6 +1838,7 @@ class _ActivePartSet:
             durability_slo_ns=self._durability_slo_ns,
             created_at_ns=plan.reservation.created_at_ns,
             phase_hook=self._phase_hook,
+            directory_proofs=self._directory_proofs,
         )
 
     def commit_rotations(
@@ -1846,6 +1912,7 @@ class _ActivePartSet:
             durability_slo_ns=self._durability_slo_ns,
             created_at_ns=created_at_ns,
             phase_hook=self._phase_hook if phase_hook is None else phase_hook,
+            directory_proofs=self._directory_proofs,
         )
 
     def install_reserved(

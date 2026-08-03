@@ -9,8 +9,8 @@ from crypto_collector.config.models import IngressConfig
 from crypto_collector.domain.clock import Clock
 from crypto_collector.domain.envelope import (
     NativeEventDraft,
-    RawEnvelope,
     SourceContext,
+    _construct_envelope_from_validated_parts,
 )
 from crypto_collector.domain.paths import encode_instrument_key
 from crypto_collector.domain.types import Market
@@ -25,9 +25,10 @@ from crypto_collector.storage.models import (
     StorageLogicalTargetV1,
     StorageScopeError,
     ValidatedControlDraft,
+    _construct_accepted_identity_from_validated_parts,
     validate_control_draft,
 )
-from crypto_collector.storage.serialize import encode_envelope
+from crypto_collector.storage.serialize import _encode_trusted_envelope
 
 _MAX_SIGNED_INT64 = 2**63 - 1
 ControlAssociationResolver = Callable[
@@ -285,6 +286,7 @@ class RawIngress:
         self._queues: dict[str, asyncio.Queue[EnqueueResult]] = {}
         self._queued_bytes: dict[str, int] = {}
         self._next_sequences: dict[_SequenceKey, int] = {}
+        self._shard_by_sequence_key: dict[_SequenceKey, str] = {}
         self._next_acceptance_ordinal = 0
         self._pending_control_associations: dict[
             AcceptedRecordIdentityV1,
@@ -347,6 +349,7 @@ class RawIngress:
             control_association_resolver=self._control_association_resolver,
         )
         replacement._next_sequences = dict(self._next_sequences)
+        replacement._shard_by_sequence_key = dict(self._shard_by_sequence_key)
         replacement._next_acceptance_ordinal = self._next_acceptance_ordinal
         replacement._accepted_count = self._accepted_count
         replacement._enqueue_high_water_count = self._enqueue_high_water_count
@@ -507,31 +510,26 @@ class RawIngress:
         writer_sequence: int,
         acceptance_ordinal: int,
     ) -> tuple[AcceptedRecord, AcceptedRecordIdentityV1]:
-        envelope_values = draft.model_dump(mode="python", warnings=False)
-        envelope_values.update(
-            {
-                "received_at_ns": _integer(
-                    self._clock.time_ns(),
-                    field_name="clock.time_ns()",
-                ),
-                "monotonic_ns": _integer(
-                    self._clock.monotonic_ns(),
-                    field_name="clock.monotonic_ns()",
-                ),
-                "worker_instance_id": self._worker_instance_id,
-                "connection_id": source.connection_id,
-                "connection_generation": source.connection_generation,
-                "writer_sequence": writer_sequence,
-                "egress_id": source.egress_id,
-                "config_sha256": self._config_sha256,
-            }
+        envelope = _construct_envelope_from_validated_parts(
+            draft,
+            received_at_ns=_integer(
+                self._clock.time_ns(),
+                field_name="clock.time_ns()",
+            ),
+            monotonic_ns=_integer(
+                self._clock.monotonic_ns(),
+                field_name="clock.monotonic_ns()",
+            ),
+            worker_instance_id=self._worker_instance_id,
+            source=source,
+            writer_sequence=writer_sequence,
+            config_sha256=self._config_sha256,
         )
-        envelope = RawEnvelope.model_validate(envelope_values)
         record = AcceptedRecord(
             envelope=envelope,
-            encoded_jsonl=encode_envelope(envelope),
+            encoded_jsonl=_encode_trusted_envelope(envelope),
         )
-        identity = AcceptedRecordIdentityV1(
+        identity = _construct_accepted_identity_from_validated_parts(
             exchange=envelope.exchange,
             market=envelope.market,
             instrument_key=envelope.instrument_key,
@@ -565,6 +563,11 @@ class RawIngress:
         self._validate_source(draft, source)
 
         sequence_key = self._sequence_key(draft)
+        bound_shard = self._shard_by_sequence_key.get(sequence_key)
+        if bound_shard is not None and bound_shard != normalized_shard:
+            raise AdmissionContractError(
+                "logical identity is already bound to a different shard"
+            )
         writer_sequence = self._next_sequences.get(sequence_key, 0)
         acceptance_ordinal = self._next_acceptance_ordinal
         record, identity = self._build_candidate(
@@ -626,6 +629,7 @@ class RawIngress:
         if association is not None:
             self._pending_control_associations[identity] = association
         self._queued_bytes[normalized_shard] = queued_bytes + charge_bytes
+        self._shard_by_sequence_key.setdefault(sequence_key, normalized_shard)
         self._next_sequences[sequence_key] = writer_sequence + 1
         self._next_acceptance_ordinal = acceptance_ordinal + 1
         self._accepted_count += 1

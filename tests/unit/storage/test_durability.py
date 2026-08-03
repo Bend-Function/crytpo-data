@@ -164,6 +164,24 @@ def make_coordinator(
     )
 
 
+def traceback_locals_retain_identity(
+    error: BaseException,
+    target: object,
+) -> bool:
+    traceback = error.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__") == durability_module.__name__:
+            for value in traceback.tb_frame.f_locals.values():
+                if value is target:
+                    return True
+                if isinstance(value, (list, tuple, set, frozenset)) and any(
+                    item is target for item in value
+                ):
+                    return True
+        traceback = traceback.tb_next
+    return False
+
+
 def test_live_coordinator_does_not_expose_an_unmeasured_override() -> None:
     parameters = inspect.signature(DurabilityCoordinator).parameters
 
@@ -523,7 +541,7 @@ async def test_recovery_coordinator_is_unmeasured_and_shares_limiter(
         make_work(tmp_path, f"recovery-{index}", accepted_monotonic_ns=(1,))
         for index in range(4)
     ]
-    executor = ThreadPoolExecutor(max_workers=4)
+    executor = ThreadPoolExecutor(max_workers=3)
     limiter = StorageIoLimiter(max_concurrency=2)
     sync = BlockingSync(loop, expected_starts=2)
     live = make_coordinator(
@@ -579,7 +597,7 @@ async def test_sync_concurrency_is_global_across_overlapping_batches(
     loop = asyncio.get_running_loop()
     clock = FakeClock(now_ns=100)
     streams_and_work = [make_work(tmp_path, f"bounded-{index}") for index in range(4)]
-    executor = ThreadPoolExecutor(max_workers=4)
+    executor = ThreadPoolExecutor(max_workers=3)
     sync = BlockingSync(loop, expected_starts=2)
     coordinator = make_coordinator(
         clock=clock,
@@ -744,47 +762,69 @@ async def test_internal_batch_cancellation_keeps_thread_and_generation_owned(
 ) -> None:
     loop = asyncio.get_running_loop()
     clock = FakeClock(now_ns=100)
-    stream, work = make_work(tmp_path, "owned-after-internal-cancel")
-    executor = ThreadPoolExecutor(max_workers=1)
-    sync = BlockingSync(loop, expected_starts=1)
+    first_stream, first_work = make_work(tmp_path, "owned-after-internal-cancel")
+    second_stream, second_work = make_work(tmp_path, "waits-for-owned-slot")
+    executor = ThreadPoolExecutor(max_workers=2)
+    sync = BlockingSync(loop, expected_starts=2)
     completions: list[object] = []
     coordinator = make_coordinator(
         clock=clock,
         sync_backend=sync,
         executor=executor,
+        io_limiter=StorageIoLimiter(max_concurrency=1),
         completion_sink=completions.append,
     )
     public = asyncio.create_task(
-        coordinator.sync_batch([work], trigger=DurabilityTrigger.PERIODIC)
+        coordinator.sync_batch([first_work], trigger=DurabilityTrigger.PERIODIC)
     )
+    contender: asyncio.Task[object] | None = None
     try:
-        await sync.wait_until_started()
+        while sync.started < 1:
+            await asyncio.sleep(0)
         internal = next(iter(coordinator._owned_batches))
         internal.cancel("supervisor requested cancellation")
         await asyncio.sleep(0)
         internal.cancel("supervisor repeated cancellation")
         await asyncio.sleep(0)
 
+        contender = asyncio.create_task(
+            coordinator.sync_batch(
+                [second_work],
+                trigger=DurabilityTrigger.BARRIER,
+            )
+        )
+        while second_work.generation_id not in coordinator._inflight_generations:
+            await asyncio.sleep(0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
         assert not public.done()
         assert sync.active == 1
+        assert sync.started == 1
         assert completions == []
         with pytest.raises(DuplicateFileGeneration):
             await coordinator.sync_batch(
-                [work],
+                [first_work],
                 trigger=DurabilityTrigger.BARRIER,
             )
 
         sync.release_all()
-        batch = await public
+        batch, contender_batch = await asyncio.gather(public, contender)
     finally:
         sync.release_all()
-        await asyncio.gather(public, return_exceptions=True)
+        await asyncio.gather(
+            public,
+            *(() if contender is None else (contender,)),
+            return_exceptions=True,
+        )
         executor.shutdown(wait=True)
-        stream.close_fd()
+        first_stream.close_fd()
+        second_stream.close_fd()
 
     assert batch.record_count == 1
-    assert len(completions) == 1
-    assert isinstance(completions[0], FileSyncCompleted)
+    assert contender_batch.record_count == 1
+    assert len(completions) == 2
+    assert all(isinstance(item, FileSyncCompleted) for item in completions)
 
 
 @pytest.mark.asyncio
@@ -851,12 +891,15 @@ async def test_partial_file_task_creation_failure_accounts_every_claim(
 ) -> None:
     clock = FakeClock(now_ns=100)
     first_stream, first_work = make_work(tmp_path, "task-created")
-    second_stream, second_work = make_work(tmp_path, "task-not-created")
-    executor = ThreadPoolExecutor(max_workers=2)
+    second_stream, second_work = make_work(tmp_path, "task-create-failed")
+    third_stream, third_work = make_work(tmp_path, "task-never-created")
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_running_loop()
+    sync = BlockingSync(loop, expected_starts=1)
     completions: list[object] = []
     coordinator = make_coordinator(
         clock=clock,
-        sync_backend=NoopSync(),
+        sync_backend=sync,
         executor=executor,
         completion_sink=completions.append,
     )
@@ -866,7 +909,7 @@ async def test_partial_file_task_creation_failure_accounts_every_claim(
     def fail_second_file_task(coroutine):  # type: ignore[no-untyped-def]
         nonlocal call_count
         call_count += 1
-        if call_count == 3:
+        if call_count == 4:
             raise RuntimeError("injected partial task creation failure")
         return real_create_task(coroutine)
 
@@ -876,21 +919,40 @@ async def test_partial_file_task_creation_failure_accounts_every_claim(
         fail_second_file_task,
     )
     try:
-        with pytest.raises(WriterCriticalError) as captured:
-            await coordinator.sync_batch(
-                [first_work, second_work],
+        public = asyncio.create_task(
+            coordinator.sync_batch(
+                [first_work, second_work, third_work],
                 trigger=DurabilityTrigger.PERIODIC,
             )
+        )
+        await sync.wait_until_started()
+        assert not public.done()
+        assert {
+            item.generation_id
+            for item in completions
+            if isinstance(item, FileSyncFailed)
+        } == {second_work.generation_id, third_work.generation_id}
+        sync.release_all()
+        with pytest.raises(WriterCriticalError) as captured:
+            await public
     finally:
+        sync.release_all()
         executor.shutdown(wait=True)
         first_stream.close_fd()
         second_stream.close_fd()
+        third_stream.close_fd()
 
     assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
-    assert captured.value.affected_generation_ids == (second_work.generation_id,)
-    assert len(completions) == 2
+    assert captured.value.affected_generation_ids == (
+        second_work.generation_id,
+        third_work.generation_id,
+    )
+    assert len(completions) == 3
     assert sum(isinstance(item, FileSyncCompleted) for item in completions) == 1
-    assert sum(isinstance(item, FileSyncFailed) for item in completions) == 1
+    assert sum(isinstance(item, FileSyncFailed) for item in completions) == 2
+    assert {
+        item.generation_id for item in completions if isinstance(item, FileSyncFailed)
+    } == {second_work.generation_id, third_work.generation_id}
     assert coordinator._inflight_generations == set()
 
 
@@ -949,6 +1011,8 @@ async def test_cancelled_queued_executor_future_emits_failure_and_releases_claim
     assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
     assert len(completions) == 1
     assert isinstance(completions[0], FileSyncFailed)
+    assert completions[0].generation_id == work.generation_id
+    assert completions[0].error.reason is WriterCriticalReason.SYNC_FAILED
     assert coordinator._inflight_generations == set()
 
 
@@ -1098,6 +1162,7 @@ async def test_write_error_is_classified_before_sync(
     assert public_failure.__traceback__ is None
     assert not hasattr(public_failure, "original")
     assert "injected" not in str(public_failure)
+    assert not traceback_locals_retain_identity(captured.value, work)
 
 
 @pytest.mark.asyncio
@@ -1177,8 +1242,53 @@ async def test_sync_error_wins_over_repeated_cancellation_after_accounting(
     assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
     assert isinstance(captured.value.__cause__, asyncio.CancelledError)
     assert captured.value.__cause__.args == ("first cancellation",)
+    assert captured.value.__cause__.__traceback__ is None
+    assert captured.value.__cause__.__context__ is None
+    assert captured.value.__context__ is None
+    assert not traceback_locals_retain_identity(captured.value, work)
     assert len(completions) == 1
     assert isinstance(completions[0], FileSyncFailed)
+
+
+@pytest.mark.asyncio
+async def test_sync_error_sanitizes_non_string_cancellation_payload(
+    tmp_path: Path,
+) -> None:
+    loop = asyncio.get_running_loop()
+    clock = FakeClock(now_ns=100)
+    stream, work = make_work(tmp_path, "cancel-payload-and-fail")
+    executor = ThreadPoolExecutor(max_workers=1)
+    sync = BlockingSync(
+        loop,
+        expected_starts=1,
+        fail_fds=frozenset({stream.fileno()}),
+    )
+    coordinator = make_coordinator(
+        clock=clock,
+        sync_backend=sync,
+        executor=executor,
+    )
+    cancellation_payload = object()
+    task = asyncio.create_task(
+        coordinator.sync_batch([work], trigger=DurabilityTrigger.PERIODIC)
+    )
+    try:
+        await sync.wait_until_started()
+        task.cancel(cancellation_payload)
+        with pytest.raises(WriterCriticalError) as captured:
+            await task
+    finally:
+        sync.release_all()
+        await asyncio.gather(task, return_exceptions=True)
+        executor.shutdown(wait=True)
+        stream.close_fd()
+
+    assert isinstance(captured.value.__cause__, asyncio.CancelledError)
+    assert captured.value.__cause__.args == ("durability wait was cancelled",)
+    assert captured.value.__cause__.__traceback__ is None
+    assert captured.value.__context__ is None
+    assert not traceback_locals_retain_identity(captured.value, cancellation_payload)
+    assert not traceback_locals_retain_identity(captured.value, work)
 
 
 @pytest.mark.asyncio

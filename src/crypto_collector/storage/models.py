@@ -112,6 +112,66 @@ class AcceptedRecordIdentityV1(FrozenStrictModel):
     config_generation: NonNegativeInt
 
 
+_TRUSTED_ACCEPTED_RECORD_IDENTITY_FIELDS = (
+    "schema_version",
+    "exchange",
+    "market",
+    "instrument_key",
+    "logical_stream",
+    "worker_instance_id",
+    "writer_sequence",
+    "acceptance_ordinal",
+    "config_sha256",
+    "config_generation",
+)
+if (
+    tuple(AcceptedRecordIdentityV1.model_fields)
+    != _TRUSTED_ACCEPTED_RECORD_IDENTITY_FIELDS
+    or AcceptedRecordIdentityV1.__private_attributes__
+    or AcceptedRecordIdentityV1.model_computed_fields
+    or AcceptedRecordIdentityV1.model_config.get("extra") != "forbid"
+    or AcceptedRecordIdentityV1.model_config.get("frozen") is not True
+    or AcceptedRecordIdentityV1.model_config.get("strict") is not True
+):
+    raise RuntimeError("trusted accepted-record identity construction is stale")
+
+
+def _construct_accepted_identity_from_validated_parts(
+    *,
+    exchange: Exchange,
+    market: Market | None,
+    instrument_key: str | None,
+    logical_stream: str,
+    worker_instance_id: str,
+    writer_sequence: int,
+    acceptance_ordinal: int,
+    config_sha256: str,
+    config_generation: int,
+) -> AcceptedRecordIdentityV1:
+    values = {
+        "schema_version": 1,
+        "exchange": exchange,
+        "market": market,
+        "instrument_key": instrument_key,
+        "logical_stream": logical_stream,
+        "worker_instance_id": worker_instance_id,
+        "writer_sequence": writer_sequence,
+        "acceptance_ordinal": acceptance_ordinal,
+        "config_sha256": config_sha256,
+        "config_generation": config_generation,
+    }
+    identity = AcceptedRecordIdentityV1.__new__(AcceptedRecordIdentityV1)
+    object.__setattr__(identity, "__dict__", values)
+    object.__setattr__(
+        identity,
+        "__pydantic_fields_set__",
+        set(_TRUSTED_ACCEPTED_RECORD_IDENTITY_FIELDS),
+    )
+    object.__setattr__(identity, "__pydantic_extra__", None)
+    object.__setattr__(identity, "__pydantic_private__", None)
+    return identity
+
+
 @dataclass(frozen=True, slots=True)
 class EnqueueResult:
     status: EnqueueStatus
@@ -119,7 +179,8 @@ class EnqueueResult:
     record_identity: AcceptedRecordIdentityV1 | None
 
     def __post_init__(self) -> None:
-        if type(self.status) is not EnqueueStatus:
+        status = self.status
+        if type(status) is not EnqueueStatus:
             raise TypeError("status must be EnqueueStatus")
         if self.record is not None and type(self.record) is not AcceptedRecord:
             raise TypeError("record must be AcceptedRecord or None")
@@ -128,9 +189,13 @@ class EnqueueResult:
             and type(self.record_identity) is not AcceptedRecordIdentityV1
         ):
             raise TypeError("record_identity must be AcceptedRecordIdentityV1 or None")
-        if self.accepted and (self.record is None or self.record_identity is None):
+        accepted = (
+            status is EnqueueStatus.ACCEPTED
+            or status is EnqueueStatus.ACCEPTED_HIGH_WATER
+        )
+        if accepted and (self.record is None or self.record_identity is None):
             raise ValueError("accepted status requires record and identity")
-        if not self.accepted and (
+        if not accepted and (
             self.record is not None or self.record_identity is not None
         ):
             raise ValueError("accepted status, record, and identity must agree")
@@ -160,10 +225,10 @@ class EnqueueResult:
 
     @property
     def accepted(self) -> bool:
-        return self.status in {
-            EnqueueStatus.ACCEPTED,
-            EnqueueStatus.ACCEPTED_HIGH_WATER,
-        }
+        return (
+            self.status is EnqueueStatus.ACCEPTED
+            or self.status is EnqueueStatus.ACCEPTED_HIGH_WATER
+        )
 
 
 class WriterLifecycle(StrEnum):

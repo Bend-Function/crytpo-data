@@ -22,10 +22,16 @@ from crypto_collector.benchmarks.artifacts import (
 from crypto_collector.benchmarks.contracts import (
     CANONICAL_EXCHANGES,
     FinalWorkerAggregateV1,
+    GateAcceptanceReceiptV1,
     GateAdmissionTraceSetV1,
     GateAdmissionTraceV1,
+    GateArchiveAttestationV1,
     GateArtifactRefV1,
+    GateBuildProvenanceV1,
+    GateEvidenceDisclosureV1,
     GateExchangeArtifactPartitionV1,
+    GateFileInventoryV1,
+    GateProvenanceReceiptV1,
     GateResourceSummaryV1,
     GateRootProbeV1,
     GateStorageHealthSummaryV1,
@@ -229,7 +235,9 @@ def _build_trace_streaming_probe(root: Path, row_count: int) -> TraceStreamProbe
     candidate = SimpleNamespace(
         admission_started_monotonic_ns=1_000_000_000,
         admission_scheduled_end_monotonic_ns=11_000_000_000,
+        admission_ended_monotonic_ns=11_000_000_000,
         admission_started_utc_ns=1_800_000_000_000_000_000,
+        admission_ended_utc_ns=1_800_000_010_000_000_000,
     )
     scratch_database_bytes = 0
     durable_record_count = 0
@@ -384,6 +392,38 @@ def test_writer_gate_target_surface_is_frozen() -> None:
         "sample_count_valid",
         "coverage_valid",
         "workers_healthy",
+    )
+
+
+def test_writer_gate_provenance_surface_is_frozen() -> None:
+    assert tuple(GateFileInventoryV1.model_fields)[:4] == (
+        "schema_version",
+        "record_type",
+        "root",
+        "relative_path",
+    )
+    assert tuple(GateArchiveAttestationV1.model_fields)[-3:] == (
+        "immutable",
+        "webdav_backup_verified",
+        "sha256",
+    )
+    assert tuple(GateBuildProvenanceV1.model_fields)[-4:] == (
+        "provenance_enabled",
+        "sbom_enabled",
+        "runtime_user",
+        "sha256",
+    )
+    assert tuple(GateProvenanceReceiptV1.model_fields)[-2:] == (
+        "provenance_valid",
+        "sha256",
+    )
+    assert tuple(GateAcceptanceReceiptV1.model_fields)[-2:] == (
+        "qualification_accepted",
+        "sha256",
+    )
+    assert tuple(GateEvidenceDisclosureV1.model_fields)[-2:] == (
+        "qualification_accepted",
+        "sha256",
     )
 
 

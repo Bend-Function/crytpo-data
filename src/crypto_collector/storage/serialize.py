@@ -1,5 +1,7 @@
 from enum import Enum
 
+import orjson
+
 from crypto_collector.domain.envelope import RawEnvelope
 from crypto_collector.domain.json_codec import (
     decode_json,
@@ -38,6 +40,16 @@ def encode_envelope(envelope: RawEnvelope) -> bytes:
     validate_json_payload(json_domain_wire)
     RawEnvelope.model_validate(wire)
     return encode_json(wire) + b"\n"
+
+
+def _encode_trusted_envelope(envelope: RawEnvelope) -> bytes:
+    """Encode an envelope constructed from ingress-validated domain values."""
+    wire = envelope.__dict__
+    try:
+        encoded = orjson.dumps(wire)
+    except TypeError:
+        return encode_envelope(envelope)
+    return encoded + b"\n"
 
 
 def decode_envelope_jsonl(line: bytes) -> RawEnvelope:

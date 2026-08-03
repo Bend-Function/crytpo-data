@@ -346,6 +346,41 @@ class _OwnedBatchState:
     started: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _CriticalErrorFacts:
+    reason: WriterCriticalReason
+    affected_generation_ids: tuple[str, ...]
+    completed_batches: tuple[DurabilityBatch, ...]
+    message: str
+
+    @classmethod
+    def capture(cls, error: WriterCriticalError) -> _CriticalErrorFacts:
+        return cls(
+            reason=error.reason,
+            affected_generation_ids=error.affected_generation_ids,
+            completed_batches=error.completed_batches,
+            message=str(error),
+        )
+
+    def materialize(self) -> WriterCriticalError:
+        return WriterCriticalError(
+            reason=self.reason,
+            affected_generation_ids=self.affected_generation_ids,
+            completed_batches=self.completed_batches,
+            message=self.message,
+        )
+
+
+def _detached_cancellation(error: asyncio.CancelledError) -> asyncio.CancelledError:
+    if (
+        len(error.args) == 1
+        and type(error.args[0]) is str
+        and len(error.args[0]) <= 256
+    ):
+        return asyncio.CancelledError(error.args[0])
+    return asyncio.CancelledError("durability wait was cancelled")
+
+
 class DurabilityCoordinator:
     def __init__(
         self,
@@ -689,6 +724,7 @@ class DurabilityCoordinator:
         if type(trigger) is not DurabilityTrigger:
             raise TypeError("trigger must be DurabilityTrigger")
         owned, batch_sequence, started_ns = self._register_work(work_items)
+        del work_items
         state = _OwnedBatchState()
         batch_coroutine = self._run_owned_batch(
             owned,
@@ -705,7 +741,10 @@ class DurabilityCoordinator:
                 self._inflight_generations.discard(item.generation_id)
             if self._next_batch_sequence == batch_sequence + 1:
                 self._next_batch_sequence = batch_sequence
+            owned = ()
+            del batch_coroutine
             raise
+        del batch_coroutine
         self._owned_batches.add(internal)
         internal.add_done_callback(self._owned_batches.discard)
 
@@ -723,25 +762,48 @@ class DurabilityCoordinator:
             if state.started:
                 raise AssertionError("started durability batch leaked cancellation")
             failures = tuple(self._fail_unstarted(item) for item in owned)
-            critical = WriterCriticalError(
+            facts = _CriticalErrorFacts(
                 reason=WriterCriticalReason.SYNC_FAILED,
                 affected_generation_ids=tuple(item.generation_id for item in owned),
                 completed_batches=(),
                 message="raw durability sync failed",
             )
-            cause = failures[0].error
+            public_cause: BaseException = failures[0].error
             if cancellation is not None:
-                raise critical from cancellation
-            raise critical from cause
+                public_cause = _detached_cancellation(cancellation)
+            cancellation = None
+            owned = ()
+            failures = ()
+            del internal, state
+            raise facts.materialize() from public_cause
 
+        critical_facts: _CriticalErrorFacts | None = None
+        critical_cause: FilePersistenceError | None = None
         try:
             batch = internal.result()
         except WriterCriticalError as critical:
+            critical_facts = _CriticalErrorFacts.capture(critical)
+            if isinstance(critical.__cause__, FilePersistenceError):
+                critical_cause = critical.__cause__
+        if critical_facts is not None:
+            detached_cause: BaseException | None = critical_cause
             if cancellation is not None:
-                raise critical from cancellation
-            raise
+                detached_cause = _detached_cancellation(cancellation)
+            cancellation = None
+            critical_cause = None
+            owned = ()
+            del internal, state
+            public = critical_facts.materialize()
+            critical_facts = None
+            if detached_cause is None:
+                raise public from None
+            raise public from detached_cause
         if cancellation is not None:
-            raise cancellation
+            detached = _detached_cancellation(cancellation)
+            cancellation = None
+            owned = ()
+            del internal, state
+            raise detached from None
         return batch
 
 

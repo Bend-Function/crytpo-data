@@ -1,0 +1,58 @@
+# Source-control and linked-worktree metadata
+.git
+.gitignore
+.worktrees
+
+# Local Python and test state
+.venv
+venv
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.hypothesis
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Collector outputs and retained gate evidence
+data
+state
+staging
+raw
+evidence
+docs/operations/evidence
+*.jsonl.zst
+*.part
+*.manifest.json
+
+# Credentials and local configuration
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.secret
+secrets
+config.yaml
+config/local*
+
+# Roles and local material not used by the collector image
+requirements/archiver.lock
+requirements/build.in
+requirements/dev.lock
+requirements/materializer.lock
+docs
+tests
+config
+scripts
+
+# Editor and OS state
+.DS_Store
+.idea
+.vscode
+*~
+*.swp

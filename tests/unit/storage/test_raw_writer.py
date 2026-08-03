@@ -1093,6 +1093,83 @@ def test_received_hour_routes_forward_and_backward_before_append(
             part.close_fd_for_test()
 
 
+def test_initial_reservation_batch_is_committed_atomically(tmp_path: Path) -> None:
+    manager = _ActivePartSet(
+        data_root=tmp_path,
+        exchange=Exchange.OKX,
+        config_sha256="a" * 64,
+        config_generation=0,
+        zstd_level=3,
+        max_plain_frame_bytes=4096,
+        max_compressed_size_bytes=1024 * 1024,
+        rotate_interval_ns=5_000_000_000,
+        durability_slo_ns=1_000_000_000,
+    )
+    first_record, first_identity = make_record(instrument_key="BTC-USDT")
+    second_record, second_identity = make_record(
+        instrument_key="ETH-USDT",
+        writer_sequence=1,
+    )
+    first_reservation = manager.begin_initial_reservation(first_record)
+    second_reservation = manager.begin_initial_reservation(second_record)
+
+    assert manager.active_parts() == ()
+    assert manager.active_entry_for(first_record) is first_reservation
+    assert manager.active_entry_for(second_record) is second_reservation
+
+    first_part = manager.materialize_reserved(
+        first_reservation,
+        first_record,
+        first_identity,
+    )
+    second_part = manager.materialize_reserved(
+        second_reservation,
+        second_record,
+        second_identity,
+    )
+    try:
+        manager.commit_reserved_batch(
+            (
+                (first_reservation, first_part),
+                (second_reservation, second_part),
+            )
+        )
+
+        assert set(manager.active_parts()) == {first_part, second_part}
+    finally:
+        first_part.close_fd_for_test()
+        second_part.close_fd_for_test()
+
+
+def test_initial_reservation_batch_rollback_is_atomic(tmp_path: Path) -> None:
+    manager = _ActivePartSet(
+        data_root=tmp_path,
+        exchange=Exchange.OKX,
+        config_sha256="a" * 64,
+        config_generation=0,
+        zstd_level=3,
+        max_plain_frame_bytes=4096,
+        max_compressed_size_bytes=1024 * 1024,
+        rotate_interval_ns=5_000_000_000,
+        durability_slo_ns=1_000_000_000,
+    )
+    first_record, _first_identity = make_record(instrument_key="BTC-USDT")
+    second_record, _second_identity = make_record(
+        instrument_key="ETH-USDT",
+        writer_sequence=1,
+    )
+    reservations = (
+        manager.begin_initial_reservation(first_record),
+        manager.begin_initial_reservation(second_record),
+    )
+
+    manager.rollback_reserved_batch(reservations)
+
+    assert manager.active_entry_for(first_record) is None
+    assert manager.active_entry_for(second_record) is None
+    assert manager.active_parts() == ()
+
+
 def test_hour_replacement_allocation_failure_keeps_old_generation_owned(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

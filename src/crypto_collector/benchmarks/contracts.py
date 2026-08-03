@@ -57,6 +57,10 @@ LogicalStream = Literal[
 ]
 ProcessRole = Literal["supervisor", "exchange_worker"]
 EvidenceMode = Literal["functional", "qualification"]
+EvidenceInventoryRoot = Literal["evidence", "data", "state"]
+ImmutableArchiveProvider = Literal["s3_object_lock", "oss_worm"]
+ArchiveProvider = Literal["s3_object_lock", "oss_worm", "webdav"]
+ArchiveRetentionMode = Literal["compliance", "worm"]
 
 CANONICAL_EXCHANGES = (
     Exchange.BINANCE,
@@ -65,11 +69,23 @@ CANONICAL_EXCHANGES = (
     Exchange.BITGET,
     Exchange.KRAKEN,
 )
+RAW_RECORD_FRAME_OVERHEAD_BYTES = 256 * 1024
+RAW_RECORD_FRAME_MIN_BYTES = 1024**2
 EMPTY_SHA256 = sha256(b"").hexdigest()
 _CANONICAL_NONNEGATIVE_DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
 _NORMALIZED_ABSOLUTE_POSIX_PATH = re.compile(r"/(?:[^/\x00]+(?:/[^/\x00]+)*)?\Z")
+_PINNED_DOCKERFILE_FRONTEND = re.compile(
+    r"docker/dockerfile:[A-Za-z0-9][A-Za-z0-9._-]*@sha256:[0-9a-f]{64}\Z"
+)
 _RUNTIME_DAG_RESERVED_PATHS = frozenset(
     {"run-index.json", "runtime-receipt.json", "runtime-index.json"}
+)
+_PROVENANCE_DAG_FUTURE_PATHS = frozenset(
+    {
+        "provenance-receipt.json",
+        "acceptance-receipt.json",
+        "evidence-disclosure.json",
+    }
 )
 
 
@@ -1527,19 +1543,298 @@ class GateRuntimeIndexV1(_SelfHashingGateContract):
         return self
 
 
+class GateFileInventoryV1(_GateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_file_inventory_v1"] = "gate_file_inventory_v1"
+    root: EvidenceInventoryRoot
+    relative_path: Annotated[
+        str,
+        AfterValidator(validate_normalized_data_relative_path),
+    ]
+    content_size_bytes: NonNegativeInt
+    content_sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_content_facts(self) -> Self:
+        if self.content_size_bytes == 0 and self.content_sha256 != EMPTY_SHA256:
+            raise ValueError("empty inventory file must use the empty SHA-256")
+        return self
+
+
+class GateArchiveAttestationV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_archive_attestation_v1"] = "gate_archive_attestation_v1"
+    run_id: CanonicalRunId
+    runtime_index_sha256: Sha256
+    provider: ArchiveProvider
+    archive_locator: NonEmptyString
+    opaque_locator_sha256: Sha256
+    object_version: NonEmptyString | None
+    retention_mode: ArchiveRetentionMode | None
+    retention_until_unix_ns: NonNegativeInt | None
+    verified_at_unix_ns: NonNegativeInt
+    archive_size_bytes: PositiveInt
+    archive_sha256: Sha256
+    files: tuple[GateFileInventoryV1, ...]
+    file_count: PositiveInt
+    content_size_bytes: NonNegativeInt
+    inventory_sha256: Sha256
+    immutable: bool
+    webdav_backup_verified: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_attestation(self) -> Self:
+        locator_digest = sha256(self.archive_locator.encode("utf-8")).hexdigest()
+        if self.opaque_locator_sha256 != locator_digest:
+            raise ValueError("opaque locator SHA-256 is inconsistent")
+        root_order = {"evidence": 0, "data": 1, "state": 2}
+        observed_order = tuple(
+            (root_order[item.root], item.relative_path) for item in self.files
+        )
+        if not self.files or observed_order != tuple(sorted(set(observed_order))):
+            raise ValueError("archive inventory must be nonempty, sorted, and unique")
+        if any(
+            item.root == "evidence"
+            and item.relative_path in _PROVENANCE_DAG_FUTURE_PATHS
+            for item in self.files
+        ):
+            raise ValueError("archive inventory may not reference future DAG nodes")
+        if self.file_count != len(self.files):
+            raise ValueError("archive file count does not match inventory")
+        if self.content_size_bytes != sum(
+            item.content_size_bytes for item in self.files
+        ):
+            raise ValueError("archive content size does not match inventory")
+        inventory_digest = sha256(
+            b"".join(item.canonical_bytes() for item in self.files)
+        ).hexdigest()
+        if self.inventory_sha256 != inventory_digest:
+            raise ValueError("archive inventory SHA-256 is inconsistent")
+
+        if self.provider == "s3_object_lock":
+            expected_immutable = (
+                self.object_version is not None
+                and self.retention_mode == "compliance"
+                and self.retention_until_unix_ns is not None
+                and self.retention_until_unix_ns > self.verified_at_unix_ns
+            )
+        elif self.provider == "oss_worm":
+            expected_immutable = (
+                self.object_version is not None
+                and self.retention_mode == "worm"
+                and self.retention_until_unix_ns is not None
+                and self.retention_until_unix_ns > self.verified_at_unix_ns
+            )
+        else:
+            if any(
+                value is not None
+                for value in (
+                    self.object_version,
+                    self.retention_mode,
+                    self.retention_until_unix_ns,
+                )
+            ):
+                raise ValueError("WebDAV may not claim immutable retention facts")
+            expected_immutable = False
+        if self.immutable != expected_immutable:
+            raise ValueError("archive immutability verdict is inconsistent")
+        return self
+
+
+class GateBuildProvenanceV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_build_provenance_v1"] = "gate_build_provenance_v1"
+    implementation_source_commit: GitCommitSha
+    source_date_epoch: NonNegativeInt
+    platform: Literal["linux/amd64"]
+    base_image_digest: ImageId
+    docker_engine_version: NonEmptyString
+    docker_buildx_version: NonEmptyString
+    buildkit_version: NonEmptyString
+    dockerfile_frontend: NonEmptyString
+    collector_wheel_sha256: Sha256
+    requirements_lock_sha256: Sha256
+    build_requirements_lock_sha256: Sha256
+    dockerfile_sha256: Sha256
+    workload_sha256: Sha256
+    provenance_enabled: bool
+    sbom_enabled: bool
+    runtime_user: Literal["65532:65532"]
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_build_contract(self) -> Self:
+        if self.provenance_enabled:
+            raise ValueError("BuildKit ambient provenance must be disabled")
+        if self.sbom_enabled:
+            raise ValueError("BuildKit ambient SBOM must be disabled")
+        for name, value in (
+            ("Docker Engine", self.docker_engine_version),
+            ("Docker Buildx", self.docker_buildx_version),
+            ("BuildKit", self.buildkit_version),
+        ):
+            if value != value.strip() or any(
+                character.isspace() for character in value
+            ):
+                raise ValueError(f"{name} version must be one normalized token")
+        if _PINNED_DOCKERFILE_FRONTEND.fullmatch(self.dockerfile_frontend) is None:
+            raise ValueError("Dockerfile frontend must be versioned and digest-pinned")
+        return self
+
+
+class GateProvenanceReceiptV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_provenance_receipt_v1"] = "gate_provenance_receipt_v1"
+    verifier_version: Literal["gate-provenance-verifier-v1"] = (
+        "gate-provenance-verifier-v1"
+    )
+    verified_at_unix_ns: NonNegativeInt
+    run_id: CanonicalRunId
+    mode: EvidenceMode
+    runtime_index_sha256: Sha256
+    runtime_receipt_sha256: Sha256
+    archive_attestation_sha256: Sha256
+    archive_sha256: Sha256
+    opaque_locator_sha256: Sha256
+    implementation_source_commit: GitCommitSha
+    source_date_epoch: NonNegativeInt
+    source_archive_sha256: Sha256
+    collector_wheel_sha256: Sha256
+    requirements_lock_sha256: Sha256
+    build_requirements_lock_sha256: Sha256
+    dockerfile_sha256: Sha256
+    workload_sha256: Sha256
+    image_id: ImageId
+    platform: Literal["linux/amd64"]
+    base_image_digest: ImageId
+    docker_engine_version: NonEmptyString
+    docker_buildx_version: NonEmptyString
+    buildkit_version: NonEmptyString
+    dockerfile_frontend: NonEmptyString
+    source_reproduction_valid: bool
+    image_reproduction_valid: bool
+    image_contract_valid: bool
+    container_binding_valid: bool
+    archive_immutable: bool
+    provenance_valid: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_verdict(self) -> Self:
+        expected = self.mode == "qualification" and all(
+            (
+                self.source_reproduction_valid,
+                self.image_reproduction_valid,
+                self.image_contract_valid,
+                self.container_binding_valid,
+                self.archive_immutable,
+            )
+        )
+        if self.provenance_valid != expected:
+            raise ValueError("provenance verdict is inconsistent")
+        return self
+
+
+class GateAcceptanceReceiptV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_acceptance_receipt_v1"] = "gate_acceptance_receipt_v1"
+    accepted_at_unix_ns: NonNegativeInt
+    run_id: CanonicalRunId
+    mode: EvidenceMode
+    runtime_receipt_sha256: Sha256
+    runtime_index_sha256: Sha256
+    archive_attestation_sha256: Sha256
+    provenance_receipt_sha256: Sha256
+    expected_target_id: TargetId | None
+    workload_sha256: Sha256
+    workload_plan_sha256: Sha256
+    multiplier: PositiveInt
+    duration_ns: PositiveInt
+    expected_record_count: PositiveInt
+    accepted_record_count: NonNegativeInt
+    durable_record_count: NonNegativeInt
+    durability_lag_max_ns: NonNegativeInt
+    implementation_source_commit: GitCommitSha
+    collector_wheel_sha256: Sha256
+    requirements_lock_sha256: Sha256
+    dockerfile_sha256: Sha256
+    image_id: ImageId
+    archive_provider: ImmutableArchiveProvider
+    opaque_locator_sha256: Sha256
+    runtime_accepted: bool
+    provenance_valid: bool
+    archive_immutable: bool
+    qualification_accepted: bool
+    sha256: Sha256
+
+    @model_validator(mode="after")
+    def validate_acceptance(self) -> Self:
+        if self.mode == "functional" and self.expected_target_id is not None:
+            raise ValueError("functional acceptance forbids a target ID")
+        if self.mode == "qualification" and self.expected_target_id is None:
+            raise ValueError("qualification acceptance requires a target ID")
+        expected = self.mode == "qualification" and all(
+            (
+                self.runtime_accepted,
+                self.provenance_valid,
+                self.archive_immutable,
+            )
+        )
+        if self.qualification_accepted != expected:
+            raise ValueError("qualification acceptance verdict is inconsistent")
+        return self
+
+
+class GateEvidenceDisclosureV1(_SelfHashingGateContract):
+    schema_version: SchemaVersion1 = 1
+    record_type: Literal["gate_evidence_disclosure_v1"] = "gate_evidence_disclosure_v1"
+    run_id: CanonicalRunId
+    mode: EvidenceMode
+    acceptance_receipt_sha256: Sha256
+    runtime_index_sha256: Sha256
+    provenance_receipt_sha256: Sha256
+    archive_attestation_sha256: Sha256
+    workload_sha256: Sha256
+    workload_plan_sha256: Sha256
+    multiplier: PositiveInt
+    duration_ns: PositiveInt
+    expected_record_count: PositiveInt
+    accepted_record_count: NonNegativeInt
+    durable_record_count: NonNegativeInt
+    durability_lag_max_ns: NonNegativeInt
+    implementation_source_commit: GitCommitSha
+    collector_wheel_sha256: Sha256
+    requirements_lock_sha256: Sha256
+    dockerfile_sha256: Sha256
+    image_id: ImageId
+    archive_provider: ImmutableArchiveProvider
+    opaque_locator_sha256: Sha256
+    qualification_accepted: bool
+    sha256: Sha256
+
+
 __all__ = [
     "CANONICAL_EXCHANGES",
+    "RAW_RECORD_FRAME_MIN_BYTES",
+    "RAW_RECORD_FRAME_OVERHEAD_BYTES",
     "FinalWorkerAggregateV1",
+    "GateAcceptanceReceiptV1",
     "GateAdmissionTraceSetV1",
     "GateAdmissionTraceV1",
+    "GateArchiveAttestationV1",
     "GateArtifactRefV1",
+    "GateBuildProvenanceV1",
     "GateCandidateReportV1",
+    "GateEvidenceDisclosureV1",
     "GateEvidenceDocumentRefV1",
     "GateExchangeArtifactPartitionV1",
+    "GateFileInventoryV1",
     "GateManifestInventoryEntryV1",
     "GateManifestInventoryV1",
     "GateProcessKeyV1",
     "GateProcessResourceSampleV1",
+    "GateProvenanceReceiptV1",
     "GateRawInventoryV1",
     "GateResourceSamplingRoundV1",
     "GateResourceSummaryV1",

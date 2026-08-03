@@ -612,6 +612,12 @@ def test_round_intervals_may_touch_but_must_not_overlap() -> None:
     rounds[0] = rounds[0].model_copy(update={"samples": tuple(overlapping_samples)})
     with pytest.raises(ValueError, match="overlap"):
         validate_worker_rounds(rounds, expected_workers=_worker_keys())
+    relaxed = validate_worker_rounds(
+        rounds,
+        expected_workers=_worker_keys(),
+        require_nonoverlap=False,
+    )
+    assert aggregate_final_worker_snapshots(relaxed).worker_count == 5
 
 
 @pytest.mark.parametrize(
@@ -1214,6 +1220,28 @@ def test_resource_round_sequence_is_complete_ordered_and_nonoverlapping(
         )
 
 
+def test_resource_round_overlap_can_be_recorded_without_qualification_gate() -> None:
+    rounds = (
+        _resource_round(
+            0,
+            scheduled_ns=10,
+            total_rss=100,
+            total_fds=1,
+            completion_ns=21,
+        ),
+        _resource_round(1, scheduled_ns=20, total_rss=100, total_fds=1),
+    )
+
+    summary = summarize_resources(
+        rounds,
+        expected_processes=_process_keys(),
+        warmup_ended_monotonic_ns=0,
+        require_nonoverlap=False,
+    )
+
+    assert summary.round_count == 2
+
+
 def test_resource_expected_processes_are_exact_and_unique() -> None:
     rounds = (_resource_round(0, scheduled_ns=10, total_rss=100, total_fds=1),)
     with pytest.raises(ValueError, match="expected processes"):
@@ -1334,6 +1362,22 @@ def test_storage_health_sequence_is_complete_ordered_and_nonoverlapping(
 ) -> None:
     with pytest.raises(ValueError, match="sample|round|empty|overlap"):
         summarize_storage_health(samples, duration_ns=600, interval_ns=10)
+
+
+def test_storage_health_overlap_can_be_recorded_without_qualification_gate() -> None:
+    samples = (
+        _health_sample(0, scheduled_ns=10, completed_ns=21),
+        _health_sample(1, scheduled_ns=20),
+    )
+
+    summary = summarize_storage_health(
+        samples,
+        duration_ns=600,
+        interval_ns=10,
+        require_nonoverlap=False,
+    )
+
+    assert summary.sample_count == 2
 
 
 def test_storage_health_revalidates_worker_completeness() -> None:

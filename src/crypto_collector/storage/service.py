@@ -45,7 +45,10 @@ from crypto_collector.storage.durability import (
 )
 from crypto_collector.storage.errors import RecoveryBlocked
 from crypto_collector.storage.ingress import RawIngress, ResidentBudget
-from crypto_collector.storage.manifest import manifest_path_for_data
+from crypto_collector.storage.manifest import (
+    SourceDispositionResolver,
+    manifest_path_for_data,
+)
 from crypto_collector.storage.models import (
     AcceptedRecord,
     AcceptedRecordIdentityV1,
@@ -87,7 +90,6 @@ from crypto_collector.storage.recovery import (
     RecoveryControlReceipt,
     RecoveryOutcome,
     RecoveryReconciliation,
-    SourceDispositionResolver,
 )
 from crypto_collector.storage.stats import (
     MAX_DURABILITY_METRIC_STREAM_LABELS,
@@ -106,6 +108,9 @@ _PART_SEQUENCE = re.compile(
     r"(?:\.jsonl\.zst(?:\.partial)?|\.manifest\.json(?:\.partial)?|\.lease)$"
 )
 _MAX_SIGNED_INT64 = 2**63 - 1
+_DRAIN_SERVICE_QUANTUM_RECORDS = 1_024
+_MAX_PUBLIC_ERROR_MESSAGE_CHARS = 256
+_GENERIC_TERMINAL_ERROR_MESSAGE = "raw writer service stopped after an internal failure"
 _LOGGER = logging.getLogger(__name__)
 _CLOSE_TRIGGER = {
     CloseReason.ROTATE_TIME: DurabilityTrigger.HOUR,
@@ -114,6 +119,85 @@ _CLOSE_TRIGGER = {
     CloseReason.SHUTDOWN: DurabilityTrigger.SHUTDOWN,
     CloseReason.RECOVERY_CONTROL: DurabilityTrigger.RECOVERY,
 }
+
+
+def _bounded_error_message(error: BaseException, *, fallback: str) -> str:
+    try:
+        arguments = error.args
+    except BaseException:  # noqa: BLE001 - this helper must be total
+        return fallback
+    if (
+        type(arguments) is tuple
+        and len(arguments) == 1
+        and type(arguments[0]) is str
+        and 0 < len(arguments[0]) <= _MAX_PUBLIC_ERROR_MESSAGE_CHARS
+    ):
+        return arguments[0]
+    return fallback
+
+
+@dataclass(frozen=True, slots=True)
+class _WriterCriticalFacts:
+    reason: WriterCriticalReason
+    affected_generation_ids: tuple[str, ...]
+    completed_batches: tuple[DurabilityBatch, ...]
+    message: str
+
+    @classmethod
+    def capture(cls, error: WriterCriticalError) -> _WriterCriticalFacts:
+        if type(error) is not WriterCriticalError:
+            raise TypeError("critical error must be an exact WriterCriticalError")
+        return cls(
+            reason=error.reason,
+            affected_generation_ids=error.affected_generation_ids,
+            completed_batches=error.completed_batches,
+            message=_bounded_error_message(
+                error,
+                fallback="raw writer service failed",
+            ),
+        )
+
+    def materialize(self) -> WriterCriticalError:
+        return WriterCriticalError(
+            reason=self.reason,
+            affected_generation_ids=self.affected_generation_ids,
+            completed_batches=self.completed_batches,
+            message=self.message,
+        )
+
+
+def _detached_service_error(error: BaseException) -> BaseException:
+    try:
+        if type(error) is WriterCriticalError:
+            return _WriterCriticalFacts.capture(error).materialize()
+        if type(error) is RecoveryBlocked:
+            return RecoveryBlocked(
+                _bounded_error_message(
+                    error,
+                    fallback="raw writer recovery was blocked",
+                )
+            )
+        if type(error) is RuntimeError:
+            return RuntimeError(
+                _bounded_error_message(
+                    error,
+                    fallback=_GENERIC_TERMINAL_ERROR_MESSAGE,
+                )
+            )
+    except BaseException:  # noqa: BLE001, S110 - settlement must not fail again
+        pass
+    return RuntimeError(_GENERIC_TERMINAL_ERROR_MESSAGE)
+
+
+def _detached_service_cancellation(
+    error: asyncio.CancelledError,
+) -> asyncio.CancelledError:
+    return asyncio.CancelledError(
+        _bounded_error_message(
+            error,
+            fallback="raw writer close wait was cancelled",
+        )
+    )
 
 
 class _NoCleanupProofResolver:
@@ -371,19 +455,23 @@ class RawWriterService:
 
         self._commands: asyncio.Queue[_ServiceCommand] = asyncio.Queue()
         self._work_event = asyncio.Event()
+        self._ingress_drain_active = False
+        self._ingress_shards_in_progress: set[str] = set()
         self._periodic_due = False
         self._command_active = False
+        self._active_command_watermark: int | None = None
         self._stopping = False
         self._resources_released = False
         self._ticker_task: asyncio.Task[None] | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._close_future: asyncio.Future[object] | None = None
         self._active_close_deadline_ns: int | None = None
-        self._pending_oldest_error: WriterCriticalError | None = None
+        self._pending_oldest_error_facts: _WriterCriticalFacts | None = None
         self._terminal_error: BaseException | None = None
         self._critical_draining = False
         self._closed_manifests: tuple[object, ...] | None = None
         self._metrics_cache = self._build_metrics_snapshot()
+        self._metrics_dirty = False
 
     @classmethod
     async def open(
@@ -673,7 +761,7 @@ class RawWriterService:
         future: asyncio.Future[object] = self._owner_loop.create_future()
         if self._stopping:
             future.set_exception(
-                self._terminal_error
+                _detached_service_error(self._terminal_error)
                 if self._terminal_error is not None
                 else RuntimeError("raw writer service has stopped")
             )
@@ -709,7 +797,7 @@ class RawWriterService:
                 record=None,
                 record_identity=None,
             )
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
             return result
         result = self._ingress.try_accept(draft, source=source, shard=shard)
         if result.accepted:
@@ -725,7 +813,7 @@ class RawWriterService:
             )
             self._record_stages[identity] = DurabilityStage.QUEUED
             self._work_event.set()
-        self._refresh_metrics_cache()
+        self._invalidate_metrics_cache()
         return result
 
     async def sync_now(self) -> tuple[DurabilityBatch, ...]:
@@ -760,7 +848,7 @@ class RawWriterService:
         if self._admission_state is AdmissionState.OPEN:
             self._admission_state = AdmissionState.CLOSED
             self._lifecycle = WriterLifecycle.ROTATING
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
         future = self._enqueue_command("rotate_config", config_sha256, generation)
         return cast(tuple[object, ...], await asyncio.shield(future))
 
@@ -777,12 +865,35 @@ class RawWriterService:
             raise ValueError("close_all requires a normal close reason")
         deadline = _nonnegative(deadline_ns, field_name="deadline_ns")
         if self._close_future is None:
+            if self._terminal_error is not None:
+                raise _detached_service_error(self._terminal_error) from None
+            if self._closed_manifests is not None:
+                return self._closed_manifests
             self._admission_state = AdmissionState.CLOSED
             if self._lifecycle is not WriterLifecycle.CRITICAL:
                 self._lifecycle = WriterLifecycle.CLOSING
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
             self._close_future = self._enqueue_command("close", reason, deadline)
-        return cast(tuple[object, ...], await asyncio.shield(self._close_future))
+            self._close_future.add_done_callback(self._settle_close_future)
+        close_future = self._close_future
+        assert close_future is not None
+        result: object | None = None
+        detached_error: BaseException | None = None
+        try:
+            result = await asyncio.shield(close_future)
+        except asyncio.CancelledError as error:
+            detached_error = _detached_service_cancellation(error)
+        except BaseException as error:  # noqa: BLE001 - detach the shared failure
+            detached_error = _detached_service_error(error)
+        if detached_error is not None:
+            raise detached_error from None
+        return cast(tuple[object, ...], result)
+
+    def _settle_close_future(self, future: asyncio.Future[object]) -> None:
+        if self._close_future is future:
+            self._close_future = None
+        if not future.cancelled():
+            future.exception()
 
     async def mark_incomplete(self, reason: str) -> None:
         self._assert_affinity()
@@ -791,7 +902,7 @@ class RawWriterService:
             self._admission_state = AdmissionState.CLOSED
             if self._lifecycle is WriterLifecycle.ACCEPTING:
                 self._lifecycle = WriterLifecycle.CLOSING
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
         future = self._enqueue_command("incomplete", normalized)
         await asyncio.shield(future)
 
@@ -801,6 +912,10 @@ class RawWriterService:
 
     def metrics_snapshot(self) -> WriterMetricsSnapshotV1:
         self._assert_affinity()
+        if self._metrics_dirty:
+            snapshot = self._build_metrics_snapshot()
+            self._metrics_cache = snapshot
+            self._metrics_dirty = False
         return self._metrics_cache
 
     def _stage_bytes(self, stage: DurabilityStage) -> int:
@@ -904,14 +1019,14 @@ class RawWriterService:
             raise critical from error
 
     def _begin_oldest_critical(self) -> WriterCriticalError | None:
-        if self._pending_oldest_error is not None:
-            return self._pending_oldest_error
+        if self._pending_oldest_error_facts is not None:
+            return self._pending_oldest_error_facts.materialize()
         critical_age = self._ledger.classify_critical_age(
             durability_critical_ns=self._writer_config.durability_critical_ns
         )
         if critical_age is None:
             return None
-        critical = WriterCriticalError(
+        facts = _WriterCriticalFacts(
             reason=WriterCriticalReason.OLDEST_UNPERSISTED_AGE,
             affected_generation_ids=tuple(
                 sorted(
@@ -925,24 +1040,25 @@ class RawWriterService:
             completed_batches=(),
             message="oldest raw record exceeded its durability deadline",
         )
-        self._pending_oldest_error = critical
-        self._critical_reason = critical.reason
+        self._pending_oldest_error_facts = facts
+        self._critical_reason = facts.reason
         self._lifecycle = WriterLifecycle.CRITICAL
         self._admission_state = AdmissionState.CLOSED
-        self._incomplete_reason = critical.reason.value
+        self._incomplete_reason = facts.reason.value
         if not self._critical_callback_called and self._on_critical is not None:
             self._critical_callback_called = True
+            callback_error = facts.materialize()
             try:
-                self._on_critical(critical)
-            except BaseException as callback_error:  # noqa: BLE001 - retain ownership
-                critical.add_note(
-                    f"on_critical callback also failed: {type(callback_error).__name__}"
+                self._on_critical(callback_error)
+            except BaseException as error:  # noqa: BLE001 - retain ownership
+                callback_error.add_note(
+                    f"on_critical callback also failed: {type(error).__name__}"
                 )
-        self._refresh_metrics_cache()
-        return critical
+        self._invalidate_metrics_cache()
+        return facts.materialize()
 
     async def _finish_oldest_critical_drain(self) -> None:
-        if self._pending_oldest_error is None or self._critical_draining:
+        if self._pending_oldest_error_facts is None or self._critical_draining:
             return
         self._critical_draining = True
         try:
@@ -1044,8 +1160,13 @@ class RawWriterService:
             publication_failure_count=self._publication_failure_count,
         )
 
+    def _invalidate_metrics_cache(self) -> None:
+        self._metrics_dirty = True
+
     def _refresh_metrics_cache(self) -> None:
-        self._metrics_cache = self._build_metrics_snapshot()
+        snapshot = self._build_metrics_snapshot()
+        self._metrics_cache = snapshot
+        self._metrics_dirty = False
 
     async def _periodic_timer(self) -> None:
         while not self._stopping:
@@ -1137,37 +1258,66 @@ class RawWriterService:
             },
         )
 
-    async def _drain_deferred(self, *, watermark: int | None) -> None:
-        for generation_id in tuple(self._deferred_by_generation):
-            part = self._owned_part_for_generation(generation_id)
-            if part is None:
-                raise ValueError("deferred record generation is no longer owned")
-            deferred = self._deferred_by_generation[generation_id]
-            while deferred:
-                if (
-                    watermark is not None
-                    and deferred[0].identity.acceptance_ordinal > watermark
-                ):
-                    break
-                if part.in_flight_claim() is not None:
-                    break
-                item = deferred[0]
-                try:
-                    part.append_accepted(item.record, item.identity)
-                except FrameSealRequired:
-                    await self._sync_parts((part,), DurabilityTrigger.SIZE)
+    async def _drain_deferred(
+        self,
+        *,
+        watermark: int | None,
+        max_records: int | None,
+    ) -> int:
+        drained_records = 0
+        while True:
+            size_parts: list[_ActivePart] = []
+            for generation_id in tuple(self._deferred_by_generation):
+                part = self._owned_part_for_generation(generation_id)
+                if part is None:
+                    raise ValueError("deferred record generation is no longer owned")
+                deferred = self._deferred_by_generation[generation_id]
+                while deferred:
+                    if max_records is not None and drained_records >= max_records:
+                        return drained_records
+                    if (
+                        watermark is not None
+                        and deferred[0].identity.acceptance_ordinal > watermark
+                    ):
+                        break
+                    if part.in_flight_claim() is not None:
+                        break
+                    item = deferred[0]
                     try:
                         part.append_accepted(item.record, item.identity)
                     except FrameSealRequired:
-                        self._warn_oversized(part, item.record)
-                        claimed = part.seal_oversized(item.record, item.identity)
-                        await self._sync_claims(
-                            ((part, claimed),),
-                            DurabilityTrigger.SIZE,
-                        )
-                deferred.pop(0)
-            if not deferred:
-                del self._deferred_by_generation[generation_id]
+                        if (
+                            part.pending_plain_bytes() == 0
+                            and len(item.record.encoded_jsonl)
+                            > part.stream_file.max_plain_frame_bytes
+                        ):
+                            self._warn_oversized(part, item.record)
+                            claimed = part.seal_oversized(item.record, item.identity)
+                            await self._sync_claims(
+                                ((part, claimed),),
+                                DurabilityTrigger.SIZE,
+                            )
+                            deferred.pop(0)
+                            drained_records += 1
+                            continue
+                        size_parts.append(part)
+                        break
+                    deferred.pop(0)
+                    drained_records += 1
+                    if (
+                        max_records is None
+                        and drained_records % _DRAIN_SERVICE_QUANTUM_RECORDS == 0
+                    ):
+                        await asyncio.sleep(0)
+                if not deferred:
+                    del self._deferred_by_generation[generation_id]
+                if len(size_parts) == self._io_limiter.max_concurrency:
+                    break
+            if not size_parts:
+                return drained_records
+            batch = await self._sync_parts(tuple(size_parts), DurabilityTrigger.SIZE)
+            if batch is None:
+                raise RuntimeError("pending size sync window had no durability work")
 
     def _can_drain_without_storage_io(self, shard: str) -> bool:
         result = self._ingress.peek_one(shard)
@@ -1182,20 +1332,293 @@ class RawWriterService:
         )
         return part.received_hour == received_hour
 
+    async def _materialize_ingress_batch(
+        self,
+        results: tuple[EnqueueResult, ...],
+    ) -> tuple[tuple[_ActivePart, _ActivePart | None], ...]:
+        reservations: list[_ActivePartReservation] = []
+        try:
+            for result in results:
+                assert result.record is not None
+                reservations.append(
+                    self._parts.begin_initial_reservation(result.record)
+                )
+        except BaseException as reservation_error:
+            if reservations:
+                try:
+                    self._parts.rollback_reserved_batch(tuple(reservations))
+                except BaseException as rollback_error:  # noqa: BLE001
+                    reservation_error.add_note(
+                        f"initial reservation rollback also failed: {rollback_error!r}"
+                    )
+            raise
+
+        async def materialize_one(
+            result: EnqueueResult,
+            reservation: _ActivePartReservation,
+        ) -> _ActivePart:
+            assert result.record is not None
+            assert result.record_identity is not None
+            return await run_storage(
+                self._io_limiter,
+                self._executor,
+                self._parts.materialize_reserved,
+                reservation,
+                result.record,
+                result.record_identity,
+                created_at_ns=reservation.created_at_ns,
+            )
+
+        async def settle() -> tuple[object, ...]:
+            return tuple(
+                await asyncio.gather(
+                    *(
+                        materialize_one(result, reservation)
+                        for result, reservation in zip(
+                            results,
+                            reservations,
+                            strict=True,
+                        )
+                    ),
+                    return_exceptions=True,
+                )
+            )
+
+        task = asyncio.create_task(settle())
+        outcomes = cast(tuple[object, ...], await self._pump_task(task))
+        primary_error = next(
+            (outcome for outcome in outcomes if isinstance(outcome, BaseException)),
+            None,
+        )
+        parts = tuple(outcome for outcome in outcomes if type(outcome) is _ActivePart)
+        if primary_error is None and len(parts) != len(results):
+            primary_error = RuntimeError(
+                "initial materialization batch returned an invalid outcome"
+            )
+        if primary_error is None:
+            try:
+                self._parts.commit_reserved_batch(
+                    tuple(zip(reservations, parts, strict=True))
+                )
+            except BaseException as commit_error:  # noqa: BLE001
+                primary_error = commit_error
+        if primary_error is not None:
+            cleanup_results = await asyncio.gather(
+                *(
+                    run_storage(
+                        self._io_limiter,
+                        self._executor,
+                        part.discard_empty,
+                    )
+                    for part in parts
+                ),
+                return_exceptions=True,
+            )
+            for cleanup_result in cleanup_results:
+                if isinstance(cleanup_result, BaseException):
+                    primary_error.add_note(
+                        "empty materialized part cleanup also failed: "
+                        f"{cleanup_result!r}"
+                    )
+            try:
+                self._parts.rollback_reserved_batch(tuple(reservations))
+            except BaseException as rollback_error:  # noqa: BLE001
+                primary_error.add_note(
+                    f"initial reservation rollback also failed: {rollback_error!r}"
+                )
+            raise primary_error
+        return tuple((part, None) for part in parts)
+
+    async def _append_drained_record(
+        self,
+        result: EnqueueResult,
+        *,
+        part: _ActivePart,
+        hour_retired: _ActivePart | None,
+        allow_storage_io: bool,
+    ) -> bool:
+        assert result.record is not None
+        assert result.record_identity is not None
+        record = result.record
+        identity = result.record_identity
+        association = self._ingress.take_control_association(identity)
+        if association is not None:
+            self._control_associations[identity] = association
+        if part.generation_id in self._deferred_by_generation:
+            self._defer_record(part, record, identity)
+            return False
+        oversized_synced = False
+        try:
+            part.append_accepted(record, identity)
+        except FrameSealRequired:
+            oversized = (
+                part.pending_plain_bytes() == 0
+                and len(record.encoded_jsonl) > part.stream_file.max_plain_frame_bytes
+            )
+            if (
+                not allow_storage_io
+                or part.in_flight_claim() is not None
+                or not oversized
+            ):
+                if (
+                    allow_storage_io
+                    and part.in_flight_claim() is None
+                    and not oversized
+                ):
+                    return True
+                self._defer_record(part, record, identity)
+                return False
+            self._warn_oversized(part, record)
+            claimed = part.seal_oversized(record, identity)
+            self._mark_buffered(identity)
+            await self._sync_claims(((part, claimed),), DurabilityTrigger.SIZE)
+            oversized_synced = True
+        if not oversized_synced:
+            self._mark_buffered(identity)
+        if hour_retired is not None:
+            self._pending_hour_retired[hour_retired.generation_id] = hour_retired
+        return False
+
+    async def _drain_cold_ingress_batch(
+        self,
+        shards: tuple[str, ...],
+        *,
+        watermark: int | None,
+        limit: int,
+    ) -> int:
+        selected: list[tuple[str, EnqueueResult]] = []
+        selected_keys: set[tuple[Market | None, str | None, str]] = set()
+        for shard in shards:
+            if len(selected) >= limit or shard in self._ingress_shards_in_progress:
+                continue
+            head = self._ingress.peek_one(shard)
+            if head is None:
+                continue
+            assert head.record is not None
+            assert head.record_identity is not None
+            if (
+                watermark is not None
+                and head.record_identity.acceptance_ordinal > watermark
+            ):
+                continue
+            if self._can_drain_without_storage_io(shard):
+                continue
+            if self._parts.active_entry_for(head.record) is not None:
+                continue
+            envelope = head.record.envelope
+            logical_key = (
+                envelope.market,
+                envelope.instrument_key,
+                envelope.logical_stream,
+            )
+            if logical_key in selected_keys:
+                continue
+            result = self._ingress.drain_one(shard)
+            if result is None:
+                continue
+            self._ingress_shards_in_progress.add(shard)
+            selected_keys.add(logical_key)
+            selected.append((shard, result))
+        if not selected:
+            return 0
+        try:
+            materialized = await self._materialize_ingress_batch(
+                tuple(result for _shard, result in selected)
+            )
+            for (_shard, result), (part, hour_retired) in zip(
+                selected,
+                materialized,
+                strict=True,
+            ):
+                await self._append_drained_record(
+                    result,
+                    part=part,
+                    hour_retired=hour_retired,
+                    allow_storage_io=True,
+                )
+        finally:
+            for shard, _result in selected:
+                self._ingress_shards_in_progress.remove(shard)
+        return len(selected)
+
     async def _drain_ingress(
         self,
         *,
         allow_storage_io: bool = True,
         watermark: int | None = None,
+        max_records: int | None = None,
     ) -> None:
+        if self._ingress_drain_active:
+            raise RuntimeError("ingress drain ownership was re-entered")
+        self._ingress_drain_active = True
+        try:
+            await self._drain_ingress_owned(
+                allow_storage_io=allow_storage_io,
+                watermark=watermark,
+                max_records=max_records,
+            )
+        finally:
+            self._ingress_drain_active = False
+        if self._pending_oldest_error_facts is not None and not self._critical_draining:
+            await self._finish_oldest_critical_drain()
+            raise self._pending_oldest_error_facts.materialize()
+
+    async def _drain_ingress_owned(
+        self,
+        *,
+        allow_storage_io: bool,
+        watermark: int | None,
+        max_records: int | None,
+    ) -> None:
+        drained_records = 0
         if allow_storage_io:
-            await self._drain_deferred(watermark=watermark)
+            drained_records = await self._drain_deferred(
+                watermark=watermark,
+                max_records=max_records,
+            )
+            if max_records is not None and drained_records >= max_records:
+                self._work_event.set()
+                await asyncio.sleep(0)
+                return
+        drained_since_yield = 0
         while True:
             shards = self._ingress.nonempty_shards()
             if not shards:
                 return
             progressed = False
+            cold_drained = 0
+            size_rollovers: list[
+                tuple[str, EnqueueResult, _ActivePart, _ActivePart | None]
+            ] = []
+            quantum_exhausted = False
+            if allow_storage_io:
+                cold_limit = self._io_limiter.max_concurrency
+                if max_records is not None:
+                    cold_limit = min(cold_limit, max_records - drained_records)
+                if cold_limit > 0:
+                    cold_drained = await self._drain_cold_ingress_batch(
+                        shards,
+                        watermark=watermark,
+                        limit=cold_limit,
+                    )
+                    if cold_drained:
+                        progressed = True
+                        drained_records += cold_drained
+                        drained_since_yield += cold_drained
+                        if max_records is not None and drained_records >= max_records:
+                            self._work_event.set()
+                            await asyncio.sleep(0)
+                            return
             for shard in shards:
+                if max_records is not None and drained_records >= max_records:
+                    self._work_event.set()
+                    if size_rollovers:
+                        quantum_exhausted = True
+                        break
+                    await asyncio.sleep(0)
+                    return
+                if shard in self._ingress_shards_in_progress:
+                    continue
                 head = self._ingress.peek_one(shard)
                 if head is None:
                     continue
@@ -1209,46 +1632,80 @@ class RawWriterService:
                     shard
                 ):
                     continue
+                if allow_storage_io and not self._can_drain_without_storage_io(shard):
+                    head = self._ingress.peek_one(shard)
+                    if head is None:
+                        continue
+                    assert head.record is not None
+                    if self._parts.active_entry_for(head.record) is None:
+                        continue
                 result = self._ingress.drain_one(shard)
                 if result is None:
                     continue
                 progressed = True
-                assert result.record is not None
-                assert result.record_identity is not None
-                record = result.record
-                identity = result.record_identity
-                association = self._ingress.take_control_association(identity)
-                if association is not None:
-                    self._control_associations[identity] = association
-                part, hour_retired = await self._ensure_part(record, identity)
-                if part.generation_id in self._deferred_by_generation:
-                    self._defer_record(part, record, identity)
-                    continue
-                oversized_synced = False
+                self._ingress_shards_in_progress.add(shard)
+                retain_shard = False
                 try:
-                    part.append_accepted(record, identity)
-                except FrameSealRequired:
-                    if not allow_storage_io or part.in_flight_claim() is not None:
-                        self._defer_record(part, record, identity)
-                        continue
-                    await self._sync_parts((part,), DurabilityTrigger.SIZE)
-                    try:
-                        part.append_accepted(record, identity)
-                    except FrameSealRequired:
-                        self._warn_oversized(part, record)
-                        claimed = part.seal_oversized(record, identity)
-                        self._mark_buffered(identity)
-                        await self._sync_claims(
-                            ((part, claimed),), DurabilityTrigger.SIZE
-                        )
-                        oversized_synced = True
-                if not oversized_synced:
-                    self._mark_buffered(identity)
-                if hour_retired is not None:
-                    self._pending_hour_retired[hour_retired.generation_id] = (
-                        hour_retired
+                    drained_records += 1
+                    drained_since_yield += 1
+                    if (
+                        max_records is None
+                        and drained_since_yield >= _DRAIN_SERVICE_QUANTUM_RECORDS
+                    ):
+                        drained_since_yield = 0
+                        await asyncio.sleep(0)
+                    assert result.record is not None
+                    assert result.record_identity is not None
+                    record = result.record
+                    identity = result.record_identity
+                    part, hour_retired = await self._ensure_part(record, identity)
+                    requires_size_sync = await self._append_drained_record(
+                        result,
+                        part=part,
+                        hour_retired=hour_retired,
+                        allow_storage_io=allow_storage_io,
                     )
-            self._refresh_metrics_cache()
+                    if requires_size_sync:
+                        retain_shard = True
+                        size_rollovers.append((shard, result, part, hour_retired))
+                finally:
+                    if not retain_shard:
+                        self._ingress_shards_in_progress.remove(shard)
+                if len(size_rollovers) == self._io_limiter.max_concurrency:
+                    break
+            if size_rollovers:
+                try:
+                    batch = await self._sync_parts(
+                        tuple(
+                            part for _shard, _result, part, _retired in size_rollovers
+                        ),
+                        DurabilityTrigger.SIZE,
+                    )
+                    if batch is None:
+                        raise RuntimeError(
+                            "pending size sync window had no durability work"
+                        )
+                    for _shard, result, part, hour_retired in size_rollovers:
+                        if await self._append_drained_record(
+                            result,
+                            part=part,
+                            hour_retired=hour_retired,
+                            allow_storage_io=allow_storage_io,
+                        ):
+                            raise RuntimeError(
+                                "size rollover trigger did not fit after its sync"
+                            )
+                finally:
+                    for shard, _result, _part, _retired in size_rollovers:
+                        self._ingress_shards_in_progress.remove(shard)
+            self._invalidate_metrics_cache()
+            if quantum_exhausted:
+                await asyncio.sleep(0)
+                return
+            if max_records is not None and cold_drained:
+                self._work_event.set()
+                await asyncio.sleep(0)
+                return
             if not progressed:
                 return
 
@@ -1333,7 +1790,7 @@ class RawWriterService:
         )
         self._clear_pending_hour_members(members)
         self._lifecycle = WriterLifecycle.ACCEPTING
-        self._refresh_metrics_cache()
+        self._invalidate_metrics_cache()
         return manifests
 
     def _pending_hour_close_members(self) -> tuple[_FinalBarrierCloseMember, ...]:
@@ -1392,9 +1849,11 @@ class RawWriterService:
         for part, claimed in claims:
             part.bind_claim_batch_task(claimed, task)
         batch = cast(DurabilityBatch, await self._pump_task(task))
-        if self._pending_oldest_error is not None and not self._critical_draining:
+        if self._pending_oldest_error_facts is not None and not self._critical_draining:
+            if self._ingress_drain_active:
+                return batch
             await self._finish_oldest_critical_drain()
-            raise self._pending_oldest_error
+            raise self._pending_oldest_error_facts.materialize()
         return batch
 
     async def _close_parts(
@@ -1461,7 +1920,7 @@ class RawWriterService:
                 final_barrier=True,
             )
         self._publication_state = PublicationState.FINAL_SYNC
-        self._refresh_metrics_cache()
+        self._invalidate_metrics_cache()
         task = asyncio.create_task(
             self._barrier.close_mixed_group(
                 members,
@@ -1482,7 +1941,7 @@ class RawWriterService:
         self._publication_state = PublicationState.IDLE
         for part in parts:
             self._retiring.pop(part.generation_id, None)
-        self._refresh_metrics_cache()
+        self._invalidate_metrics_cache()
         return manifests
 
     async def _pump_task(self, task: asyncio.Task[object]) -> object:
@@ -1505,7 +1964,7 @@ class RawWriterService:
                 for generation_id in unowned_final:
                     self._completion_claims.pop(generation_id, None)
                 if unowned_final:
-                    self._refresh_metrics_cache()
+                    self._invalidate_metrics_cache()
             if task.done() and not self._completion_claims:
                 if wake_after_task:
                     self._work_event.set()
@@ -1530,10 +1989,29 @@ class RawWriterService:
                     and self._commands.empty()
                     and (not self._command_active or bool(self._retiring))
                 ):
-                    await self._drain_ingress(allow_storage_io=False)
+                    if self._ingress_drain_active:
+                        await self._drain_ingress_owned(
+                            allow_storage_io=False,
+                            watermark=self._active_command_watermark,
+                            max_records=_DRAIN_SERVICE_QUANTUM_RECORDS,
+                        )
+                    else:
+                        await self._drain_ingress(
+                            allow_storage_io=False,
+                            watermark=self._active_command_watermark,
+                            max_records=_DRAIN_SERVICE_QUANTUM_RECORDS,
+                        )
+                    wake_after_task = wake_after_task or bool(
+                        self._ingress.nonempty_shards() or self._deferred_by_generation
+                    )
                 else:
                     wake_after_task = True
                 wake_after_task = wake_after_task or self._periodic_due
+            if get_message not in done and get_message.done():
+                message = get_message.result()
+                self._completion_queue.task_done()
+                self._handle_completion(message)
+                done.add(get_message)
             for waiter in (get_message, wake):
                 if waiter in done:
                     continue
@@ -1559,7 +2037,11 @@ class RawWriterService:
                 try:
                     if claim.final_barrier:
                         barrier_message: FileSyncCompleted | FileSyncFailed = message
-                        barrier_error = self._pending_oldest_error
+                        barrier_error = (
+                            self._pending_oldest_error_facts.materialize()
+                            if self._pending_oldest_error_facts is not None
+                            else None
+                        )
                         deadline = self._active_close_deadline_ns
                         if (
                             barrier_error is None
@@ -1607,7 +2089,7 @@ class RawWriterService:
             elif not self._barrier.handle_message(message):
                 raise ValueError("unknown storage completion message")
         finally:
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
 
     def _account_durable(
         self,
@@ -1817,7 +2299,7 @@ class RawWriterService:
             self._lifecycle = WriterLifecycle.ACCEPTING
             self._admission_state = AdmissionState.OPEN
             self._ticker_task = asyncio.create_task(self._periodic_timer())
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
             return self
         if command.kind == "sync":
             batch = await self._sync_parts(
@@ -1862,7 +2344,7 @@ class RawWriterService:
             self._config_generation = config_generation
             self._lifecycle = WriterLifecycle.ACCEPTING
             self._admission_state = AdmissionState.OPEN
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
             return manifests
         if command.kind == "close":
             reason = cast(CloseReason, command.args[0])
@@ -1900,7 +2382,7 @@ class RawWriterService:
             self._lifecycle = WriterLifecycle.CLOSED
             self._admission_state = AdmissionState.CLOSED
             self._stopping = True
-            self._refresh_metrics_cache()
+            self._invalidate_metrics_cache()
             return manifests
         if command.kind == "incomplete":
             incomplete_reason = cast(str, command.args[0])
@@ -1927,7 +2409,9 @@ class RawWriterService:
                     self._lifecycle is not WriterLifecycle.STARTING
                     and self._commands.empty()
                 ):
-                    await self._drain_ingress()
+                    await self._drain_ingress(
+                        max_records=_DRAIN_SERVICE_QUANTUM_RECORDS
+                    )
                 while True:
                     try:
                         command = self._commands.get_nowait()
@@ -1936,6 +2420,7 @@ class RawWriterService:
                     self._commands.task_done()
                     terminal_command = command
                     self._command_active = True
+                    self._active_command_watermark = command.watermark
                     try:
                         if command.kind != "startup":
                             await self._drain_ingress(watermark=command.watermark)
@@ -1945,6 +2430,7 @@ class RawWriterService:
                         self._stopping = True
                         break
                     finally:
+                        self._active_command_watermark = None
                         self._command_active = False
                     if command.kind == "close":
                         terminal_result = result
@@ -1974,19 +2460,16 @@ class RawWriterService:
                 await self._release_resources()
             except BaseException as release_error:  # noqa: BLE001 - settle all futures
                 if terminal_error is None:
-                    terminal_error = release_error
-                else:
-                    terminal_error.add_note(
-                        "raw writer resource release also failed: "
-                        f"{type(release_error).__name__}"
-                    )
+                    terminal_error = _detached_service_error(release_error)
             if terminal_error is not None:
-                self._terminal_error = terminal_error
+                self._terminal_error = _detached_service_error(terminal_error)
             if terminal_command is not None and not terminal_command.future.done():
                 if terminal_error is None:
                     terminal_command.future.set_result(terminal_result)
                 else:
-                    terminal_command.future.set_exception(terminal_error)
+                    terminal_command.future.set_exception(
+                        _detached_service_error(terminal_error)
+                    )
             while True:
                 try:
                     command = self._commands.get_nowait()
@@ -1995,7 +2478,7 @@ class RawWriterService:
                 self._commands.task_done()
                 if not command.future.done():
                     command.future.set_exception(
-                        terminal_error
+                        _detached_service_error(terminal_error)
                         if terminal_error is not None
                         else RuntimeError("raw writer service has stopped")
                     )
@@ -2004,26 +2487,20 @@ class RawWriterService:
         try:
             terminal_error = await self._enter_terminal_error(error)
         except BaseException as capture_error:  # noqa: BLE001 - fail the owned command
-            capture_error.add_note(
-                "raw writer terminal accounting also failed while handling "
-                f"{type(error).__name__}"
-            )
             try:
                 self._metrics_cache = self._assemble_metrics_snapshot()
-            except BaseException as snapshot_error:  # noqa: BLE001 - freeze terminal state
-                capture_error.add_note(
-                    "raw writer terminal metrics snapshot also failed: "
-                    f"{type(snapshot_error).__name__}"
-                )
-            terminal_error = capture_error
-        self._terminal_error = terminal_error
-        return terminal_error
+                self._metrics_dirty = False
+            except BaseException:  # noqa: BLE001, S110 - retain the primary error
+                pass
+            terminal_error = _detached_service_error(capture_error)
+        self._terminal_error = _detached_service_error(terminal_error)
+        return _detached_service_error(terminal_error)
 
     async def _enter_terminal_error(self, error: BaseException) -> BaseException:
         if isinstance(error, RecoveryBlocked) and self._ledger.accepted_count == 0:
-            return error
+            return _detached_service_error(error)
         critical = (
-            error
+            _detached_service_error(error)
             if isinstance(error, WriterCriticalError)
             else WriterCriticalError(
                 reason=(
@@ -2039,8 +2516,8 @@ class RawWriterService:
                 message="raw writer service failed",
             )
         )
-        if critical is not error:
-            critical.__cause__ = error
+        if not isinstance(critical, WriterCriticalError):
+            raise TypeError("critical service error did not detach correctly")
         self._critical_reason = critical.reason
         self._lifecycle = WriterLifecycle.CRITICAL
         self._admission_state = AdmissionState.CLOSED

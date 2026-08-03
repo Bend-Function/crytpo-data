@@ -2115,21 +2115,40 @@ def _create_child_directories(
                     dir_fd=current_fd,
                 )
             except FileNotFoundError:
-                os.mkdir(segment, 0o750, dir_fd=current_fd)
-                if segment_phases is not None:
-                    notify_storage_phase(phase_hook, segment_phases[0])
-                os.fsync(current_fd)
-                if segment_phases is not None:
-                    notify_storage_phase(phase_hook, segment_phases[1])
-                next_fd = os.open(
-                    segment,
-                    _recovery_directory_flags(),
-                    dir_fd=current_fd,
-                )
+                try:
+                    os.mkdir(segment, 0o750, dir_fd=current_fd)
+                except FileExistsError:
+                    next_fd = os.open(
+                        segment,
+                        _recovery_directory_flags(),
+                        dir_fd=current_fd,
+                    )
+                    try:
+                        os.fsync(current_fd)
+                        if segment_phases is not None:
+                            notify_storage_phase(phase_hook, segment_phases[2])
+                    except BaseException:
+                        os.close(next_fd)
+                        raise
+                else:
+                    if segment_phases is not None:
+                        notify_storage_phase(phase_hook, segment_phases[0])
+                    os.fsync(current_fd)
+                    if segment_phases is not None:
+                        notify_storage_phase(phase_hook, segment_phases[1])
+                    next_fd = os.open(
+                        segment,
+                        _recovery_directory_flags(),
+                        dir_fd=current_fd,
+                    )
             else:
-                os.fsync(current_fd)
-                if segment_phases is not None:
-                    notify_storage_phase(phase_hook, segment_phases[2])
+                try:
+                    os.fsync(current_fd)
+                    if segment_phases is not None:
+                        notify_storage_phase(phase_hook, segment_phases[2])
+                except BaseException:
+                    os.close(next_fd)
+                    raise
             os.close(current_fd)
             current_fd = next_fd
     finally:

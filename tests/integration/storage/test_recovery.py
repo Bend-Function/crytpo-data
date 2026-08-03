@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -752,6 +753,40 @@ def test_recovery_journal_publishes_and_replays_exact_intent(tmp_path: Path) -> 
     assert fact_path.read_bytes() == intent.canonical_fact_bytes()
     assert fact_path.stat().st_ino == first_inode
     assert journal.load_chain(TRANSACTION_ID) == (intent,)
+
+
+def test_recovery_journals_tolerate_shared_root_creation_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    mkdir_barrier = threading.Barrier(2)
+    real_mkdir = recovery_module.os.mkdir
+
+    def racing_mkdir(
+        path: str,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == "raw-recovery":
+            mkdir_barrier.wait(timeout=5)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(recovery_module.os, "mkdir", racing_mkdir)
+    journals = (
+        _RecoveryJournal(state_root=state_root, exchange=Exchange.OKX),
+        _RecoveryJournal(state_root=state_root, exchange=Exchange.BYBIT),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        roots = tuple(executor.map(lambda journal: journal.ensure_exchange(), journals))
+
+    assert roots == (
+        state_root / "raw-recovery/okx",
+        state_root / "raw-recovery/bybit",
+    )
+    assert all(root.is_dir() for root in roots)
 
 
 def test_recovery_journal_cleans_known_temp_before_republishing(

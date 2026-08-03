@@ -8,7 +8,7 @@ import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise, zip_longest
@@ -27,6 +27,8 @@ from crypto_collector.benchmarks.aggregation import (
 from crypto_collector.benchmarks.artifacts import iter_jsonl_zstd
 from crypto_collector.benchmarks.contracts import (
     CANONICAL_EXCHANGES,
+    RAW_RECORD_FRAME_MIN_BYTES,
+    RAW_RECORD_FRAME_OVERHEAD_BYTES,
     FinalWorkerAggregateV1,
     GateAdmissionTraceV1,
     GateArtifactRefV1,
@@ -92,7 +94,6 @@ _SQLITE_COMMIT_ROWS = 50_000
 _ONE_SECOND_NS = 1_000_000_000
 _TRACE_MAX_LINE_BYTES = 64 * 1024
 _SAMPLE_MAX_LINE_BYTES = 64 * 1024
-_RAW_MAX_LINE_OVERHEAD_BYTES = 256 * 1024
 _RAW_DIRECTORY_ENTRY_MULTIPLIER = 20
 _RAW_DIRECTORY_ENTRY_FLOOR = 1_024
 _ZSTD_FRAME_HEADER_MAX_BYTES = 18
@@ -272,6 +273,22 @@ def _load_referenced_model(
     model_type: type[_ModelT],
 ) -> tuple[_ModelT, bytes]:
     _, source = _read_document_ref(root, reference)
+    return _load_model_source(reference, model_type, source)
+
+
+def _load_model_source(
+    reference: GateEvidenceDocumentRefV1,
+    model_type: type[_ModelT],
+    source: bytes,
+) -> tuple[_ModelT, bytes]:
+    if (
+        type(source) is not bytes
+        or len(source) != reference.content_size_bytes
+        or hashlib.sha256(source).hexdigest() != reference.content_sha256
+    ):
+        raise RuntimeEvidenceValidationError(
+            f"in-memory document disagrees with its ref: {reference.relative_path}"
+        )
     try:
         model = model_type.model_validate_json(source, strict=True)
     except (TypeError, ValueError, ValidationError) as error:
@@ -478,11 +495,32 @@ class _SampleValidation:
     worker_record_counts: _WorkerRecordCounts
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeEvidenceEvaluation:
+    recomputed_summary: GateRuntimeSummaryV1 | None
+    target_reprobe: GateTargetReprobeV1 | None
+    failure_codes: tuple[str, ...]
+    evidence_integrity_valid: bool
+    candidate_summary_matches: bool
+    runtime_predicates_passed: bool
+
+    @property
+    def runtime_evidence_valid(self) -> bool:
+        return (
+            self.evidence_integrity_valid
+            and self.candidate_summary_matches
+            and self.runtime_predicates_passed
+            and self.recomputed_summary is not None
+            and (self.target_reprobe is None or self.target_reprobe.reprobe_valid)
+        )
+
+
 def _load_primary_documents(
     evidence_root: Path,
     run_index: GateRunIndexV1,
     *,
     target_declaration_sha256: str | None,
+    candidate_source: bytes | None = None,
 ) -> _PrimaryDocuments:
     workload_path, workload_source = _read_document_ref(
         evidence_root,
@@ -499,10 +537,18 @@ def _load_primary_documents(
         raise RuntimeEvidenceValidationError(
             "workload bytes disagree with the run index"
         )
-    candidate, _ = _load_referenced_model(
-        evidence_root,
-        run_index.candidate_report,
-        GateCandidateReportV1,
+    candidate, _ = (
+        _load_referenced_model(
+            evidence_root,
+            run_index.candidate_report,
+            GateCandidateReportV1,
+        )
+        if candidate_source is None
+        else _load_model_source(
+            run_index.candidate_report,
+            GateCandidateReportV1,
+            candidate_source,
+        )
     )
     raw_inventory, _ = _load_referenced_model(
         evidence_root,
@@ -746,6 +792,7 @@ def _validate_trace(
     merged_count = 0
     accepted_count = 0
     accepted_payload_bytes = 0
+    admission_completed_monotonic_ns_max = candidate.admission_started_monotonic_ns
     sentinel = object()
     connection = database.connection
     connection.execute("BEGIN")
@@ -798,6 +845,10 @@ def _validate_trace(
             raise RuntimeEvidenceValidationError(
                 "trace row disagrees with the workload oracle"
             )
+        admission_completed_monotonic_ns_max = max(
+            admission_completed_monotonic_ns_max,
+            observed.admission_completed_monotonic_ns,
+        )
         line = observed.canonical_bytes()
         merged_digest.update(line)
         merged_size += len(line)
@@ -877,6 +928,20 @@ def _validate_trace(
     ):
         raise RuntimeEvidenceValidationError(
             "virtual merged trace facts disagree with the run index"
+        )
+    expected_admission_end = max(
+        candidate.admission_scheduled_end_monotonic_ns,
+        admission_completed_monotonic_ns_max,
+    )
+    expected_admission_end_utc = candidate.admission_started_utc_ns + (
+        expected_admission_end - candidate.admission_started_monotonic_ns
+    )
+    if (
+        candidate.admission_ended_monotonic_ns != expected_admission_end
+        or candidate.admission_ended_utc_ns != expected_admission_end_utc
+    ):
+        raise RuntimeEvidenceValidationError(
+            "candidate admission end disagrees with the completed trace"
         )
     ordinal_rows = connection.execute(
         """
@@ -965,6 +1030,7 @@ def _validate_sample_artifacts(
     database: _ScratchDatabase,
 ) -> _SampleValidation:
     candidate = documents.candidate
+    qualification = candidate.mode == "qualification"
     plan = build_workload_plan(
         documents.workload,
         multiplier=candidate.multiplier,
@@ -985,6 +1051,7 @@ def _validate_sample_artifacts(
     sequences = validate_worker_rounds(
         worker_rounds,
         expected_workers=worker_rounds[0].expected_worker_keys,
+        require_nonoverlap=qualification,
     )
     aggregate = aggregate_final_worker_snapshots(sequences)
     sample_interval_ns = (
@@ -1008,7 +1075,7 @@ def _validate_sample_artifacts(
         ),
         default=0,
     )
-    if (
+    if qualification and (
         first_worker_request
         > candidate.admission_started_monotonic_ns + sample_interval_ns
         or final_worker_completion < candidate.admission_scheduled_end_monotonic_ns
@@ -1101,6 +1168,7 @@ def _validate_sample_artifacts(
         warmup_ended_monotonic_ns=(
             candidate.admission_started_monotonic_ns + warmup_ns
         ),
+        require_nonoverlap=qualification,
     )
     del resource_rounds
     health_samples = tuple(
@@ -1118,8 +1186,9 @@ def _validate_sample_artifacts(
         health_samples,
         duration_ns=candidate.duration_ns,
         interval_ns=sample_interval_ns,
+        require_nonoverlap=qualification,
     )
-    if (
+    if qualification and (
         health_summary.first_request_monotonic_ns
         > candidate.admission_started_monotonic_ns + sample_interval_ns
         or health_summary.final_completion_monotonic_ns
@@ -1352,6 +1421,7 @@ def _validate_raw_manifest_rows(
     *,
     manifest_ordinal: int,
     max_line_bytes: int,
+    max_plain_frame_bytes: int,
 ) -> tuple[int, int, set[str], set[str]]:
     manifest = loaded.manifest
     data_path = _referenced_path(data_root, manifest.data_relative_path)
@@ -1366,10 +1436,9 @@ def _validate_raw_manifest_rows(
             raise RuntimeEvidenceValidationError(
                 "raw manifest source is not present and verified"
             )
-        assert manifest.max_plain_frame_bytes is not None
         _validate_raw_zstd_frames(
             data_path,
-            max_plain_frame_bytes=manifest.max_plain_frame_bytes,
+            max_plain_frame_bytes=max_plain_frame_bytes,
         )
         content_digest = hashlib.sha256()
         content_size = 0
@@ -1702,6 +1771,7 @@ def _validate_raw_evidence(
     database: _ScratchDatabase,
     plan: WorkloadPlanV1,
 ) -> _RawValidation:
+    qualification = documents.candidate.mode == "qualification"
     _validate_raw_directory_inventory(data_root, documents)
     record_count = 0
     payload_bytes = 0
@@ -1714,7 +1784,11 @@ def _validate_raw_evidence(
     sync_by_worker: dict[str, list[int]] = {}
     max_line_bytes = (
         max(stream.payload_max_bytes for stream in plan.streams)
-        + _RAW_MAX_LINE_OVERHEAD_BYTES
+        + RAW_RECORD_FRAME_OVERHEAD_BYTES
+    )
+    expected_max_plain_frame_bytes = max(
+        RAW_RECORD_FRAME_MIN_BYTES,
+        max_line_bytes,
     )
     for entry in documents.manifest_inventory.manifests:
         manifest_path = _referenced_path(data_root, entry.manifest.relative_path)
@@ -1738,9 +1812,16 @@ def _validate_raw_evidence(
             manifest.parse_error_count,
             manifest.checksum_error_count,
             manifest.queue_overflow_count,
-            manifest.slo_breach_count,
             manifest.write_failure_count,
             manifest.sync_failure_count,
+        )
+        qualification_durability_failure = qualification and (
+            manifest.slo_breach_count != 0
+            or (
+                manifest.durability_lag_max_ns is not None
+                and manifest.durability_lag_max_ns
+                > documents.workload.workload.qualification.durability_lag_max_ns
+            )
         )
         if (
             manifest.close_reason
@@ -1753,8 +1834,7 @@ def _validate_raw_evidence(
             or any(value != 0 for value in control_failures)
             or manifest.control_event_ids != ()
             or manifest.durability_lag_max_ns is None
-            or manifest.durability_lag_max_ns
-            > documents.workload.workload.qualification.durability_lag_max_ns
+            or qualification_durability_failure
             or manifest.sync_count is None
             or manifest.sync_count <= 0
         ):
@@ -1766,6 +1846,13 @@ def _validate_raw_evidence(
         assert manifest.sync_count is not None
         assert manifest.sync_duration_total_ns is not None
         assert manifest.sync_duration_max_ns is not None
+        if (
+            manifest.zstd_level != 3
+            or manifest.max_plain_frame_bytes != expected_max_plain_frame_bytes
+        ):
+            raise RuntimeEvidenceValidationError(
+                "raw manifest codec facts disagree with the workload-derived config"
+            )
         sync_count += manifest.sync_count
         sync_duration_total_ns += manifest.sync_duration_total_ns
         sync_duration_max_ns = max(
@@ -1794,6 +1881,7 @@ def _validate_raw_evidence(
             database,
             manifest_ordinal=entry.ordinal,
             max_line_bytes=max_line_bytes,
+            max_plain_frame_bytes=expected_max_plain_frame_bytes,
         )
         record_count += rows
         payload_bytes += bytes_
@@ -2038,6 +2126,7 @@ def _runtime_predicates_pass(
     summary: GateRuntimeSummaryV1,
     target_reprobe: GateTargetReprobeV1 | None,
 ) -> bool:
+    qualification = run_index.mode == "qualification"
     limits = documents.workload.workload.qualification
     aggregate = summary.final_worker_aggregate
     resource = summary.resource_summary
@@ -2060,7 +2149,7 @@ def _runtime_predicates_pass(
         == summary.durable_payload_bytes
         == summary.expected_payload_bytes
     )
-    worker_valid = (
+    worker_correctness_valid = (
         aggregate.worker_count == 5
         and aggregate.accepted_record_count == summary.expected_record_count
         and aggregate.durable_record_count == summary.expected_record_count
@@ -2070,59 +2159,89 @@ def _runtime_predicates_pass(
         and aggregate.normal_overflow_count == 0
         and aggregate.control_overflow_count == 0
         and aggregate.not_accepting_count == 0
-        and aggregate.slo_breach_count == 0
         and aggregate.write_failure_count == 0
         and aggregate.sync_failure_count == 0
         and aggregate.publication_failure_count == 0
-        and aggregate.retiring_generation_count_peak == 0
+    )
+    worker_performance_valid = not qualification or (
+        aggregate.slo_breach_count == 0
         and aggregate.durability_lag_max_ns is not None
         and aggregate.durability_lag_max_ns <= limits.durability_lag_max_ns
         and aggregate.active_logical_generation_count_peak
         == summary.expected_touched_file_identity_count
+        and aggregate.retiring_generation_count_peak == 0
     )
-    resource_valid = (
+    qualification_resource_trend_valid = not qualification or (
         resource.resource_trend_valid
-        and resource.first_request_monotonic_ns
+        and resource.rss_slope_bytes_per_minute is not None
+        and resource.rss_slope_bytes_per_minute <= limits.max_rss_slope_bytes_per_minute
+        and resource.fd_growth_after_warmup is not None
+        and resource.fd_growth_after_warmup <= limits.max_fd_growth_after_warmup
+    )
+    resource_evidence_valid = not qualification or (
+        resource.first_request_monotonic_ns
         <= documents.candidate.admission_started_monotonic_ns + interval_ns
         and resource.final_completion_monotonic_ns
         >= documents.candidate.admission_scheduled_end_monotonic_ns
         and resource.coverage_ns
         >= max(0, documents.candidate.duration_ns - interval_ns)
         and resource.sample_max_gap_ns <= max_gap_ns
-        and resource.rss_peak_bytes <= limits.max_rss_bytes
-        and resource.rss_slope_bytes_per_minute is not None
-        and resource.rss_slope_bytes_per_minute <= limits.max_rss_slope_bytes_per_minute
-        and resource.open_fds_peak <= limits.max_open_fds
-        and resource.fd_growth_after_warmup is not None
-        and resource.fd_growth_after_warmup <= limits.max_fd_growth_after_warmup
     )
-    health_valid = (
+    resource_performance_valid = not qualification or (
+        resource.rss_peak_bytes <= limits.max_rss_bytes
+        and resource.open_fds_peak <= limits.max_open_fds
+        and qualification_resource_trend_valid
+    )
+    health_evidence_valid = not qualification or (
         health.sample_count_valid
         and health.coverage_valid
-        and health.workers_healthy
         and health.sample_max_gap_ns <= max_gap_ns
     )
+    health_correctness_valid = health.workers_healthy
     stream_valid = all(
-        item.planned_values_match and item.admission_values_match and item.burst_valid
+        item.planned_values_match
+        and (
+            (item.admission_values_match and item.burst_valid)
+            if qualification
+            else (
+                item.scheduled_record_count
+                == item.attempted_record_count
+                == item.accepted_record_count
+                == item.expected_record_count
+                and item.scheduled_payload_bytes
+                == item.attempted_payload_bytes
+                == item.accepted_payload_bytes
+                == item.expected_payload_bytes
+                and item.early_count == 0
+                and item.burst_scheduled_count
+                == item.burst_attempted_count
+                == item.burst_accepted_count
+                == item.scheduled_burst_count
+            )
+        )
         for item in summary.stream_summaries
     )
     identity_valid = (
         summary.accepted_identity_count
         == summary.unique_accepted_identity_count
         == summary.expected_record_count
+        and summary.raw_file_count == summary.expected_touched_file_identity_count
+        and summary.manifest_file_count == summary.expected_touched_file_identity_count
         and summary.observed_touched_file_identity_count
         == summary.expected_touched_file_identity_count
     )
     timing_valid = (
         summary.early_count == 0
-        and summary.late_count == 0
-        and summary.out_of_window_count == 0
+        and (
+            not qualification
+            or (summary.late_count == 0 and summary.out_of_window_count == 0)
+        )
         and len(summary.received_utc_hours) == 1
         and summary.received_utc_hours[0]
         == documents.candidate.declared_admission_utc_hour
     )
     mode_valid = True
-    if run_index.mode == "qualification":
+    if qualification:
         mode_valid = (
             documents.workload.sha256 == RESEARCH_DEFAULT_V1_SHA256
             and documents.candidate.multiplier >= 2
@@ -2137,9 +2256,12 @@ def _runtime_predicates_pass(
         (
             exact_counts,
             exact_payloads,
-            worker_valid,
-            resource_valid,
-            health_valid,
+            worker_correctness_valid,
+            worker_performance_valid,
+            resource_evidence_valid,
+            resource_performance_valid,
+            health_evidence_valid,
+            health_correctness_valid,
             stream_valid,
             identity_valid,
             timing_valid,
@@ -2489,6 +2611,208 @@ def _finish_scratch_database(database: _ScratchDatabase) -> None:
     database.close()
 
 
+def _invalid_evaluation(
+    *,
+    target_reprobe: GateTargetReprobeV1 | None,
+    failure_code: str,
+) -> RuntimeEvidenceEvaluation:
+    return RuntimeEvidenceEvaluation(
+        recomputed_summary=None,
+        target_reprobe=target_reprobe,
+        failure_codes=(failure_code,),
+        evidence_integrity_valid=False,
+        candidate_summary_matches=False,
+        runtime_predicates_passed=False,
+    )
+
+
+def _evaluate_primary_evidence(
+    *,
+    evidence_root: Path,
+    data_root: Path,
+    state_root: Path,
+    run_index: GateRunIndexV1,
+    target_reprobe: GateTargetReprobeV1 | None,
+    candidate_source: bytes | None,
+    after_scratch_finished: Callable[[RuntimeEvidenceEvaluation], None] | None = None,
+) -> RuntimeEvidenceEvaluation:
+    database = _ScratchDatabase.open(state_root)
+    try:
+        try:
+            documents = _load_primary_documents(
+                evidence_root,
+                run_index,
+                target_declaration_sha256=(
+                    None
+                    if target_reprobe is None
+                    else target_reprobe.declaration_sha256
+                ),
+                candidate_source=candidate_source,
+            )
+            plan = build_workload_plan(
+                documents.workload,
+                multiplier=documents.candidate.multiplier,
+                duration_ns=documents.candidate.duration_ns,
+            )
+            trace = _validate_trace(
+                evidence_root,
+                run_index,
+                documents.candidate,
+                plan,
+                database,
+            )
+            _validate_bucket_artifact(
+                evidence_root,
+                run_index.second_bucket_artifact,
+                trace.buckets,
+            )
+            samples = _validate_sample_artifacts(
+                evidence_root,
+                run_index,
+                documents,
+                database,
+            )
+            raw = _validate_raw_evidence(data_root, documents, database, plan)
+            summary = _build_runtime_summary(
+                plan,
+                documents,
+                trace,
+                samples,
+                raw,
+                database,
+            )
+            runtime_predicates_passed = _runtime_predicates_pass(
+                run_index,
+                documents,
+                plan,
+                summary,
+                target_reprobe,
+            )
+            candidate_summary_matches = (
+                documents.candidate.runtime_summary == summary
+                and documents.candidate.candidate_runtime_passed
+                == runtime_predicates_passed
+            )
+            failure_codes: list[str] = []
+            if not candidate_summary_matches:
+                failure_codes.append("candidate_summary_mismatch")
+            if not runtime_predicates_passed:
+                failure_codes.append("runtime_predicate_failed")
+            if target_reprobe is not None and not target_reprobe.reprobe_valid:
+                failure_codes.append("target_reprobe_failed")
+            evaluation = RuntimeEvidenceEvaluation(
+                recomputed_summary=summary,
+                target_reprobe=target_reprobe,
+                failure_codes=tuple(failure_codes),
+                evidence_integrity_valid=True,
+                candidate_summary_matches=candidate_summary_matches,
+                runtime_predicates_passed=runtime_predicates_passed,
+            )
+        except RuntimeEvidenceValidationError:
+            database.connection.rollback()
+            evaluation = _invalid_evaluation(
+                target_reprobe=target_reprobe,
+                failure_code="evidence_integrity_invalid",
+            )
+        except (OSError, sqlite3.Error, ValueError, zstandard.ZstdError):
+            try:
+                database.connection.rollback()
+            except sqlite3.Error:
+                pass
+            evaluation = _invalid_evaluation(
+                target_reprobe=target_reprobe,
+                failure_code="evidence_integrity_invalid",
+            )
+        _finish_scratch_database(database)
+        if after_scratch_finished is not None:
+            after_scratch_finished(evaluation)
+    except BaseException:
+        try:
+            database.close()
+        except sqlite3.Error:
+            pass
+        raise
+    database.cleanup()
+    fsync_directory(state_root)
+    return evaluation
+
+
+def evaluate_runtime_candidate(
+    *,
+    evidence_root: Path,
+    run_index: GateRunIndexV1,
+    candidate_source: bytes,
+    target_probe: TargetProbePort | None,
+) -> RuntimeEvidenceEvaluation:
+    if target_probe is not None and not callable(target_probe):
+        raise TypeError("target_probe must be callable or None")
+    if not isinstance(evidence_root, Path) or not evidence_root.is_absolute():
+        raise RuntimeEvidenceValidationError(
+            "candidate evidence root must be an absolute Path"
+        )
+    try:
+        resolved_root = evidence_root.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeEvidenceValidationError(
+            "candidate evidence root must exist"
+        ) from error
+    if resolved_root != evidence_root or not evidence_root.is_dir():
+        raise RuntimeEvidenceValidationError(
+            "candidate evidence root must be a normalized non-symlink directory"
+        )
+    if not isinstance(run_index, GateRunIndexV1):
+        raise TypeError("run_index must be GateRunIndexV1")
+    if type(candidate_source) is not bytes or not candidate_source:
+        raise TypeError("candidate_source must be nonempty bytes")
+    if (
+        GateRunIndexV1.model_validate_json(
+            run_index.canonical_bytes(),
+            strict=True,
+        )
+        != run_index
+    ):
+        raise RuntimeEvidenceValidationError("in-memory run index is noncanonical")
+    candidate_path = evidence_root.joinpath(
+        *run_index.candidate_report.relative_path.split("/")
+    )
+    if not candidate_path.is_relative_to(evidence_root) or os.path.lexists(
+        candidate_path
+    ):
+        raise RuntimeEvidenceValidationError(
+            "precommit candidate path must be absent inside the evidence root"
+        )
+    data_root = _trusted_root(run_index.data_root, label="data root")
+    state_root = _trusted_root(run_index.state_root, label="state root")
+    if run_index.mode == "functional" and target_probe is not None:
+        raise RuntimeEvidenceValidationError(
+            "functional runtime evidence forbids a target probe"
+        )
+    if run_index.mode == "qualification" and target_probe is None:
+        raise RuntimeEvidenceValidationError(
+            "qualification runtime evidence requires a target probe"
+        )
+    try:
+        target_reprobe = _target_reprobe_for_attempt(
+            evidence_root,
+            run_index,
+            target_probe,
+            None,
+        )
+    except RuntimeEvidenceValidationError:
+        return _invalid_evaluation(
+            target_reprobe=None,
+            failure_code="target_evidence_invalid",
+        )
+    return _evaluate_primary_evidence(
+        evidence_root=evidence_root,
+        data_root=data_root,
+        state_root=state_root,
+        run_index=run_index,
+        target_reprobe=target_reprobe,
+        candidate_source=candidate_source,
+    )
+
+
 def _publish_or_reuse_receipt(
     evidence_root: Path,
     run_index: GateRunIndexV1,
@@ -2512,6 +2836,36 @@ def _publish_or_reuse_receipt(
         evidence_root,
         run_index,
         run_index_path,
+        existing,
+    )
+
+
+def _publish_finished_evaluation(
+    evaluation: RuntimeEvidenceEvaluation,
+    *,
+    evidence_root: Path,
+    run_index: GateRunIndexV1,
+    run_index_source: bytes,
+    run_index_path: Path,
+    existing: GateRuntimeReceiptV1 | None,
+    verified_at_unix_ns: int,
+) -> None:
+    receipt = _runtime_receipt(
+        run_index,
+        run_index_source,
+        recomputed_summary=evaluation.recomputed_summary,
+        target_reprobe=evaluation.target_reprobe,
+        failure_codes=evaluation.failure_codes,
+        evidence_integrity_valid=evaluation.evidence_integrity_valid,
+        candidate_summary_matches=evaluation.candidate_summary_matches,
+        runtime_predicates_passed=evaluation.runtime_predicates_passed,
+        verified_at_unix_ns=verified_at_unix_ns,
+    )
+    _publish_or_reuse_receipt(
+        evidence_root,
+        run_index,
+        run_index_path,
+        receipt,
         existing,
     )
 
@@ -2572,128 +2926,40 @@ def validate_runtime_evidence(
             existing,
         )
         return receipt
-    database = _ScratchDatabase.open(state_root)
-    try:
-        try:
-            documents = _load_primary_documents(
-                evidence_root,
-                run_index,
-                target_declaration_sha256=(
-                    None
-                    if target_reprobe is None
-                    else target_reprobe.declaration_sha256
-                ),
-            )
-            plan = build_workload_plan(
-                documents.workload,
-                multiplier=documents.candidate.multiplier,
-                duration_ns=documents.candidate.duration_ns,
-            )
-            trace = _validate_trace(
-                evidence_root,
-                run_index,
-                documents.candidate,
-                plan,
-                database,
-            )
-            _validate_bucket_artifact(
-                evidence_root,
-                run_index.second_bucket_artifact,
-                trace.buckets,
-            )
-            samples = _validate_sample_artifacts(
-                evidence_root,
-                run_index,
-                documents,
-                database,
-            )
-            raw = _validate_raw_evidence(data_root, documents, database, plan)
-            summary = _build_runtime_summary(
-                plan,
-                documents,
-                trace,
-                samples,
-                raw,
-                database,
-            )
-            runtime_predicates_passed = _runtime_predicates_pass(
-                run_index,
-                documents,
-                plan,
-                summary,
-                target_reprobe,
-            )
-            candidate_summary_matches = (
-                documents.candidate.runtime_summary == summary
-                and documents.candidate.candidate_runtime_passed
-                == runtime_predicates_passed
-            )
-            failure_codes: list[str] = []
-            if not candidate_summary_matches:
-                failure_codes.append("candidate_summary_mismatch")
-            if not runtime_predicates_passed:
-                failure_codes.append("runtime_predicate_failed")
-            if target_reprobe is not None and not target_reprobe.reprobe_valid:
-                failure_codes.append("target_reprobe_failed")
-            receipt = _runtime_receipt(
-                run_index,
-                run_index_source,
-                recomputed_summary=summary,
-                target_reprobe=target_reprobe,
-                failure_codes=tuple(failure_codes),
-                evidence_integrity_valid=True,
-                candidate_summary_matches=candidate_summary_matches,
-                runtime_predicates_passed=runtime_predicates_passed,
-                verified_at_unix_ns=verified_at_unix_ns,
-            )
-        except RuntimeEvidenceValidationError:
-            database.connection.rollback()
-            receipt = _runtime_receipt(
-                run_index,
-                run_index_source,
-                recomputed_summary=None,
-                target_reprobe=target_reprobe,
-                failure_codes=("evidence_integrity_invalid",),
-                evidence_integrity_valid=False,
-                candidate_summary_matches=False,
-                runtime_predicates_passed=False,
-                verified_at_unix_ns=verified_at_unix_ns,
-            )
-        except (OSError, sqlite3.Error, ValueError, zstandard.ZstdError) as error:
-            database.connection.rollback()
-            receipt = _runtime_receipt(
-                run_index,
-                run_index_source,
-                recomputed_summary=None,
-                target_reprobe=target_reprobe,
-                failure_codes=("evidence_integrity_invalid",),
-                evidence_integrity_valid=False,
-                candidate_summary_matches=False,
-                runtime_predicates_passed=False,
-                verified_at_unix_ns=verified_at_unix_ns,
-            )
-            error.add_note("runtime evidence validation failed closed")
-        _finish_scratch_database(database)
-        _publish_or_reuse_receipt(
-            evidence_root,
-            run_index,
-            trusted_path,
-            receipt,
-            existing,
-        )
-    except BaseException:
-        try:
-            database.close()
-        except sqlite3.Error:
-            pass
-        raise
-    database.cleanup()
-    fsync_directory(state_root)
-    return receipt
+    evaluation = _evaluate_primary_evidence(
+        evidence_root=evidence_root,
+        data_root=data_root,
+        state_root=state_root,
+        run_index=run_index,
+        target_reprobe=target_reprobe,
+        candidate_source=None,
+        after_scratch_finished=lambda finished: _publish_finished_evaluation(
+            finished,
+            evidence_root=evidence_root,
+            run_index=run_index,
+            run_index_source=run_index_source,
+            run_index_path=trusted_path,
+            existing=existing,
+            verified_at_unix_ns=verified_at_unix_ns,
+        ),
+    )
+    return _runtime_receipt(
+        run_index,
+        run_index_source,
+        recomputed_summary=evaluation.recomputed_summary,
+        target_reprobe=evaluation.target_reprobe,
+        failure_codes=evaluation.failure_codes,
+        evidence_integrity_valid=evaluation.evidence_integrity_valid,
+        candidate_summary_matches=evaluation.candidate_summary_matches,
+        runtime_predicates_passed=evaluation.runtime_predicates_passed,
+        verified_at_unix_ns=verified_at_unix_ns,
+    )
 
 
 __all__ = [
+    "RuntimeEvidenceEvaluation",
     "RuntimeEvidenceValidationError",
     "TargetProbePort",
+    "evaluate_runtime_candidate",
     "validate_runtime_evidence",
 ]

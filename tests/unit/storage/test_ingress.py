@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -10,9 +11,11 @@ from pydantic import ValidationError
 
 import crypto_collector.storage as storage_package
 import crypto_collector.storage.ingress as ingress_module
+import crypto_collector.storage.serialize as serialize_module
 from crypto_collector.config.models import IngressConfig
 from crypto_collector.domain.envelope import (
     NativeEventDraft,
+    RawEnvelope,
     RestMetadata,
     SourceContext,
 )
@@ -43,6 +46,7 @@ from crypto_collector.storage.models import (
     WriterStatus,
     validate_control_draft,
 )
+from crypto_collector.storage.serialize import encode_envelope
 from crypto_collector.storage.stats import DURABILITY_BUCKET_UPPER_BOUNDS_NS
 
 
@@ -244,6 +248,91 @@ def test_successful_nonblocking_insert_defines_acceptance() -> None:
     assert ingress.queued_bytes("trade-0") == len(result.record.encoded_jsonl)
 
 
+def test_admission_uses_trusted_envelope_path_after_input_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingress, _budget, _clock = make_ingress()
+
+    def fail_revalidation(*_args: object, **_kwargs: object) -> RawEnvelope:
+        raise AssertionError("validated admission input was revalidated")
+
+    def fail_public_encoding(_value: object) -> bytes:
+        raise AssertionError("validated admission input used the public encoder")
+
+    def fail_model_dump(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("validated admission input was dumped twice")
+
+    def fail_model_construct(*_args: object, **_kwargs: object) -> RawEnvelope:
+        raise AssertionError(
+            "validated admission input used generic model construction"
+        )
+
+    def fail_identity_init(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("validated identity values used public model construction")
+
+    with monkeypatch.context() as context:
+        context.setattr(RawEnvelope, "model_validate", fail_revalidation)
+        context.setattr(RawEnvelope, "model_construct", fail_model_construct)
+        context.setattr(RawEnvelope, "model_dump", fail_model_dump)
+        context.setattr(AcceptedRecordIdentityV1, "__init__", fail_identity_init)
+        context.setattr(serialize_module, "encode_json", fail_public_encoding)
+        result = ingress.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        )
+
+    assert result.accepted
+    assert result.record is not None
+    assert result.record_identity is not None
+    assert result.record.encoded_jsonl == encode_envelope(result.record.envelope)
+    assert (
+        AcceptedRecordIdentityV1.model_validate(
+            result.record_identity.model_dump(mode="python")
+        )
+        == result.record_identity
+    )
+
+
+@pytest.mark.parametrize(
+    ("draft", "source", "shard"),
+    (
+        (
+            trade_draft(
+                payload={
+                    "text": 'line one\nline two / "quoted"',
+                    "unicode": "\u6570\u636e",
+                }
+            ),
+            websocket_source(),
+            "trade-0",
+        ),
+        (
+            trade_draft(payload={"ratio": Decimal("0.100")}),
+            websocket_source(),
+            "trade-0",
+        ),
+        (
+            rest_draft(payload={"last": "100", "flags": [True, None]}),
+            rest_source(),
+            "ticker-0",
+        ),
+    ),
+    ids=("escaped-unicode", "decimal-fallback", "nested-rest-metadata"),
+)
+def test_trusted_envelope_encoding_matches_public_canonical_bytes(
+    draft: NativeEventDraft,
+    source: SourceContext,
+    shard: str,
+) -> None:
+    ingress, _budget, _clock = make_ingress()
+
+    result = ingress.try_accept(draft, source=source, shard=shard)
+
+    assert result.record is not None
+    assert result.record.encoded_jsonl == encode_envelope(result.record.envelope)
+
+
 def test_record_overflow_never_consumes_sequence_or_acceptance_ordinal() -> None:
     config = ingress_config(shard_max_records=1)
     ingress, budget, _clock = make_ingress(config=config)
@@ -306,6 +395,49 @@ def test_writer_sequence_is_per_logical_stream_identity() -> None:
     ) == (0, 1, 2)
 
 
+def test_successful_acceptance_binds_logical_identity_to_one_shard() -> None:
+    ingress, _budget, _clock = make_ingress()
+    first = ingress.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    )
+    before_conflict = ingress.snapshot_for_test()
+
+    with pytest.raises(AdmissionContractError, match="logical identity.*shard"):
+        ingress.try_accept(trade_draft(), source=websocket_source(), shard="trade-1")
+
+    assert ingress.snapshot_for_test() == before_conflict
+    second = ingress.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    )
+    assert first.record is not None
+    assert second.record is not None
+    assert first.record.envelope.writer_sequence == 0
+    assert second.record.envelope.writer_sequence == 1
+
+
+def test_overflow_does_not_bind_logical_identity_to_shard() -> None:
+    config = ingress_config(shard_max_records=1)
+    ingress, _budget, _clock = make_ingress(config=config)
+    assert ingress.try_accept(
+        trade_draft(instrument_key="ETH-USDT", wire_symbol="ETH-USDT"),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+
+    overflow = ingress.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    )
+    accepted = ingress.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-1"
+    )
+
+    assert overflow.status is EnqueueStatus.OVERFLOW
+    assert accepted.record is not None
+    assert accepted.record_identity is not None
+    assert accepted.record.envelope.writer_sequence == 0
+    assert accepted.record_identity.acceptance_ordinal == 1
+
+
 def test_config_replacement_preserves_sequences_ordinals_and_counters() -> None:
     config = ingress_config(shard_max_records=1)
     ingress, budget, _clock = make_ingress(config=config)
@@ -345,6 +477,35 @@ def test_config_replacement_preserves_sequences_ordinals_and_counters() -> None:
     )
     assert retired.status is EnqueueStatus.NOT_ACCEPTING
     assert retired.record is retired.record_identity is None
+
+
+def test_config_replacement_preserves_logical_identity_shard_affinity() -> None:
+    ingress, budget, _clock = make_ingress()
+    first = ingress.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    )
+    assert first.record_identity is not None
+    assert ingress.drain_one("trade-0") == first
+    budget.release(first.record_identity)
+    replacement = ingress.replacement_for_config(
+        config_sha256="b" * 64,
+        config_generation=8,
+    )
+    before_conflict = replacement.snapshot_for_test()
+
+    with pytest.raises(AdmissionContractError, match="logical identity.*shard"):
+        replacement.try_accept(
+            trade_draft(), source=websocket_source(), shard="trade-1"
+        )
+
+    assert replacement.snapshot_for_test() == before_conflict
+    second = replacement.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    )
+    assert second.record is not None
+    assert second.record_identity is not None
+    assert second.record.envelope.writer_sequence == 1
+    assert second.record_identity.acceptance_ordinal == 1
 
 
 def test_failed_config_replacement_leaves_current_ingress_usable() -> None:
@@ -542,7 +703,7 @@ def test_unexpected_put_nowait_full_rolls_back_every_candidate_side_effect(
     accepted = ingress.try_accept(
         trade_draft(),
         source=websocket_source(),
-        shard="trade-0",
+        shard="trade-1",
     )
     assert accepted.record_identity is not None
     assert accepted.record_identity.acceptance_ordinal == 0
@@ -579,7 +740,7 @@ def test_unexpected_put_nowait_failure_rolls_back_before_propagating(
     accepted = ingress.try_accept(
         trade_draft(),
         source=websocket_source(),
-        shard="trade-0",
+        shard="trade-1",
     )
     assert accepted.record_identity is not None
     assert accepted.record_identity.acceptance_ordinal == 0

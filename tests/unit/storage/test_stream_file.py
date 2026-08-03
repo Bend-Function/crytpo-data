@@ -9,6 +9,7 @@ import zstandard
 import crypto_collector.storage.stream_file as stream_file_module
 from crypto_collector.storage.stream_file import (
     BufferedRow,
+    DirectoryDurabilityProofCache,
     FrameSealRequired,
     PendingRows,
     StreamFile,
@@ -16,11 +17,17 @@ from crypto_collector.storage.stream_file import (
 )
 
 
-def allocate(path: Path, *, limit: int = 1024) -> StreamFile:
+def allocate(
+    path: Path,
+    *,
+    limit: int = 1024,
+    directory_proofs: DirectoryDurabilityProofCache | None = None,
+) -> StreamFile:
     return StreamFile.allocate(
         path,
         zstd_level=3,
         max_plain_frame_bytes=limit,
+        directory_proofs=directory_proofs,
     )
 
 
@@ -222,6 +229,71 @@ def test_allocation_retry_resyncs_existing_directory_entry(
     stream.close_fd()
 
     assert tmp_identity in successful_syncs
+
+
+def test_repeated_allocation_reuses_proven_parent_directory_entries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "exchange" / "market" / "instrument" / "hour"
+    directory_proofs = DirectoryDurabilityProofCache()
+    real_fsync = stream_file_module.os.fsync
+    synced_directories: list[tuple[int, int]] = []
+
+    def traced_fsync(fd: int) -> None:
+        stat_result = os.fstat(fd)
+        synced_directories.append((stat_result.st_dev, stat_result.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(stream_file_module.os, "fsync", traced_fsync)
+
+    first = allocate(
+        parent / "part-1.jsonl.zst.partial",
+        directory_proofs=directory_proofs,
+    )
+    first.close_fd()
+    synced_directories.clear()
+
+    second = allocate(
+        parent / "part-2.jsonl.zst.partial",
+        directory_proofs=directory_proofs,
+    )
+    second.close_fd()
+
+    parent_stat = parent.stat()
+    assert synced_directories == [(parent_stat.st_dev, parent_stat.st_ino)]
+
+
+def test_directory_proofs_do_not_cross_writer_lifetimes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "exchange" / "market" / "instrument" / "hour"
+    real_fsync = stream_file_module.os.fsync
+    synced_directories: list[tuple[int, int]] = []
+
+    def traced_fsync(fd: int) -> None:
+        stat_result = os.fstat(fd)
+        synced_directories.append((stat_result.st_dev, stat_result.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(stream_file_module.os, "fsync", traced_fsync)
+
+    first = allocate(
+        parent / "part-1.jsonl.zst.partial",
+        directory_proofs=DirectoryDurabilityProofCache(),
+    )
+    first.close_fd()
+    synced_directories.clear()
+
+    second = allocate(
+        parent / "part-2.jsonl.zst.partial",
+        directory_proofs=DirectoryDurabilityProofCache(),
+    )
+    second.close_fd()
+
+    tmp_stat = tmp_path.stat()
+    assert (tmp_stat.st_dev, tmp_stat.st_ino) in synced_directories
 
 
 def test_directory_walk_closes_opened_child_if_previous_close_fails(

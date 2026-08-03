@@ -4,7 +4,7 @@ import heapq
 import re
 from collections import Counter
 from copy import deepcopy
-from decimal import localcontext
+from decimal import Decimal, localcontext
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +29,7 @@ from crypto_collector.benchmarks.workload import (
     LoadedWorkload,
     load_workload,
 )
+from crypto_collector.domain.envelope import NativeEventDraft
 from crypto_collector.domain.json_codec import decode_json, encode_json
 from crypto_collector.domain.types import (
     CoverageMode,
@@ -1006,6 +1007,120 @@ def test_plan_build_is_lazy_about_payload_generation(
         next(iter_plan_events(plan))
 
 
+def test_trusted_event_and_draft_generation_avoid_generic_python_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = build_workload_plan(
+        _micro_loaded(), multiplier=1, duration_ns=10_000_000_000
+    )
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("trusted oracle generation used a generic Python path")
+
+    monkeypatch.setattr(oracle_module, "encode_json", unexpected)
+    monkeypatch.setattr(oracle_module, "decode_json", unexpected)
+    monkeypatch.setattr(PlannedEventV1, "model_construct", unexpected)
+    monkeypatch.setattr(NativeEventDraft, "__init__", unexpected)
+
+    event = next(iter_exchange_plan_events(plan, Exchange.BINANCE))
+    draft, _source, _shard = build_native_draft(
+        event,
+        admission_started_utc_ns=1_800_000_000_000_000_000,
+    )
+
+    assert type(event) is PlannedEventV1
+    assert type(draft) is NativeEventDraft
+    assert encode_json(draft.payload) == event.payload_canonical_bytes
+
+
+@pytest.mark.parametrize("value", (Decimal("1.230"), 2**80))
+def test_public_draft_builder_preserves_lossless_json_numbers(value: object) -> None:
+    plan = build_workload_plan(
+        _micro_loaded(), multiplier=1, duration_ns=10_000_000_000
+    )
+    event = next(iter_exchange_plan_events(plan, Exchange.BINANCE))
+    payload = event.payload
+    value_key = next(key for key in payload if key.startswith("value"))
+    payload[value_key] = cast(Any, value)
+    payload["padding"] = ""
+    canonical_payload = encode_json(payload)
+    values = event.model_dump(mode="python")
+    values.update(
+        payload_bytes=len(canonical_payload),
+        payload_sha256=sha256(canonical_payload).hexdigest(),
+        payload_canonical_bytes=canonical_payload,
+    )
+    public_event = PlannedEventV1.model_validate(values)
+
+    draft, _, _ = build_native_draft(
+        public_event,
+        admission_started_utc_ns=1_800_000_000_000_000_000,
+    )
+
+    assert draft.payload[value_key] == value
+    assert type(draft.payload[value_key]) is type(value)
+    assert NativeEventDraft.model_validate(draft.model_dump(mode="python")) == draft
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda values: values.pop("schema_version"),
+        lambda values: values.update(unexpected="value"),
+        lambda values: values.update(schema_version=values.pop("schema_version")),
+    ),
+    ids=("missing", "extra", "reordered"),
+)
+def test_trusted_model_constructor_rejects_stale_value_layout(
+    mutate: Any,
+) -> None:
+    plan = build_workload_plan(
+        _micro_loaded(), multiplier=1, duration_ns=10_000_000_000
+    )
+    event = next(iter_plan_events(plan))
+    values = event.model_dump(mode="python")
+    values["payload_canonical_bytes"] = event.payload_canonical_bytes
+    mutate(values)
+
+    with pytest.raises(RuntimeError, match="values are stale"):
+        oracle_module._construct_trusted_model(  # type: ignore[attr-defined]
+            PlannedEventV1,
+            values,
+            oracle_module._TRUSTED_PLANNED_EVENT_FIELDS,  # type: ignore[attr-defined]
+        )
+
+
+def test_trusted_models_round_trip_through_public_validation() -> None:
+    plan = build_workload_plan(
+        _micro_loaded(
+            exchanges=tuple(exchange.value for exchange in CANONICAL_EXCHANGES)
+        ),
+        multiplier=1,
+        duration_ns=10_000_000_000,
+    )
+
+    for event in iter_plan_events(plan):
+        event_values = event.model_dump(mode="python")
+        event_values["payload_canonical_bytes"] = event.payload_canonical_bytes
+        assert PlannedEventV1.model_validate(event_values) == event
+        draft, source, _ = build_native_draft(
+            event,
+            admission_started_utc_ns=1_800_000_000_000_000_000,
+        )
+        assert NativeEventDraft.model_validate(draft.model_dump(mode="python")) == draft
+        assert (
+            oracle_module.SourceContext.model_validate(source.model_dump(mode="python"))
+            == source
+        )
+        if draft.rest_metadata is not None:
+            assert (
+                oracle_module.RestMetadata.model_validate(
+                    draft.rest_metadata.model_dump(mode="python")
+                )
+                == draft.rest_metadata
+            )
+
+
 def test_native_draft_source_and_shard_profiles_are_exact() -> None:
     plan = build_workload_plan(
         _micro_loaded(), multiplier=1, duration_ns=10_000_000_000
@@ -1022,14 +1137,16 @@ def test_native_draft_source_and_shard_profiles_are_exact() -> None:
     assert trade_source.connection_id == "gate-ws-v1-binance-spot"
     assert trade_source.connection_generation == 0
     assert trade_source.egress_id == "gate-egress-v1-binance"
-    assert trade_shard == "trade"
+    trade_event = _event(plan, "trade")
+    assert trade_shard == f"gate-trade-{trade_event.identity_index}"
 
     live, _, live_shard = build_native_draft(
         _event(plan, "book_live"), admission_started_utc_ns=anchor
     )
     assert live.integrity_mode is IntegrityMode.SEQUENCE_VERIFIED
     assert live.coverage is CoverageMode.COMPLETE
-    assert live_shard == "book_live"
+    live_event = _event(plan, "book_live")
+    assert live_shard == f"gate-book_live-{live_event.identity_index}"
 
     deep, deep_source, deep_shard = build_native_draft(
         _event(plan, "book_deep_snapshot"), admission_started_utc_ns=anchor
@@ -1044,7 +1161,8 @@ def test_native_draft_source_and_shard_profiles_are_exact() -> None:
     assert deep.rest_metadata.params == {"instrument": deep.instrument_key}
     assert deep_source.connection_id is None
     assert deep_source.connection_generation is None
-    assert deep_shard == "book_deep_snapshot"
+    deep_event = _event(plan, "book_deep_snapshot")
+    assert deep_shard == (f"gate-book_deep_snapshot-{deep_event.identity_index}")
 
     control, control_source, control_shard = build_native_draft(
         _event(plan, "control"), admission_started_utc_ns=anchor

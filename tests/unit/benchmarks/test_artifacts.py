@@ -14,6 +14,7 @@ from pydantic import BaseModel, ValidationError
 
 import crypto_collector.benchmarks.artifacts as artifacts_module
 from crypto_collector.benchmarks.artifacts import (
+    StreamingJsonlZstdWriter,
     build_admission_trace_set,
     iter_jsonl_zstd,
     iter_merged_trace_partitions,
@@ -813,6 +814,94 @@ def test_empty_artifact_round_trip_is_canonical(tmp_path: Path) -> None:
         )
         == ()
     )
+
+
+def test_streaming_writer_publishes_on_successful_context_exit(
+    tmp_path: Path,
+) -> None:
+    writer = StreamingJsonlZstdWriter(
+        tmp_path,
+        "streaming/buckets.jsonl.zst",
+        zstd_level=3,
+    )
+
+    with writer:
+        writer.write(_bucket())
+        writer.write(_bucket(1))
+
+    assert writer.artifact_ref.row_count == 2
+    assert tuple(
+        iter_jsonl_zstd(
+            tmp_path,
+            writer.artifact_ref,
+            GateSecondBucketV1,
+            max_rows=2,
+            max_content_bytes=20_000,
+            max_line_bytes=10_000,
+        )
+    ) == (_bucket(), _bucket(1))
+
+
+def test_streaming_writer_accepts_guarded_trusted_chunks(tmp_path: Path) -> None:
+    rows = (_bucket(), _bucket(1))
+    chunk = b"".join(row.canonical_bytes() for row in rows)
+    writer = StreamingJsonlZstdWriter(
+        tmp_path,
+        "streaming/trusted-chunk.jsonl.zst",
+        zstd_level=3,
+    )
+
+    writer.write_trusted_lines(chunk, GateSecondBucketV1, row_count=2)
+    artifact = writer.close()
+
+    assert artifact.row_count == 2
+    assert artifact.content_size_bytes == len(chunk)
+    assert artifact.content_sha256 == _sha(chunk)
+    assert (
+        tuple(
+            iter_jsonl_zstd(
+                tmp_path,
+                artifact,
+                GateSecondBucketV1,
+                max_rows=2,
+                max_content_bytes=20_000,
+                max_line_bytes=10_000,
+            )
+        )
+        == rows
+    )
+
+
+def test_streaming_writer_rejects_untrusted_chunk_row_count(tmp_path: Path) -> None:
+    writer = StreamingJsonlZstdWriter(
+        tmp_path,
+        "streaming/invalid-trusted-chunk.jsonl.zst",
+        zstd_level=3,
+    )
+    chunk = _bucket().canonical_bytes() + _bucket(1).canonical_bytes()
+    try:
+        with pytest.raises(ValueError, match="row count"):
+            writer.write_trusted_lines(chunk, GateSecondBucketV1, row_count=1)
+    finally:
+        writer.abort()
+
+
+def test_streaming_writer_retains_partial_on_error(tmp_path: Path) -> None:
+    destination = "streaming/error.jsonl.zst"
+
+    with (
+        pytest.raises(RuntimeError, match="injected"),
+        StreamingJsonlZstdWriter(
+            tmp_path,
+            destination,
+            zstd_level=3,
+        ) as writer,
+    ):
+        writer.write(_bucket())
+        raise RuntimeError("injected")
+
+    assert not (tmp_path / destination).exists()
+    assert (tmp_path / f"{destination}.partial").is_file()
 
 
 def test_jsonl_reader_rejects_noncanonical_missing_newline_and_duplicate_key(

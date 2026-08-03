@@ -4,10 +4,11 @@ import heapq
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from functools import cached_property
+from functools import cache, cached_property
 from hashlib import sha256, shake_256
-from typing import Annotated, Any, Literal, Self, cast
+from typing import Annotated, Any, Literal, Self, TypeVar, cast
 
+import orjson
 from pydantic import (
     BaseModel,
     BeforeValidator,
@@ -58,6 +59,8 @@ _STREAM_GROUPS = (
     "book_deep_snapshot",
     "control",
 )
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveInt = Annotated[int, Field(gt=0)]
@@ -473,6 +476,100 @@ class PlannedEventV1(_FrozenStrictModel):
 
     def canonical_bytes(self) -> bytes:
         return encode_json(self.model_dump(mode="json")) + b"\n"
+
+
+_TRUSTED_PLANNED_EVENT_FIELDS = (
+    "schema_version",
+    "record_type",
+    "identity_algorithm",
+    "event_algorithm",
+    "payload_algorithm",
+    "schedule_algorithm",
+    "planned_event_id",
+    "stream_group",
+    "logical_stream",
+    "exchange",
+    "market",
+    "lane_index",
+    "symbol_index",
+    "instrument_key",
+    "canonical_identity",
+    "identity_index",
+    "local_sequence",
+    "transport",
+    "due_offset_ns",
+    "deadline_offset_ns",
+    "payload_bytes",
+    "payload_sha256",
+    "payload_canonical_bytes",
+)
+_TRUSTED_NATIVE_DRAFT_FIELDS = (
+    "exchange",
+    "market",
+    "instrument_key",
+    "wire_symbol",
+    "logical_stream",
+    "native_channel",
+    "transport",
+    "event_time_ns",
+    "event_time_source",
+    "integrity_mode",
+    "coverage",
+    "rest_metadata",
+    "payload",
+)
+_TRUSTED_SOURCE_CONTEXT_FIELDS = (
+    "connection_id",
+    "connection_generation",
+    "egress_id",
+)
+_TRUSTED_REST_METADATA_FIELDS = (
+    "request_started_at_ns",
+    "request_ended_at_ns",
+    "method",
+    "path",
+    "params",
+    "status",
+    "attempt",
+    "rate_limit_headers",
+    "requested_interval_ns",
+    "effective_interval_ns",
+)
+for _trusted_model, _trusted_fields in (
+    (PlannedEventV1, _TRUSTED_PLANNED_EVENT_FIELDS),
+    (NativeEventDraft, _TRUSTED_NATIVE_DRAFT_FIELDS),
+    (SourceContext, _TRUSTED_SOURCE_CONTEXT_FIELDS),
+    (RestMetadata, _TRUSTED_REST_METADATA_FIELDS),
+):
+    if tuple(_trusted_model.model_fields) != _trusted_fields:
+        raise RuntimeError(
+            f"trusted {_trusted_model.__name__} construction fields are stale"
+        )
+    if (
+        _trusted_model.__private_attributes__
+        or _trusted_model.__pydantic_computed_fields__
+        or _trusted_model.model_config.get("extra") != "forbid"
+        or _trusted_model.model_config.get("frozen") is not True
+        or _trusted_model.model_config.get("strict") is not True
+    ):
+        raise RuntimeError(
+            f"trusted {_trusted_model.__name__} construction contract is stale"
+        )
+
+
+def _construct_trusted_model(
+    model_type: type[_ModelT],
+    values: dict[str, Any],
+    fields: tuple[str, ...],
+) -> _ModelT:
+    if tuple(values) != fields:
+        raise RuntimeError(f"trusted {model_type.__name__} values are stale")
+    instance = model_type.__new__(model_type)
+    object.__setattr__(instance, "__dict__", values)
+    object.__setattr__(instance, "__pydantic_fields_set__", set(fields))
+    object.__setattr__(instance, "__pydantic_extra__", None)
+    object.__setattr__(instance, "__pydantic_private__", None)
+    return instance
 
 
 class WorkloadPlanV1(_FrozenStrictModel):
@@ -1057,7 +1154,7 @@ def _payload_bytes(
         payload["kind"] = _CONTROL_KIND
         payload["affected_markets"] = ["spot", "perpetual"]
     payload["padding"] = ""
-    base_bytes = encode_json(payload)
+    base_bytes = orjson.dumps(payload)
     padding_length = target_bytes - len(base_bytes)
     if padding_length < 0:
         raise ValueError(
@@ -1136,7 +1233,11 @@ def _scheduled_event_canonical_bytes(scheduled: _ScheduledEvent) -> bytes:
 def _build_event(scheduled: _ScheduledEvent) -> PlannedEventV1:
     values, payload = _scheduled_event_values(scheduled)
     values["payload_canonical_bytes"] = payload
-    return PlannedEventV1.model_construct(**values)
+    return _construct_trusted_model(
+        PlannedEventV1,
+        values,
+        _TRUSTED_PLANNED_EVENT_FIELDS,
+    )
 
 
 def _iter_burst_schedule_for_identity_span(
@@ -1278,6 +1379,56 @@ def iter_exchange_plan_events(
         yield _build_event(scheduled)
 
 
+@cache
+def _source_values_for_gate_event(
+    exchange: Exchange,
+    market: Market | None,
+    transport: Transport,
+) -> tuple[str | None, int | None, str | None]:
+    if transport is Transport.INTERNAL:
+        return None, None, None
+    if transport is Transport.WEBSOCKET:
+        if market is None:
+            raise ValueError("WebSocket event requires a market")
+        return (
+            f"gate-ws-v1-{exchange.value}-{market.value}",
+            0,
+            f"gate-egress-v1-{exchange.value}",
+        )
+    return None, None, f"gate-egress-v1-{exchange.value}"
+
+
+def _source_for_gate_event(
+    exchange: Exchange,
+    market: Market | None,
+    transport: Transport,
+) -> SourceContext:
+    connection_id, connection_generation, egress_id = _source_values_for_gate_event(
+        exchange,
+        market,
+        transport,
+    )
+    return _construct_trusted_model(
+        SourceContext,
+        {
+            "connection_id": connection_id,
+            "connection_generation": connection_generation,
+            "egress_id": egress_id,
+        },
+        _TRUSTED_SOURCE_CONTEXT_FIELDS,
+    )
+
+
+def _has_lossy_orjson_number(value: object) -> bool:
+    if type(value) is float:
+        return True
+    if type(value) is list:
+        return any(_has_lossy_orjson_number(item) for item in value)
+    if type(value) is dict:
+        return any(_has_lossy_orjson_number(item) for item in value.values())
+    return False
+
+
 def build_native_draft(
     event: PlannedEventV1,
     *,
@@ -1300,35 +1451,25 @@ def build_native_draft(
         None if is_control else admission_started_utc_ns + event.due_offset_ns
     )
     rest_metadata: RestMetadata | None = None
-    if event.transport is Transport.INTERNAL:
-        source = SourceContext.internal()
-    elif event.transport is Transport.WEBSOCKET:
-        if event.market is None:
-            raise ValueError("WebSocket event requires a market")
-        source = SourceContext(
-            connection_id=(f"gate-ws-v1-{event.exchange.value}-{event.market.value}"),
-            connection_generation=0,
-            egress_id=f"gate-egress-v1-{event.exchange.value}",
-        )
-    else:
+    source = _source_for_gate_event(event.exchange, event.market, event.transport)
+    if event.transport is Transport.REST:
         if event.instrument_key is None or event_time_ns is None:
             raise ValueError("REST event requires instrument and event time")
-        source = SourceContext(
-            connection_id=None,
-            connection_generation=None,
-            egress_id=f"gate-egress-v1-{event.exchange.value}",
-        )
-        rest_metadata = RestMetadata(
-            request_started_at_ns=event_time_ns,
-            request_ended_at_ns=event_time_ns,
-            method="GET",
-            path="/gate/v1/book-deep-snapshot",
-            params={"instrument": event.instrument_key},
-            status=200,
-            attempt=1,
-            rate_limit_headers={},
-            requested_interval_ns=None,
-            effective_interval_ns=None,
+        rest_metadata = _construct_trusted_model(
+            RestMetadata,
+            {
+                "request_started_at_ns": event_time_ns,
+                "request_ended_at_ns": event_time_ns,
+                "method": "GET",
+                "path": "/gate/v1/book-deep-snapshot",
+                "params": {"instrument": event.instrument_key},
+                "status": 200,
+                "attempt": 1,
+                "rate_limit_headers": {},
+                "requested_interval_ns": None,
+                "effective_interval_ns": None,
+            },
+            _TRUSTED_REST_METADATA_FIELDS,
         )
 
     integrity_mode: IntegrityMode | None = None
@@ -1340,23 +1481,39 @@ def build_native_draft(
         integrity_mode = IntegrityMode.SNAPSHOT_CHAIN
         coverage = CoverageMode.COMPLETE
 
-    draft = NativeEventDraft(
-        exchange=event.exchange,
-        market=event.market,
-        instrument_key=event.instrument_key,
-        wire_symbol=event.instrument_key,
-        logical_stream=event.logical_stream,
-        native_channel=None if is_control else f"gate.v1.{event.logical_stream}",
-        transport=event.transport,
-        event_time_ns=event_time_ns,
-        event_time_source=None if is_control else "gate_due_time",
-        integrity_mode=integrity_mode,
-        coverage=coverage,
-        rest_metadata=rest_metadata,
-        payload=event.payload,
+    payload = orjson.loads(event.payload_canonical_bytes)
+    if _has_lossy_orjson_number(payload):
+        payload = event.payload
+    if type(payload) is not dict:
+        raise AssertionError("planned payload must decode to an object")
+    draft = _construct_trusted_model(
+        NativeEventDraft,
+        {
+            "exchange": event.exchange,
+            "market": event.market,
+            "instrument_key": event.instrument_key,
+            "wire_symbol": event.instrument_key,
+            "logical_stream": event.logical_stream,
+            "native_channel": (
+                None if is_control else f"gate.v1.{event.logical_stream}"
+            ),
+            "transport": event.transport,
+            "event_time_ns": event_time_ns,
+            "event_time_source": None if is_control else "gate_due_time",
+            "integrity_mode": integrity_mode,
+            "coverage": coverage,
+            "rest_metadata": rest_metadata,
+            "payload": cast(dict[str, JsonPayload], payload),
+        },
+        _TRUSTED_NATIVE_DRAFT_FIELDS,
     )
     draft.validate_source(source)
-    return draft, source, event.logical_stream
+    shard = (
+        "_control"
+        if is_control
+        else f"gate-{event.logical_stream}-{event.identity_index}"
+    )
+    return draft, source, shard
 
 
 __all__ = [

@@ -7,13 +7,15 @@ import logging
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from crypto_collector.config.models import IngressConfig, WriterConfig
 from crypto_collector.domain.envelope import NativeEventDraft, SourceContext
 from crypto_collector.domain.types import CloseReason, Exchange, Market, Transport
+from crypto_collector.storage import service as service_module
 from crypto_collector.storage.durability import (
     AsyncSleeper,
     DurabilitySloState,
@@ -32,6 +34,7 @@ from crypto_collector.storage.models import (
     AdmissionState,
     EnqueueStatus,
     WriterLifecycle,
+    WriterMetricsSnapshotV1,
 )
 from crypto_collector.storage.raw_writer import _ActivePart
 from crypto_collector.storage.recovery import (
@@ -147,6 +150,32 @@ class BlockingNthSyncBackend:
             return
         self.started.set()
         assert self.release.wait(timeout=5)
+
+
+class ArmableConcurrencySyncBackend:
+    def __init__(self, *, expected_concurrency: int) -> None:
+        self.expected_concurrency = expected_concurrency
+        self.armed = False
+        self.active = 0
+        self.max_active = 0
+        self.reached_expected = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def sync(self, fd: int) -> None:
+        assert fd >= 0
+        if not self.armed:
+            return
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.active == self.expected_concurrency:
+                self.reached_expected.set()
+        try:
+            assert self.release.wait(timeout=5)
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 class FailingNthSyncBackend:
@@ -391,6 +420,685 @@ async def test_empty_recovery_opens_accepting_service(tmp_path: Path) -> None:
             CloseReason.SHUTDOWN,
             deadline_ns=clock.monotonic_ns() + 1_000_000_000,
         )
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_admission_rebuilds_metrics_lazily_and_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, clock = await open_service(tmp_path)
+    rebuild_count = 0
+    original = service._assemble_metrics_snapshot
+
+    def count_rebuilds() -> WriterMetricsSnapshotV1:
+        nonlocal rebuild_count
+        rebuild_count += 1
+        return original()
+
+    monkeypatch.setattr(service, "_assemble_metrics_snapshot", count_rebuilds)
+    try:
+        for _ in range(3):
+            assert service.try_accept(
+                trade_draft(),
+                source=websocket_source(),
+                shard="trade-0",
+            ).accepted
+        assert rebuild_count == 0
+
+        snapshot = service.metrics_snapshot()
+
+        assert rebuild_count == 1
+        assert snapshot.accepted_record_count == 3
+        assert snapshot.queued_records == 3
+        assert service.metrics_snapshot() is snapshot
+        assert rebuild_count == 1
+    finally:
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_large_active_part_drain_cooperatively_yields_to_owner_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, clock = await open_service(tmp_path)
+    assert service.try_accept(
+        trade_draft(),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+    await service.sync_now()
+
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    for _ in range(2_049):
+        assert service.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+
+    cooperative_yields = 0
+    real_sleep = asyncio.sleep
+
+    async def observe_sleep(delay: float) -> None:
+        nonlocal cooperative_yields
+        if delay == 0:
+            cooperative_yields += 1
+        await real_sleep(delay)
+
+    monkeypatch.setattr(service_module.asyncio, "sleep", observe_sleep)
+    try:
+        await service._drain_ingress()
+        assert 2 <= cooperative_yields <= 3
+    finally:
+        service._work_event = actor_event
+        actor_event.set()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_is_not_starved_by_continuous_ingress(
+    tmp_path: Path,
+) -> None:
+    sync = BlockingNthSyncBackend(block_on_call=1)
+    service, clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate({"max_plain_frame_bytes": "64MiB"}),
+    )
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    for _ in range(2_049):
+        assert service.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+
+    service._work_event = actor_event
+    service._periodic_due = True
+    actor_event.set()
+    try:
+        assert await asyncio.to_thread(sync.started.wait, 5)
+        status = service.status()
+        assert 1 <= status.in_flight_records <= 1_024
+        assert (
+            status.queued_records + status.buffered_records + status.in_flight_records
+            == 2_049
+        )
+    finally:
+        sync.release.set()
+        await service.sync_now()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_quantum_includes_deferred_records(
+    tmp_path: Path,
+) -> None:
+    sync = BlockingNthSyncBackend(block_on_call=1)
+    service, clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate({"max_plain_frame_bytes": "64MiB"}),
+    )
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    for _ in range(2_049):
+        assert service.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+        result = service._ingress.drain_one("trade-0")
+        assert result is not None
+        assert result.record is not None
+        assert result.record_identity is not None
+        part, retired = await service._ensure_part(
+            result.record,
+            result.record_identity,
+        )
+        assert retired is None
+        service._defer_record(part, result.record, result.record_identity)
+
+    service._work_event = actor_event
+    service._periodic_due = True
+    actor_event.set()
+    try:
+        assert await asyncio.to_thread(sync.started.wait, 5)
+        status = service.status()
+        assert status.in_flight_records == 1_024
+        assert status.buffered_records == 1_025
+    finally:
+        sync.release.set()
+        await service.sync_now()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cold_parts_materialize_at_storage_io_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, clock = await open_service(
+        tmp_path,
+        writer_config=WriterConfig.model_validate({"max_sync_concurrency": 2}),
+    )
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    original_materialize = service._parts.materialize_reserved
+    started_together = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def blocking_materialize(*args: Any, **kwargs: Any) -> _ActivePart:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                started_together.set()
+        try:
+            assert release.wait(timeout=5)
+            return original_materialize(*args, **kwargs)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(service._parts, "materialize_reserved", blocking_materialize)
+    assert service.try_accept(
+        trade_draft(instrument_key="BTC-USDT"),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+    assert service.try_accept(
+        trade_draft(instrument_key="ETH-USDT"),
+        source=websocket_source(),
+        shard="trade-1",
+    ).accepted
+
+    service._work_event = actor_event
+    actor_event.set()
+    try:
+        assert await asyncio.to_thread(started_together.wait, 1)
+        assert max_active == 2
+    finally:
+        release.set()
+        await service.sync_now()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_periodic_sync_runs_between_cold_materialization_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sync = BlockingSyncBackend()
+    sleeper = ManualSleeper()
+    service, clock = await open_service(
+        tmp_path,
+        sleeper=sleeper,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate({"max_sync_concurrency": 2}),
+    )
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    original_materialize = service._parts.materialize_reserved
+    first_window_started = threading.Event()
+    release_first_window = threading.Event()
+    second_window_started = threading.Event()
+    state_lock = threading.Lock()
+    started = 0
+
+    def observed_materialize(*args: Any, **kwargs: Any) -> _ActivePart:
+        nonlocal started
+        with state_lock:
+            started += 1
+            call = started
+            if call == 2:
+                first_window_started.set()
+            elif call > 2:
+                second_window_started.set()
+        if call <= 2:
+            assert release_first_window.wait(timeout=5)
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(service._parts, "materialize_reserved", observed_materialize)
+    for index, instrument_key in enumerate(
+        ("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT")
+    ):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=f"trade-{index}",
+        ).accepted
+
+    service._work_event = actor_event
+    service._periodic_due = True
+    actor_event.set()
+    try:
+        assert await asyncio.to_thread(first_window_started.wait, 1)
+        release_first_window.set()
+        assert await asyncio.to_thread(sync.started.wait, 2)
+        assert not second_window_started.is_set()
+        sync.release.set()
+        assert await asyncio.to_thread(second_window_started.wait, 1)
+    finally:
+        release_first_window.set()
+        sync.release.set()
+        await service.sync_now()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_cold_materialization_failure_rolls_back_the_entire_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _clock = await open_service(
+        tmp_path,
+        writer_config=WriterConfig.model_validate({"max_sync_concurrency": 2}),
+    )
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    original_materialize = service._parts.materialize_reserved
+    both_started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    started = 0
+
+    def fail_one_materialization(*args: Any, **kwargs: Any) -> _ActivePart:
+        nonlocal started
+        record = args[1]
+        with state_lock:
+            started += 1
+            if started == 2:
+                both_started.set()
+        assert release.wait(timeout=5)
+        if record.envelope.instrument_key == "ETH-USDT":
+            raise OSError(errno.ENOSPC, "injected allocation failure")
+        return original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service._parts,
+        "materialize_reserved",
+        fail_one_materialization,
+    )
+    for index, instrument_key in enumerate(("BTC-USDT", "ETH-USDT")):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=f"trade-{index}",
+        ).accepted
+
+    service._work_event = actor_event
+    actor_event.set()
+    assert await asyncio.to_thread(both_started.wait, 1)
+    release.set()
+
+    with pytest.raises(WriterCriticalError):
+        await service.sync_now()
+
+    snapshot = service.metrics_snapshot()
+    assert snapshot.accepted_record_count == snapshot.uncertain_record_count == 2
+    assert snapshot.resident_record_bytes == 0
+    assert service._parts.active_parts() == ()
+    assert service._ingress_shards_in_progress == set()
+    assert tuple((tmp_path / "data").rglob("*.partial")) == ()
+    replacement_lock = ExchangeWriterLock.acquire(
+        tmp_path / "data",
+        exchange=Exchange.OKX,
+    )
+    replacement_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_frame_rollover_does_not_reenter_ingress_drain(tmp_path: Path) -> None:
+    sync = BlockingSyncBackend()
+    service, clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate({"max_plain_frame_bytes": "1KiB"}),
+    )
+    for _ in range(2):
+        assert service.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+
+    assert await asyncio.to_thread(sync.started.wait, 5)
+    assert service.try_accept(
+        trade_draft(),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+    for _ in range(100):
+        if service.status().queued_records == 2:
+            break
+        await asyncio.sleep(0)
+    assert service.status().queued_records == 2
+    sync.release.set()
+    await service.sync_now()
+
+    status = service.status()
+    assert status.lifecycle is WriterLifecycle.ACCEPTING
+    assert status.accepted_record_count == status.durable_record_count == 3
+    manifests = await service.close_all(
+        CloseReason.SHUTDOWN,
+        deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+    )
+    assert len(manifests) == 1
+    assert manifests[0].record_count == 3
+
+
+@pytest.mark.asyncio
+async def test_frame_rollover_syncs_across_parts_at_configured_concurrency(
+    tmp_path: Path,
+) -> None:
+    sync = ArmableConcurrencySyncBackend(expected_concurrency=8)
+    service, clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate(
+            {
+                "max_plain_frame_bytes": "1KiB",
+                "max_sync_concurrency": 8,
+            }
+        ),
+    )
+    instruments = tuple(f"GATE-{index:02d}-USDT" for index in range(16))
+    for index, instrument_key in enumerate(instruments):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=f"trade-{index}",
+        ).accepted
+    await service.sync_now()
+
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    for index, instrument_key in enumerate(instruments):
+        for _ in range(2):
+            assert service.try_accept(
+                trade_draft(instrument_key=instrument_key),
+                source=websocket_source(),
+                shard=f"trade-{index}",
+            ).accepted
+
+    sync.armed = True
+    service._work_event = actor_event
+    actor_event.set()
+    try:
+        assert await asyncio.to_thread(sync.reached_expected.wait, 1)
+        assert sync.max_active == 8
+    finally:
+        sync.release.set()
+        await service.sync_now()
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_grouped_frame_rollover_failure_releases_all_record_ownership(
+    tmp_path: Path,
+) -> None:
+    sync = FailingNthSyncBackend(fail_on_call=17)
+    service, _clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate(
+            {
+                "max_plain_frame_bytes": "1KiB",
+                "max_sync_concurrency": 8,
+            }
+        ),
+    )
+    instruments = tuple(f"FAIL-{index:02d}-USDT" for index in range(16))
+    for index, instrument_key in enumerate(instruments):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=f"trade-{index}",
+        ).accepted
+    await service.sync_now()
+
+    for index, instrument_key in enumerate(instruments):
+        for _ in range(2):
+            assert service.try_accept(
+                trade_draft(instrument_key=instrument_key),
+                source=websocket_source(),
+                shard=f"trade-{index}",
+            ).accepted
+
+    with pytest.raises(WriterCriticalError) as captured:
+        await service.sync_now()
+
+    assert captured.value.reason is WriterCriticalReason.SYNC_FAILED
+    snapshot = service.metrics_snapshot()
+    assert snapshot.accepted_record_count == 48
+    assert (
+        snapshot.durable_record_count + snapshot.uncertain_record_count
+        == snapshot.accepted_record_count
+    )
+    assert snapshot.uncertain_record_count > 0
+    assert snapshot.resident_record_bytes == 0
+    assert service._ingress_shards_in_progress == set()
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_frame_rollover_drains_other_shards_without_reordering(
+    tmp_path: Path,
+) -> None:
+    sync = BlockingNthSyncBackend(block_on_call=3)
+    service, clock = await open_service(
+        tmp_path,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate({"max_plain_frame_bytes": "1KiB"}),
+    )
+    assert service.try_accept(
+        trade_draft(instrument_key="BTC-USDT"),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+    assert service.try_accept(
+        trade_draft(instrument_key="ETH-USDT"),
+        source=websocket_source(),
+        shard="trade-1",
+    ).accepted
+    await service.sync_now()
+
+    for _ in range(2):
+        assert service.try_accept(
+            trade_draft(instrument_key="BTC-USDT"),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+    assert await asyncio.to_thread(sync.started.wait, 5)
+
+    assert service.try_accept(
+        trade_draft(instrument_key="ETH-USDT"),
+        source=websocket_source(),
+        shard="trade-1",
+    ).accepted
+    for _ in range(100):
+        if service.status().buffered_records == 1:
+            break
+        await asyncio.sleep(0)
+
+    status = service.status()
+    assert status.queued_records == 1
+    assert status.buffered_records == 1
+    assert status.in_flight_records == 1
+
+    sync.release.set()
+    await service.sync_now()
+    manifests = await service.close_all(
+        CloseReason.SHUTDOWN,
+        deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+    )
+    assert sum(manifest.record_count for manifest in manifests) == 5
+
+
+@pytest.mark.asyncio
+async def test_pump_handles_completion_dequeued_during_nested_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, clock = await open_service(tmp_path)
+    await service.sync_now()
+    await asyncio.sleep(0)
+    actor_event = service._work_event
+    service._work_event = asyncio.Event()
+    service._ingress_drain_active = True
+    service._completion_claims = cast(
+        Any,
+        {"generation": SimpleNamespace(final_barrier=False)},
+    )
+    nested_started = asyncio.Event()
+    release_nested = asyncio.Event()
+    target_done = asyncio.Event()
+    handled: list[object] = []
+
+    async def hold_nested_drain(
+        *,
+        allow_storage_io: bool,
+        watermark: int | None,
+        max_records: int | None,
+    ) -> None:
+        assert allow_storage_io is False
+        assert watermark is None
+        assert max_records == 1_024
+        nested_started.set()
+        await release_nested.wait()
+
+    def handle_completion(message: object) -> None:
+        handled.append(message)
+        service._completion_claims.clear()
+
+    async def target() -> object:
+        await target_done.wait()
+        return target_result
+
+    original_drain = service._drain_ingress_owned
+    original_handle = service._handle_completion
+    monkeypatch.setattr(service, "_drain_ingress_owned", hold_nested_drain)
+    monkeypatch.setattr(service, "_handle_completion", handle_completion)
+    target_result = object()
+    completion = object()
+    target_task = asyncio.create_task(target())
+    pump_task = asyncio.create_task(service._pump_task(target_task))
+    service._work_event.set()
+    try:
+        await nested_started.wait()
+        service._completion_queue.put_nowait(completion)
+        target_done.set()
+        for _ in range(100):
+            if service._completion_queue.empty():
+                break
+            await asyncio.sleep(0)
+        assert service._completion_queue.empty()
+        release_nested.set()
+
+        assert await asyncio.wait_for(asyncio.shield(pump_task), 0.1) is target_result
+        assert handled == [completion]
+    finally:
+        release_nested.set()
+        target_done.set()
+        if not handled and service._completion_queue.empty():
+            service._completion_queue.task_done()
+        service._completion_claims.clear()
+        if not pump_task.done():
+            await asyncio.wait_for(pump_task, 1)
+        service._ingress_drain_active = False
+        monkeypatch.setattr(service, "_drain_ingress_owned", original_drain)
+        monkeypatch.setattr(service, "_handle_completion", original_handle)
+        service._work_event = actor_event
+        await service.close_all(
+            CloseReason.SHUTDOWN,
+            deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_oldest_age_critical_drain_finishes_owned_frame_rollover(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    sleeper = ManualSleeper()
+    sync = BlockingSyncBackend()
+    service, _ = await open_service(
+        tmp_path,
+        clock=clock,
+        sleeper=sleeper,
+        sync_backend=sync,
+        writer_config=WriterConfig.model_validate(
+            {
+                "durability_critical": "1s",
+                "max_plain_frame_bytes": "1KiB",
+            }
+        ),
+    )
+    for _ in range(2):
+        assert service.try_accept(
+            trade_draft(),
+            source=websocket_source(),
+            shard="trade-0",
+        ).accepted
+    assert await asyncio.to_thread(sync.started.wait, 5)
+
+    assert service.try_accept(
+        trade_draft(),
+        source=websocket_source(),
+        shard="trade-0",
+    ).accepted
+    clock.monotonic += 1_000_000_001
+    await sleeper.wake_once()
+    for _ in range(100):
+        if service.status().lifecycle is WriterLifecycle.CRITICAL:
+            break
+        await asyncio.sleep(0)
+    assert service.status().lifecycle is WriterLifecycle.CRITICAL
+    assert service.status().queued_records == 2
+
+    sync.release.set()
+    for _ in range(100):
+        if service.status().durable_record_count == 3:
+            break
+        await asyncio.sleep(0)
+    status = service.status()
+    assert status.durable_record_count == status.accepted_record_count == 3
+    assert status.uncertain_record_count == 0
+    assert service._loop_task is not None
+    await service._loop_task
     with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
         pass
 
@@ -994,7 +1702,7 @@ async def test_control_accepted_while_size_replacement_materializes_targets_repl
 
 
 @pytest.mark.asyncio
-async def test_size_replacement_buffers_new_rows_while_old_final_sync_is_blocked(
+async def test_size_replacement_keeps_post_watermark_rows_queued_during_final_sync(
     tmp_path: Path,
 ) -> None:
     sync_backend = BlockingNthSyncBackend(block_on_call=2)
@@ -1014,17 +1722,25 @@ async def test_size_replacement_buffers_new_rows_while_old_final_sync_is_blocked
         trade_draft(), source=websocket_source(), shard="trade-0"
     ).accepted
     for _ in range(100):
-        if service.status().buffered_records == 1:
+        if not service._work_event.is_set():
             break
         await asyncio.sleep(0)
+    assert not service._work_event.is_set()
     during = service.status()
     assert during.active_logical_generation_count == 1
     assert during.retiring_generation_count == 1
     assert during.open_file_descriptor_count == 2
-    assert during.buffered_records == 1
+    assert during.queued_records == 1
+    assert during.buffered_records == 0
 
     sync_backend.release.set()
     await rotating
+    for _ in range(100):
+        if service.status().buffered_records == 1:
+            break
+        await asyncio.sleep(0)
+    assert service.status().queued_records == 0
+    assert service.status().buffered_records == 1
     await service.close_all(
         CloseReason.SHUTDOWN,
         deadline_ns=clock.monotonic_ns() + 1_000_000_000,
@@ -1141,6 +1857,13 @@ async def test_part_allocation_failure_terminalizes_actor_and_releases_lock(
     with pytest.raises(WriterCriticalError) as captured:
         await service.sync_now()
     assert captured.value.reason is WriterCriticalReason.WRITE_FAILED
+    stored_terminal = service._terminal_error
+    assert isinstance(stored_terminal, WriterCriticalError)
+    assert stored_terminal is not captured.value
+    assert stored_terminal.reason is WriterCriticalReason.WRITE_FAILED
+    assert stored_terminal.__traceback__ is None
+    assert stored_terminal.__cause__ is None
+    assert stored_terminal.__context__ is None
     assert service.status().lifecycle is WriterLifecycle.CRITICAL
     assert service.status().uncertain_record_count == 1
     with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
@@ -1168,6 +1891,41 @@ async def test_terminal_accounting_failure_cannot_resolve_command_as_success(
     assert snapshot.lifecycle is WriterLifecycle.CRITICAL
     assert snapshot.admission_state is AdmissionState.CLOSED
     assert snapshot.critical_reason is WriterCriticalReason.MARKED_INCOMPLETE
+    with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_unprintable_terminal_error_cannot_break_actor_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service, _clock = await open_service(tmp_path)
+    original_refresh = service._refresh_metrics_cache
+
+    class Unprintable:
+        def __str__(self) -> str:
+            raise ValueError("injected string conversion failure")
+
+    def fail_terminal_refresh() -> None:
+        if service._lifecycle is WriterLifecycle.CRITICAL:
+            raise RuntimeError(Unprintable())
+        original_refresh()
+
+    monkeypatch.setattr(service, "_refresh_metrics_cache", fail_terminal_refresh)
+
+    with pytest.raises(RuntimeError, match="raw writer service stopped"):
+        await asyncio.wait_for(
+            service.mark_incomplete("injected incomplete state"),
+            timeout=1,
+        )
+
+    assert service._stopping is True
+    assert service._loop_task is not None and service._loop_task.done()
+    assert service._terminal_error is not None
+    assert service._terminal_error.__traceback__ is None
+    assert service._terminal_error.__cause__ is None
+    assert service._terminal_error.__context__ is None
     with ExchangeWriterLock.acquire(tmp_path / "data", exchange=Exchange.OKX):
         pass
 
@@ -1248,6 +2006,57 @@ async def test_resource_release_failure_cannot_leave_close_future_pending(
 
 
 @pytest.mark.asyncio
+async def test_failed_close_waiters_receive_independent_detached_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sync = BlockingSyncBackend()
+    service, clock = await open_service(tmp_path, sync_backend=sync)
+    assert service.try_accept(
+        trade_draft(), source=websocket_source(), shard="trade-0"
+    ).accepted
+    original_release = service._release_resources
+
+    async def release_then_fail() -> None:
+        await original_release()
+        raise RuntimeError("injected resource release failure")
+
+    monkeypatch.setattr(service, "_release_resources", release_then_fail)
+    deadline = clock.monotonic_ns() + 1_000_000_000
+    first = asyncio.create_task(
+        service.close_all(CloseReason.SHUTDOWN, deadline_ns=deadline)
+    )
+    assert await asyncio.to_thread(sync.started.wait, 5)
+    second = asyncio.create_task(
+        service.close_all(CloseReason.SHUTDOWN, deadline_ns=deadline)
+    )
+    await asyncio.sleep(0)
+    sync.release.set()
+
+    errors: list[BaseException] = []
+    for waiter in (first, second):
+        try:
+            await asyncio.wait_for(waiter, timeout=1)
+        except RuntimeError as error:
+            errors.append(error)
+
+    assert len(errors) == 2
+    assert errors[0] is not errors[1]
+    assert all(str(error) == "injected resource release failure" for error in errors)
+    assert service._close_future is None
+    assert service._terminal_error is not None
+    assert service._terminal_error is not errors[0]
+    assert service._terminal_error is not errors[1]
+    assert service._terminal_error.__traceback__ is None
+    with pytest.raises(
+        RuntimeError, match="injected resource release failure"
+    ) as third:
+        await service.close_all(CloseReason.SHUTDOWN, deadline_ns=deadline)
+    assert third.value is not errors[0]
+    assert third.value is not errors[1]
+
+
+@pytest.mark.asyncio
 async def test_ticker_failure_still_releases_every_owned_resource(
     tmp_path: Path,
 ) -> None:
@@ -1298,6 +2107,12 @@ async def test_command_after_terminal_error_fails_without_reentering_stopped_act
     with pytest.raises(WriterCriticalError) as repeated:
         await asyncio.wait_for(pending, timeout=1)
     assert repeated.value.reason is WriterCriticalReason.MARKED_INCOMPLETE
+    assert repeated.value is not terminal.value
+    assert repeated.value is not service._terminal_error
+    assert service._terminal_error is not None
+    assert service._terminal_error.__traceback__ is None
+    assert service._terminal_error.__cause__ is None
+    assert service._terminal_error.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -1610,12 +2425,91 @@ async def test_sync_watermark_excludes_records_accepted_after_command(
     first_batches = await first_sync
     assert sum(batch.record_count for batch in first_batches) == 1
     assert service.status().durable_record_count == 1
+    for _ in range(100):
+        if service.status().buffered_records == 1:
+            break
+        await asyncio.sleep(0)
+    assert service.status().queued_records == 0
+    assert service.status().buffered_records == 1
     await service.sync_now()
     assert service.status().durable_record_count == 2
     await service.close_all(
         CloseReason.SHUTDOWN,
         deadline_ns=clock.monotonic_ns() + 1_000_000_000,
     )
+
+
+@pytest.mark.asyncio
+async def test_command_watermark_applies_to_nested_cross_shard_drain(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    sync = BlockingNthSyncBackend(block_on_call=3)
+    service, _ = await open_service(
+        tmp_path,
+        clock=clock,
+        sleeper=ManualSleeper(),
+        sync_backend=sync,
+    )
+    for instrument_key, shard in (
+        ("BTC-USDT", "trade-0"),
+        ("ETH-USDT", "trade-1"),
+    ):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=shard,
+        ).accepted
+    await service.sync_now()
+
+    clock.wall_ns += 60 * 60 * 1_000_000_000
+    for instrument_key, shard in (
+        ("BTC-USDT", "trade-0"),
+        ("ETH-USDT", "trade-1"),
+    ):
+        assert service.try_accept(
+            trade_draft(instrument_key=instrument_key),
+            source=websocket_source(),
+            shard=shard,
+        ).accepted
+    for _ in range(100):
+        if service.status().buffered_records == 2 and len(service._retiring) == 2:
+            break
+        await asyncio.sleep(0)
+    assert service.status().buffered_records == 2
+    assert len(service._retiring) == 2
+
+    command_sync = asyncio.create_task(service.sync_now())
+    assert await asyncio.to_thread(sync.started.wait, 5)
+    later = service.try_accept(
+        trade_draft(instrument_key="ETH-USDT"),
+        source=websocket_source(),
+        shard="trade-1",
+    )
+    assert later.record_identity is not None
+    assert later.record_identity.acceptance_ordinal == 4
+    for _ in range(100):
+        if not service._work_event.is_set():
+            break
+        await asyncio.sleep(0)
+    assert not service._work_event.is_set()
+    queued_during_command = service._ingress.queued_records("trade-1")
+
+    sync.release.set()
+    batches = await command_sync
+    assert sum(batch.record_count for batch in batches) == 2
+    for _ in range(100):
+        if service.status().buffered_records == 1:
+            break
+        await asyncio.sleep(0)
+    assert service.status().buffered_records == 1
+    await service.sync_now()
+    assert service.status().durable_record_count == 5
+    await service.close_all(
+        CloseReason.SHUTDOWN,
+        deadline_ns=clock.monotonic_ns() + 1_000_000_000,
+    )
+    assert queued_during_command == 1
 
 
 @pytest.mark.asyncio
@@ -1694,3 +2588,10 @@ async def test_watchdog_enters_critical_while_sync_remains_owned(
         pytest.fail("writer lock was not released after watchdog drain")
     assert service.status().durable_record_count == 1
     assert service.status().uncertain_record_count == 0
+    assert service._pending_oldest_error_facts is not None
+    assert not isinstance(service._pending_oldest_error_facts, BaseException)
+    first = service._pending_oldest_error_facts.materialize()
+    second = service._pending_oldest_error_facts.materialize()
+    assert first is not second
+    assert first.__traceback__ is None
+    assert second.__traceback__ is None

@@ -137,7 +137,7 @@ def _document_ref(root: Path, path: Path) -> GateEvidenceDocumentRefV1:
     )
 
 
-def _micro_workload_bytes() -> bytes:
+def _micro_workload_bytes(*, warmup_seconds: int = 9) -> bytes:
     baseline = load_workload(_BASE_WORKLOAD).workload.model_dump(mode="json")
     data = cast(dict[str, Any], deepcopy(baseline))
     data.update(
@@ -170,7 +170,7 @@ def _micro_workload_bytes() -> bytes:
         else:
             stream["instances"] = 10
     qualification = cast(dict[str, Any], data["qualification"])
-    qualification["warmup_seconds"] = 9
+    qualification["warmup_seconds"] = warmup_seconds
     workload = GateWorkloadV1.model_validate(data)
     return encode_json(workload.model_dump(mode="json"))
 
@@ -764,6 +764,8 @@ def _runtime_summary(
     health_samples: tuple[GateStorageHealthSampleV1, ...],
     raw_inventory: GateRawInventoryV1,
     manifest_inventory: GateManifestInventoryV1,
+    *,
+    warmup_seconds: int = 9,
 ) -> GateRuntimeSummaryV1:
     worker_keys = worker_rounds[0].expected_worker_keys
     worker_sequences = validate_worker_rounds(
@@ -775,7 +777,7 @@ def _runtime_summary(
         resource_rounds,
         expected_processes=resource_rounds[0].expected_process_keys,
         warmup_ended_monotonic_ns=(
-            _ADMISSION_STARTED_MONOTONIC_NS + 9 * _ONE_SECOND_NS
+            _ADMISSION_STARTED_MONOTONIC_NS + warmup_seconds * _ONE_SECOND_NS
         ),
     )
     health_summary = summarize_storage_health(
@@ -823,7 +825,11 @@ def _runtime_summary(
     )
 
 
-def write_passing_micro_evidence(root: Path) -> PassingMicroEvidence:
+def write_passing_micro_evidence(
+    root: Path,
+    *,
+    warmup_seconds: int = 9,
+) -> PassingMicroEvidence:
     if not isinstance(root, Path):
         raise TypeError("evidence root must be Path")
     if root.exists():
@@ -844,7 +850,10 @@ def write_passing_micro_evidence(root: Path) -> PassingMicroEvidence:
     state_root.mkdir()
 
     workload_path = root / "workload.json"
-    _write_bytes(workload_path, _micro_workload_bytes())
+    _write_bytes(
+        workload_path,
+        _micro_workload_bytes(warmup_seconds=warmup_seconds),
+    )
     loaded = load_workload(workload_path)
     plan = build_workload_plan(
         loaded,
@@ -927,6 +936,7 @@ def write_passing_micro_evidence(root: Path) -> PassingMicroEvidence:
         health_samples,
         raw_inventory,
         manifest_inventory,
+        warmup_seconds=warmup_seconds,
     )
     candidate_unsigned = {
         "schema_version": 1,

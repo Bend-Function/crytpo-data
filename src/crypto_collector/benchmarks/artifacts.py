@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import BinaryIO, Protocol, TypeVar, cast
+from typing import BinaryIO, Protocol, Self, TypeVar, cast
 
 import zstandard
 from pydantic import BaseModel, ValidationError
@@ -43,6 +43,193 @@ class _Closeable(Protocol):
 
 class ArtifactValidationError(ValueError):
     pass
+
+
+class StreamingJsonlZstdWriter:
+    """Incrementally publish one canonical model stream without replacement."""
+
+    def __init__(
+        self,
+        root: Path,
+        relative_path: str,
+        *,
+        zstd_level: int,
+    ) -> None:
+        self._root = _validate_root(root)
+        self._relative_path = _validate_relative_path(relative_path)
+        self._level = _strict_positive_int(zstd_level, field_name="zstd_level")
+        if self._level > 22:
+            raise ValueError("zstd_level must not exceed 22")
+        self._destination = _artifact_path(self._root, self._relative_path)
+        self._partial = self._destination.with_name(self._destination.name + ".partial")
+        self._parent_fd = _open_or_create_parent_directories(
+            self._root,
+            self._relative_path,
+        )
+        self._raw_file: BinaryIO | None = None
+        self._writer: _CompressionWriter | None = None
+        self._closed = False
+        self._content_digest = hashlib.sha256()
+        self._content_size = 0
+        self._row_count = 0
+        self._row_model_type: type[BaseModel] | None = None
+        self._artifact_ref: GateArtifactRefV1 | None = None
+        fd = -1
+        try:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            for flag_name in ("O_NOFOLLOW", "O_CLOEXEC"):
+                flag = getattr(os, flag_name, None)
+                if type(flag) is not int or flag == 0:
+                    raise OSError(f"required open flag {flag_name} is unavailable")
+                flags |= flag
+            fd = os.open(
+                self._partial.name,
+                flags,
+                0o640,
+                dir_fd=self._parent_fd,
+            )
+            os.fsync(self._parent_fd)
+            self._raw_file = os.fdopen(fd, "wb", buffering=0, closefd=True)
+            fd = -1
+            compressor = zstandard.ZstdCompressor(
+                level=self._level,
+                write_checksum=True,
+                write_content_size=False,
+            )
+            self._writer = cast(
+                _CompressionWriter,
+                compressor.stream_writer(self._raw_file, closefd=False),
+            )
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            if self._raw_file is not None:
+                self._raw_file.close()
+            os.close(self._parent_fd)
+            self._closed = True
+            raise
+
+    def _write_chunk(
+        self,
+        chunk: bytes,
+        model_type: type[BaseModel],
+        *,
+        row_count: int,
+    ) -> None:
+        if self._closed or self._writer is None:
+            raise RuntimeError("artifact writer is closed")
+        if self._row_model_type is None:
+            self._row_model_type = model_type
+        elif model_type is not self._row_model_type:
+            raise TypeError("artifact rows must all use one exact model type")
+        written = self._writer.write(chunk)
+        if written != len(chunk):
+            raise OSError("zstd artifact writer accepted a partial chunk")
+        self._content_digest.update(chunk)
+        self._content_size += len(chunk)
+        self._row_count += row_count
+
+    def _write_line(self, line: bytes, model_type: type[BaseModel]) -> None:
+        self._write_chunk(line, model_type, row_count=1)
+
+    def write(self, row: BaseModel) -> None:
+        self._write_line(_canonical_row_bytes(row), type(row))
+
+    def write_trusted_line(
+        self,
+        line: bytes,
+        model_type: type[BaseModel],
+    ) -> None:
+        """Write caller-validated canonical JSONL bytes without re-encoding."""
+        _validate_model_type(model_type)
+        if type(line) is not bytes or not line.endswith(b"\n") or b"\n" in line[:-1]:
+            raise ValueError("trusted artifact line must be one newline-terminated row")
+        self._write_line(line, model_type)
+
+    def write_trusted_lines(
+        self,
+        chunk: bytes,
+        model_type: type[BaseModel],
+        *,
+        row_count: int,
+    ) -> None:
+        """Write caller-validated canonical JSONL rows as one bounded chunk."""
+        _validate_model_type(model_type)
+        count = _strict_positive_int(row_count, field_name="row_count")
+        if (
+            type(chunk) is not bytes
+            or not chunk.endswith(b"\n")
+            or chunk.startswith(b"\n")
+            or b"\n\n" in chunk
+            or chunk.count(b"\n") != count
+        ):
+            raise ValueError("trusted artifact chunk must match its declared row count")
+        self._write_chunk(chunk, model_type, row_count=count)
+
+    def abort(self, primary_error: BaseException | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            _close_partial_writer(self._writer, self._raw_file, primary_error)
+        finally:
+            self._writer = None
+            self._raw_file = None
+            os.close(self._parent_fd)
+
+    def close(self) -> GateArtifactRefV1:
+        if self._closed:
+            raise RuntimeError("artifact writer is closed")
+        self.abort()
+        verification_fd = open_readonly_nofollow(self._partial)
+        publication_error: BaseException | None = None
+        try:
+            compressed_size, compressed_sha256 = size_and_sha256_fd(verification_fd)
+            publish_no_replace(
+                self._partial,
+                self._destination,
+                capability=NoReplaceCapability.HARDLINK,
+                expected_source_fd=verification_fd,
+            )
+        except BaseException as error:
+            publication_error = error
+            raise
+        finally:
+            _close_fd_after(
+                verification_fd,
+                publication_error,
+                description="artifact publication verification",
+            )
+        self._artifact_ref = GateArtifactRefV1(
+            relative_path=self._relative_path,
+            row_count=self._row_count,
+            content_size_bytes=self._content_size,
+            content_sha256=self._content_digest.hexdigest(),
+            compressed_size_bytes=compressed_size,
+            compressed_sha256=compressed_sha256,
+        )
+        return self._artifact_ref
+
+    @property
+    def artifact_ref(self) -> GateArtifactRefV1:
+        if self._artifact_ref is None:
+            raise RuntimeError("artifact has not been published")
+        return self._artifact_ref
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        error_type: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del error_type, traceback
+        if error is not None:
+            self.abort(error)
+        else:
+            self.close()
 
 
 def _strict_positive_int(value: int, *, field_name: str) -> int:
@@ -645,6 +832,7 @@ def build_admission_trace_set(
 
 __all__ = [
     "ArtifactValidationError",
+    "StreamingJsonlZstdWriter",
     "build_admission_trace_set",
     "iter_jsonl_zstd",
     "iter_merged_trace_partitions",
