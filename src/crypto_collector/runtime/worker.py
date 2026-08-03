@@ -543,10 +543,20 @@ class ExchangeWorker:
                 or self._fatal_pending
             ):
                 return
+            terminal_control_written = self._emit_adapter_terminal_control(reason)
+            expectation_closed = self._emit_expectation_end()
+            sink_failure = None if self._sink is None else self._sink.stopped_reason
+            if sink_failure is not None:
+                await self._pause_writer_locked(sink_failure)
+                return
+            if not terminal_control_written:
+                await self._pause_writer_locked("adapter_terminal_control_failed")
+                return
+            if not expectation_closed:
+                await self._pause_writer_locked("expectation_close_failed")
+                return
             self._last_failure = reason
             self._exit_code = 1
-            self._emit_adapter_terminal_control(reason)
-            self._emit_expectation_end()
             self._stop_requested = True
             self._stop.set()
             if self._sink is not None:
@@ -556,12 +566,12 @@ class ExchangeWorker:
             await self._mark_writer_incomplete(reason)
             await self._transition(WorkerState.DEGRADED)
 
-    def _emit_adapter_terminal_control(self, reason: str) -> None:
+    def _emit_adapter_terminal_control(self, reason: str) -> bool:
         sink = self._sink
         if sink is None or sink.stopped_reason is not None:
-            return
+            return False
         try:
-            sink.try_emit(
+            result = sink.try_emit(
                 NativeEventDraft(
                     exchange=self.exchange,
                     market=None,
@@ -579,6 +589,8 @@ class ExchangeWorker:
             )
         except Exception:  # noqa: BLE001 - terminalization continues.
             logger.error("adapter terminal control event failed")
+            return False
+        return result.accepted
 
     async def _run_hourly_checkpoints(self) -> None:
         plan = self._plan
@@ -650,6 +662,7 @@ class ExchangeWorker:
     async def _pause_writer_locked(self, reason: str) -> None:
         if self._state in {
             WorkerState.DEGRADED,
+            WorkerState.PAUSED_WRITER,
             WorkerState.STOPPING,
             WorkerState.STOPPED,
         }:
@@ -729,6 +742,24 @@ class ExchangeWorker:
         if self._sink is not None:
             self._sink.stop_accepting("shutdown")
         self._stop.set()
+        cleanup_task = asyncio.create_task(
+            self._stop_locked(
+                deadline_ns=deadline_ns,
+                expectation_closed=expectation_closed,
+            )
+        )
+        try:
+            return await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
+            raise
+
+    async def _stop_locked(
+        self,
+        *,
+        deadline_ns: int,
+        expectation_closed: bool,
+    ) -> tuple[object, ...]:
         async with self._lifecycle_lock:
             if self._state is WorkerState.STOPPED:
                 return self._closed_manifests or ()

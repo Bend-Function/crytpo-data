@@ -610,6 +610,64 @@ async def test_stop_during_writer_open_cannot_revive_worker() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelled_stop_during_writer_open_still_finishes_cleanup() -> None:
+    writer = ScriptedWriter()
+    writer_factory_entered = asyncio.Event()
+    release_writer_factory = asyncio.Event()
+
+    class Adapter:
+        exchange = Exchange.OKX
+
+        def plan(self, collection_request: CollectionRequest) -> AdapterPlan:
+            del collection_request
+            return plan()
+
+        async def run(
+            self, adapter_plan: object, runtime: object, sink: object
+        ) -> None:
+            del adapter_plan, runtime, sink
+
+    async def writer_factory(*, on_critical: object) -> ScriptedWriter:
+        del on_critical
+        writer_factory_entered.set()
+        await release_writer_factory.wait()
+        return writer
+
+    class Runtime:
+        def __init__(self, stop: object) -> None:
+            self.stop = stop
+
+    async def runtime_factory(stop: object) -> Runtime:
+        return Runtime(stop)
+
+    worker = ExchangeWorker(
+        exchange=Exchange.OKX,
+        worker_instance_id="worker-1",
+        request=request(),
+        adapter=Adapter(),
+        writer_factory=writer_factory,
+        runtime_factory=runtime_factory,
+    )
+    start_task = asyncio.create_task(worker.start())
+    await writer_factory_entered.wait()
+    stop_task = asyncio.create_task(
+        worker.stop(deadline_ns=worker.clock.monotonic_ns() + 1_000_000_000)
+    )
+    await asyncio.sleep(0)
+    stop_task.cancel()
+    await asyncio.sleep(0)
+    assert not stop_task.done()
+
+    release_writer_factory.set()
+    await start_task
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert worker.state is WorkerState.STOPPED
+    assert writer.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_invalid_control_coverage_fails_prepare_and_closes_runtime() -> None:
     writer = ScriptedWriter()
     runtime_closed = False
@@ -738,6 +796,55 @@ async def test_adapter_terminal_exit_marks_data_incomplete_and_requests_restart(
     ]
     assert "effective_end_ns" in writer.calls[-1][0].payload
     assert runtime_closed
+    await worker.stop(deadline_ns=worker.clock.monotonic_ns())
+    assert writer.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_exit_control_overflow_takes_writer_failure_priority() -> None:
+    writer = ScriptedWriter(
+        EnqueueStatus.ACCEPTED,
+        EnqueueStatus.CONTROL_OVERFLOW,
+    )
+
+    class Adapter:
+        exchange = Exchange.OKX
+
+        def plan(self, collection_request: CollectionRequest) -> AdapterPlan:
+            del collection_request
+            return plan()
+
+        async def run(
+            self, adapter_plan: object, runtime: object, sink: object
+        ) -> None:
+            del adapter_plan, runtime, sink
+
+    async def writer_factory(*, on_critical: object) -> ScriptedWriter:
+        del on_critical
+        return writer
+
+    class Runtime:
+        def __init__(self, stop: object) -> None:
+            self.stop = stop
+
+    async def runtime_factory(stop: object) -> Runtime:
+        return Runtime(stop)
+
+    worker = ExchangeWorker(
+        exchange=Exchange.OKX,
+        worker_instance_id="worker-1",
+        request=request(),
+        adapter=Adapter(),
+        writer_factory=writer_factory,
+        runtime_factory=runtime_factory,
+    )
+    await worker.start()
+    await worker.wait_until_state(WorkerState.PAUSED_WRITER, timeout=1)
+
+    assert worker.status().last_failure == "control_overflow"
+    assert worker.exit_code is None
+    assert writer.incomplete_reasons == ["control_overflow"]
+    assert writer.close_calls == 0
     await worker.stop(deadline_ns=worker.clock.monotonic_ns())
     assert writer.close_calls == 0
 
