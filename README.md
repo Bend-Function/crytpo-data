@@ -1,5 +1,8 @@
 # Crypto Market Data Collector
 
+中文安装、配置和当前能力说明见
+[`docs/zh-CN/使用指南.md`](docs/zh-CN/使用指南.md)。
+
 Install the locked dependency set for the role you are running:
 
 ```bash
