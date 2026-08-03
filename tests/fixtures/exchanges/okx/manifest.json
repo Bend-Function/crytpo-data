@@ -34,6 +34,12 @@
       "sha256": "3d222466fb683cc4632ef4f391ae23e95e43a49b65dc90ae3d444561c9e1000a",
       "source_anchor": "#order-book-trading-market-data-get-tickers",
       "adaptation": "Official SWAP volume units, missing optional turnover inputs, and an unknown field."
+    },
+    {
+      "file": "ws-session.jsonl",
+      "sha256": "40fd3285199b59c6ca4f8dc6435faa02c35d8f2c4d4e86468c200bd9acbc3ca2",
+      "source_anchor": "#websocket",
+      "adaptation": "Official public books, application pong, subscription acknowledgement/error, and 64008 service-upgrade shapes with forward-compatible fields."
     }
   ]
 }

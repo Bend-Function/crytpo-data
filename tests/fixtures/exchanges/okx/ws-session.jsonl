@@ -1,0 +1,7 @@
+{"name":"subscribe_ack","wire":"{\"id\":\"req1\",\"event\":\"subscribe\",\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"connId\":\"okx-conn-1\",\"futureAckField\":{\"kept\":true}}"}
+{"name":"book_snapshot","wire":"{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"snapshot\",\"data\":[{\"asks\":[[\"11\",\"1\",\"0\",\"1\"]],\"bids\":[[\"10\",\"2\",\"0\",\"1\"]],\"ts\":\"1760000000000\",\"checksum\":0,\"prevSeqId\":-1,\"seqId\":100,\"futureBookField\":{\"kept\":\"exactly\"}}],\"futureTopLevel\":[1,2,3]}"}
+{"name":"book_update","wire":"{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"update\",\"data\":[{\"asks\":[],\"bids\":[[\"10\",\"3\",\"0\",\"1\"]],\"ts\":\"1760000000100\",\"checksum\":0,\"prevSeqId\":100,\"seqId\":101}]}"}
+{"name":"book_heartbeat","wire":"{\"arg\":{\"channel\":\"books\",\"instId\":\"BTC-USDT\"},\"action\":\"update\",\"data\":[{\"asks\":[],\"bids\":[],\"ts\":\"1760000060000\",\"checksum\":0,\"prevSeqId\":101,\"seqId\":101}]}"}
+{"name":"pong","wire":"pong"}
+{"name":"service_upgrade","wire":"{\"event\":\"notice\",\"code\":\"64008\",\"msg\":\"The connection will soon be closed for a service upgrade. Please reconnect.\",\"connId\":\"okx-conn-1\",\"futureNoticeField\":\"kept\"}"}
+{"name":"subscription_error","wire":"{\"id\":\"req1\",\"event\":\"error\",\"code\":\"60012\",\"msg\":\"Invalid request\",\"connId\":\"okx-conn-1\",\"futureErrorField\":42}"}
