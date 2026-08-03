@@ -381,6 +381,18 @@ class InstrumentRecord:
     def scope(self) -> CatalogScope:
         return CatalogScope(self.exchange, self.market)
 
+    def wire_symbol(self, protocol: str) -> str:
+        normalized_protocol = _nonempty_string(
+            protocol,
+            field="wire symbol protocol",
+        )
+        try:
+            return self.wire_symbols[normalized_protocol]
+        except KeyError:
+            raise KeyError(
+                f"wire symbol is not defined for protocol {normalized_protocol!r}"
+            ) from None
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class CatalogInstrument(InstrumentRecord):

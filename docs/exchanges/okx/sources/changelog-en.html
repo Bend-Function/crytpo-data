@@ -432,6 +432,14 @@
                 </ul>
             </li>
             <li>
+              <a href="#2026-08-03" class="toc-h1 toc-link" data-title="2026-08-03">2026-08-03</a>
+                <ul class="toc-list-h2">
+                    <li>
+                      <a href="#2026-08-03-affiliate-invitee-endpoints-add-uid-and-join-time-filters-and-rolling-window-volume" class="toc-h2 toc-link" data-title="Affiliate invitee endpoints add UID and join-time filters and rolling-window volume">Affiliate invitee endpoints add UID and join-time filters and rolling-window volume</a>
+                    </li>
+                </ul>
+            </li>
+            <li>
               <a href="#2026-07-28" class="toc-h1 toc-link" data-title="2026-07-28">2026-07-28</a>
                 <ul class="toc-list-h2">
                     <li>
@@ -2284,9 +2292,9 @@ body
 </tr>
 </tbody></table>
 <h2 id='upcoming-changes-websocket-orders-channel-push-behavior-adjustment'>WebSocket Orders Channel: Push Behavior Adjustment</h2>
-<p><strong>Last update: Jul 22, 2026</strong><br><br></p>
+<p><strong>Last update: Jul 28, 2026</strong><br><br></p>
 
-<p>To help clients more clearly determine the final status of <code>post-only</code> new orders (including <code>mmp_and_post_only</code>) and upcoming <code>rpi</code> new orders — and to avoid scenarios where an order is still canceled after the client has already received a <code>state: live</code> event — OKX will adjust the <code>state: live</code> event behavior for <code>post-only</code> and <code>rpi</code> orders in the <a href="/docs-v5/en/#order-book-trading-trade-ws-order-channel">Order channel</a>.<br><br></p>
+<p>To help clients more clearly determine the final status of <code>post-only</code> new orders (including <code>mmp_and_post_only</code>) and <code>rpi</code> new orders — and to avoid scenarios where an order is still canceled after the client has already received a <code>state: live</code> event — OKX will adjust the <code>state: live</code> event behavior for <code>post-only</code> and <code>rpi</code> orders in the <a href="/docs-v5/en/#order-book-trading-trade-ws-order-channel">Order channel</a>.<br><br></p>
 
 <p><strong>Impact details</strong></p>
 
@@ -2328,12 +2336,12 @@ body
 <td><code>state: live</code> (<code>amendSource: 4</code>, <code>amendResult: 0</code>) → <code>state: live</code></td>
 </tr>
 <tr>
-<td>Upcoming <code>rpi</code> order, <code>rpiPxRound: false</code>,<br>order placement failure<br>(canceled due to not meeting the price spacing rule)</td>
+<td><code>rpi</code> order, <code>rpiPxRound: false</code>,<br>order placement failure<br>(canceled due to not meeting the price spacing rule)</td>
 <td>N/A</td>
 <td>Only <code>state: canceled</code> (no <code>state: live</code>)</td>
 </tr>
 <tr>
-<td>Upcoming <code>rpi</code> order, <code>rpiPxRound: true</code>,<br>and price is modified</td>
+<td><code>rpi</code> order, <code>rpiPxRound: true</code>,<br>and price is modified</td>
 <td>N/A</td>
 <td><code>state: live</code> (<code>amendSource: 6</code>, <code>amendResult: 0</code>) → <code>state: live</code></td>
 </tr>
@@ -2342,7 +2350,7 @@ body
 <p><strong>Effective date</strong></p>
 
 <ul>
-<li>For <code>rpi</code> orders (including <code>elp</code> orders, which will be deprecated): demo trading — <strong>July 23, 2026</strong>; production — <strong>July 28, 2026</strong>.</li>
+<li>For <code>rpi</code> orders (including <code>elp</code> orders, which will be deprecated): <strong>already live</strong> — demo trading — <strong>July 23, 2026</strong>; production — <strong>July 28, 2026</strong>.</li>
 <li>For <code>post_only</code> and <code>mmp_and_post_only</code> orders: both demo trading and production — <strong>mid-August, 2026</strong>.</li>
 </ul>
 
@@ -2351,6 +2359,61 @@ body
 <p>The order types affected are: <code>post_only</code>, <code>mmp_and_post_only</code>, and <code>rpi</code> (Retail Price Improvement).</p>
 
 <p>Other order types — such as <code>limit</code> (regular limit orders), <code>market</code> (market orders), <code>ioc</code>, and <code>fok</code> — will have their push behavior remain unchanged.</p>
+<h1 id='2026-08-03'>2026-08-03</h1><h2 id='2026-08-03-affiliate-invitee-endpoints-add-uid-and-join-time-filters-and-rolling-window-volume'>Affiliate invitee endpoints add UID and join-time filters and rolling-window volume</h2>
+<ul>
+<li>New request parameters added to <a href="/docs-v5/en/#affiliate-rest-api-get-invitee-list">Get invitee list</a>:</li>
+</ul>
+
+<table><thead>
+<tr>
+<th><strong>Parameter</strong></th>
+<th><strong>Type</strong></th>
+<th><strong>Required</strong></th>
+<th><strong>Description</strong></th>
+</tr>
+</thead><tbody>
+<tr>
+<td>uid</td>
+<td>String</td>
+<td>No</td>
+<td>External user UIDs for exact match. Single UID or up to 100 UIDs, comma-separated. Unknown UIDs are silently skipped; if none resolve, an empty page is returned.</td>
+</tr>
+<tr>
+<td>joinTimeBegin</td>
+<td>String</td>
+<td>Conditional</td>
+<td>Filter lower bound on <code>joinTime</code>, Unix timestamp in millisecond format, inclusive. Required together with <code>joinTimeEnd</code>; span up to 90 days, not earlier than 180 days ago.</td>
+</tr>
+<tr>
+<td>joinTimeEnd</td>
+<td>String</td>
+<td>Conditional</td>
+<td>Filter upper bound on <code>joinTime</code>, Unix timestamp in millisecond format, inclusive. Required together with <code>joinTimeBegin</code>.</td>
+</tr>
+</tbody></table>
+
+<ul>
+<li>New request parameter <code>periodType</code> and new response field <code>volPeriod</code> added to <a href="/docs-v5/en/#affiliate-rest-api-get-the-invitee-39-s-detail">Get the invitee&#39;s detail</a>:</li>
+</ul>
+
+<table><thead>
+<tr>
+<th><strong>Parameter</strong></th>
+<th><strong>Type</strong></th>
+<th><strong>Description</strong></th>
+</tr>
+</thead><tbody>
+<tr>
+<td>periodType (request)</td>
+<td>String</td>
+<td>Stats window for <code>volPeriod</code>: <code>last_7d</code>, <code>last_30d</code>, <code>this_month</code>, <code>last_month</code>, <code>total</code>, <code>today</code>, <code>this_week</code>. When omitted, <code>volPeriod</code> is not returned.</td>
+</tr>
+<tr>
+<td>volPeriod (response)</td>
+<td>String</td>
+<td>Trading volume within the selected <code>periodType</code> window, unit in USDT. Only returned when <code>periodType</code> is supplied. <code>0</code> if the user has not traded in the window.</td>
+</tr>
+</tbody></table>
 <h1 id='2026-07-28'>2026-07-28</h1><h2 id='2026-07-28-rebranding-elp-to-rpi-retail-price-improvement-program'>Rebranding ELP to RPI (Retail Price Improvement) Program</h2>
 <p>OKX is rebranding <strong>Enhanced Liquidity Program (ELP)</strong> to <strong>Retail Price Improvement (RPI)</strong>. This includes a new consolidated RPI order book (<code>books-rpi</code>) over WebSocket and REST, a renamed <code>rpi</code> maker order type (replacing <code>elp</code>), an expanded <code>rpiTakerAccess</code> order parameter (replacing <code>isElpTakerAccess</code>), a new <code>rpiPxRound</code> parameter for the RPI maker spacing rule, and renamed <code>rpi</code>/<code>rpiMaker</code> account fields.</p>
 
@@ -2394,15 +2457,18 @@ body
 <li>Error code <code>54045</code> (previously returned when a non-<code>ioc</code> order attempted to take RPI liquidity) is retired — unreachable now that <code>rpiTakerAccess</code> is valid on all order types.</li>
 </ul>
 
-<p>Applies to place / amend, REST + WS:
-- <a href="/docs-v5/en/#order-book-trading-trade-post-place-order">POST / Place order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-post-place-multiple-orders">POST / Place multiple orders</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-post-amend-order">POST / Amend order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-post-amend-multiple-orders">POST / Amend multiple orders</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-place-order">WS / Place order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-place-multiple-orders">WS / Place multiple orders</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-amend-order">WS / Amend order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-amend-multiple-orders">WS / Amend multiple orders</a></p>
+<p>Applies to place / amend, REST + WS:</p>
+
+<ul>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-place-order">POST / Place order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-place-multiple-orders">POST / Place multiple orders</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-amend-order">POST / Amend order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-amend-multiple-orders">POST / Amend multiple orders</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-place-order">WS / Place order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-place-multiple-orders">WS / Place multiple orders</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-amend-order">WS / Amend order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-amend-multiple-orders">WS / Amend multiple orders</a></li>
+</ul>
 
 <table><thead>
 <tr>
@@ -2424,11 +2490,14 @@ body
 <li>To place an RPI maker order, set <code>ordType</code> to <code>rpi</code> instead of <code>elp</code>. <code>elp</code> remains accepted until the sunset date (see migration note above) — <code>ordType</code> takes a single value, so send one or the other, not both.</li>
 </ul>
 
-<p>Applies to place, REST + WS:
-- <a href="/docs-v5/en/#order-book-trading-trade-post-place-order">POST / Place order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-post-place-multiple-orders">POST / Place multiple orders</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-place-order">WS / Place order</a>
-- <a href="/docs-v5/en/#order-book-trading-trade-ws-place-multiple-orders">WS / Place multiple orders</a></p>
+<p>Applies to place, REST + WS:</p>
+
+<ul>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-place-order">POST / Place order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-post-place-multiple-orders">POST / Place multiple orders</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-place-order">WS / Place order</a></li>
+<li><a href="/docs-v5/en/#order-book-trading-trade-ws-place-multiple-orders">WS / Place multiple orders</a></li>
+</ul>
 <h3 id='2026-07-28-rebranding-elp-to-rpi-retail-price-improvement-program-maker-parameter-rpipxround'>Maker parameter: <code>rpiPxRound</code></h3>
 <ul>
 <li><code>rpiPxRound</code> is a new parameter for the RPI maker spacing rule (see below). Effective only on RPI maker orders (<code>ordType: rpi</code>); silently ignored on non-RPI orders and on <code>OPTION</code>/<code>EVENTS</code>.</li>
