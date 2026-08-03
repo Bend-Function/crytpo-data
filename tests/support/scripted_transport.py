@@ -20,6 +20,7 @@ class ScriptedHttpTransport:
     def __init__(self, *responses: httpx.Response) -> None:
         self._responses = deque(responses)
         self.requests: list[RecordedGet] = []
+        self.closed = False
 
     async def get(
         self,
@@ -37,6 +38,9 @@ class ScriptedHttpTransport:
         if not self._responses:
             raise AssertionError("scripted HTTP transport has no response")
         return self._responses.popleft()
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class ScriptedWebSocketTransport:

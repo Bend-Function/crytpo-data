@@ -220,15 +220,6 @@ async def test_control_overflow_is_fatal_and_never_publishes_complete_part(tmp_p
     assert worker.active_part_is_marked_incomplete
 
 
-@pytest.mark.asyncio
-async def test_periodic_catalog_refresh_reselects_and_replans(fake_clock, tmp_path) -> None:
-    adapter = MutableCatalogAdapter(initial=["BTC-USDT"], next=["BTC-USDT", "NEW-USDT"])
-    worker = make_worker(tmp_path, adapter=adapter, selection_refresh_ns=minutes(5))
-    await worker.start()
-    fake_clock.advance(minutes(5))
-    await worker.wait_until_selected("NEW-USDT")
-    assert adapter.plan_calls == 2
-    assert any_control(worker.closed_manifests, event="selected_set_changed")
 ```
 
 - [ ] **Step 2: Run and verify runtime modules are missing**
@@ -250,13 +241,11 @@ class WorkerState(StrEnum):
     STOPPED = "stopped"
 ```
 
-The worker receives a reference-only `ConfigBundle` from the supervisor and resolves its exchange secret references exactly once into a worker-local snapshot. It then calls only Plan 02's `RawWriterService.open`, which owns lock acquisition, startup recovery, sequence allocation, ingress, coordinator, stream writers, rotation, incomplete marking, and close. A `RecoveryBlocked` result enters `PAUSED_WRITER` before creating network clients or issuing any adapter HTTP/WS action. After storage is accepting, construct all clients from the already resolved snapshot and load persisted catalog/network state. On first start execute adapter capability/time/catalog probes, resolve fixed requests, update catalog state, compute the fixed/Top-N/new-listing union, admit capacity, build the adapter plan, emit a `subscription_expectation` checkpoint, and only then start long-running adapter tasks. Unknown/ambiguous fixed requests, required probe failures, or fixed-only capacity failures reject worker prepare before subscriptions open.
+This task freezes the single-loop worker around an already prepared immutable `CollectionRequest` plus writer/runtime factories. It calls only Plan 02's `RawWriterService.open`, which owns lock acquisition, startup recovery, sequence allocation, ingress, coordinator, stream writers, rotation, incomplete marking, and close. A `RecoveryBlocked` result enters `PAUSED_WRITER` before invoking the runtime factory or issuing any adapter HTTP/WS action. Startup, fatal pause, and shutdown share one lifecycle mutex; a stop request is latched before waiting for that mutex so a writer factory that completes concurrently cannot revive a stopped worker or open later network resources. After storage is accepting, construct clients, build and validate the adapter plan, require a complete `_control` expectation, emit a `subscription_expectation` checkpoint, and only then start the long-running adapter task. Invalid plans reject prepare before subscriptions open. Task 6 owns `ConfigBundle`/secret resolution, initial probe/catalog/selection preparation, periodic catalog refresh, and transactional plan replacement once the OKX adapter surface exists; those concerns are not duplicated in this scripted lifecycle task.
 
-One worker-owned selection coordinator repeats catalog/turnover refresh at `selection.refresh_interval` (default five minutes), updates new-listing lifecycle, recomputes selection/admission/intervals, and transactionally applies a plan diff. It closes removed streams under their old expectation window before opening additions and emits catalog/selection/interval control records. This loop, startup, and reload all use the same pure plan builder; no one-shot CLI result is treated as runtime state.
+`EventSink.try_emit(draft, source=source, shard=plan_item.shard_id)` validates the event against the plan-bound expectation and then delegates immediately to `RawWriterService.try_accept(draft, source=source, shard=shard)`, which invokes the Plan 02 nonblocking ingress and adds receive time, worker/config identity, source connection/egress fields, and writer sequence. Queue overflow writes a reserved control event and requests that channel generation close/rebuild. `CONTROL_OVERFLOW` or writer failure latches the sink closed, joins adapter cancellation, closes all exchange inputs, calls `RawWriterService.mark_incomplete`, and enters `PAUSED_WRITER`; that state remains alive but unready. An unexpected normal return or exception from the long-running adapter writes a generic control record, closes its expectation interval, terminalizes the writer as incomplete, and exposes exit code 1 in `DEGRADED` so Task 6 can restart the worker. A normal stop emits the expectation's `effective_end_ns`, joins adapter cleanup before closing network/writer resources, and only then publishes `STOPPED`. Rotation, reload boundaries, sync, and shutdown call only the other frozen service methods; runtime never opens storage files or acquires writer locks itself.
 
-`EventSink.try_emit(draft, source=source, shard=plan_item.shard_id)` validates the event against the plan-bound expectation and then delegates immediately to `RawWriterService.try_accept(draft, source=source, shard=shard)`, which invokes the Plan 02 nonblocking ingress and adds receive time, worker/config identity, source connection/egress fields, and writer sequence. Queue overflow writes a reserved control event and requests that channel generation close/rebuild. `CONTROL_OVERFLOW` or writer failure closes all exchange inputs, calls `RawWriterService.mark_incomplete`, and enters `PAUSED_WRITER`; that state remains alive but unready. Rotation, reload boundaries, sync, and shutdown call only the other frozen service methods; runtime never opens storage files or acquires writer locks itself.
-
-Emit expectation checkpoints on config commit, selected-set change, and UTC hour boundary. The payload contains effective start, optional end, and sorted exchange/market/instrument/stream keys so completely silent quality windows remain discoverable.
+Emit expectation checkpoints on config commit, selected-set change, every UTC hour boundary, and interval close. The payload contains effective start, optional end, and sorted exchange/market/instrument/stream keys so completely silent quality windows remain discoverable.
 
 - [ ] **Step 4: Run worker tests**
 

@@ -421,7 +421,8 @@ def test_market_wide_subscription_can_cover_instrument_expectations() -> None:
     assert plan.expected_logical_streams() == frozenset({"liquidation"})
 
 
-def test_adapter_runtime_freezes_egress_lookup() -> None:
+@pytest.mark.asyncio
+async def test_adapter_runtime_freezes_egress_lookup_and_closes_http() -> None:
     class Scheduler:
         async def submit(self, job: RestJob) -> object:
             del job
@@ -441,9 +442,10 @@ def test_adapter_runtime_freezes_egress_lookup() -> None:
         async def wait(self) -> None:
             return None
 
+    http = ScriptedHttpTransport()
     transport = EgressTransport(
         egress_id="direct-primary",
-        http=ScriptedHttpTransport(),
+        http=http,
         websocket=ScriptedWebSocketTransport(),
     )
     transports = {"direct-primary": transport}
@@ -465,6 +467,60 @@ def test_adapter_runtime_freezes_egress_lookup() -> None:
             clock=Clock(),
             stop=Stop(),
         )
+    await runtime.aclose()
+    assert http.closed
+
+
+@pytest.mark.asyncio
+async def test_adapter_runtime_closes_all_unique_http_clients_after_failure() -> None:
+    class Scheduler:
+        async def submit(self, job: RestJob) -> object:
+            del job
+            return object()
+
+    class Clock:
+        def time_ns(self) -> int:
+            return 1
+
+        def monotonic_ns(self) -> int:
+            return 1
+
+    class Stop:
+        def is_set(self) -> bool:
+            return False
+
+        async def wait(self) -> None:
+            return None
+
+    class FailingHttp(ScriptedHttpTransport):
+        async def aclose(self) -> None:
+            self.closed = True
+            raise RuntimeError("injected close failure")
+
+    failing = FailingHttp()
+    healthy = ScriptedHttpTransport()
+    runtime = AdapterRuntime(
+        transports={
+            "one": EgressTransport(
+                egress_id="one",
+                http=failing,
+                websocket=ScriptedWebSocketTransport(),
+            ),
+            "two": EgressTransport(
+                egress_id="two",
+                http=healthy,
+                websocket=ScriptedWebSocketTransport(),
+            ),
+        },
+        scheduler=Scheduler(),
+        clock=Clock(),
+        stop=Stop(),
+    )
+
+    with pytest.raises(RuntimeError, match="injected close failure"):
+        await runtime.aclose()
+    assert failing.closed
+    assert healthy.closed
 
 
 def test_stream_expectation_distinguishes_control_market_and_instrument_scope() -> None:

@@ -713,6 +713,25 @@ class AdapterRuntime:
                 f"runtime egress {egress_id!r} is not available"
             ) from None
 
+    async def aclose(self) -> None:
+        closed: set[int] = set()
+        first_error: Exception | None = None
+        for transport in self.transports.values():
+            http = transport.http
+            identity = id(http)
+            if identity in closed:
+                continue
+            closed.add(identity)
+            close = getattr(http, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception as error:  # noqa: BLE001 - close remaining clients.
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
+
 
 class EventSink(Protocol):
     def try_emit(
