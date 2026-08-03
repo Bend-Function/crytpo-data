@@ -185,3 +185,54 @@ class RawEnvelope(NativeEventDraft):
         except ValueError as error:
             raise ValueError(f"invalid source context: {error}") from error
         return self
+
+
+_TRUSTED_RAW_ENVELOPE_FIELDS = (
+    *NativeEventDraft.model_fields,
+    "schema_version",
+    "received_at_ns",
+    "monotonic_ns",
+    "worker_instance_id",
+    "connection_id",
+    "connection_generation",
+    "writer_sequence",
+    "egress_id",
+    "config_sha256",
+)
+if tuple(RawEnvelope.model_fields) != _TRUSTED_RAW_ENVELOPE_FIELDS:
+    raise RuntimeError("trusted raw-envelope construction fields are stale")
+
+
+def _construct_envelope_from_validated_parts(
+    draft: NativeEventDraft,
+    *,
+    received_at_ns: int,
+    monotonic_ns: int,
+    worker_instance_id: str,
+    source: SourceContext,
+    writer_sequence: int,
+    config_sha256: str,
+) -> RawEnvelope:
+    """Construct an envelope from values already validated by raw ingress."""
+    values = draft.__dict__.copy()
+    values.update(
+        schema_version=1,
+        received_at_ns=received_at_ns,
+        monotonic_ns=monotonic_ns,
+        worker_instance_id=worker_instance_id,
+        connection_id=source.connection_id,
+        connection_generation=source.connection_generation,
+        writer_sequence=writer_sequence,
+        egress_id=source.egress_id,
+        config_sha256=config_sha256,
+    )
+    envelope = RawEnvelope.__new__(RawEnvelope)
+    object.__setattr__(envelope, "__dict__", values)
+    object.__setattr__(
+        envelope,
+        "__pydantic_fields_set__",
+        set(_TRUSTED_RAW_ENVELOPE_FIELDS),
+    )
+    object.__setattr__(envelope, "__pydantic_extra__", None)
+    object.__setattr__(envelope, "__pydantic_private__", None)
+    return envelope

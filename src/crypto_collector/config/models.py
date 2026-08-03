@@ -259,6 +259,10 @@ class WriterConfig(StrictModel):
     max_compressed_size_bytes: PositiveSizeBytes = Field(
         1024**3, alias="max_compressed_size"
     )
+    zstd_level: Annotated[int, Field(ge=1, le=22)] = 3
+    max_plain_frame_bytes: PositiveSizeBytes = Field(
+        1024**2, alias="max_plain_frame_bytes"
+    )
 
 
 class IngressConfig(StrictModel):
@@ -270,6 +274,20 @@ class IngressConfig(StrictModel):
     control_reserve_bytes: PositiveSizeBytes = Field(
         8 * 1024**2, alias="control_reserve_bytes"
     )
+
+    @model_validator(mode="after")
+    def validate_capacity_relationships(self) -> Self:
+        if self.worker_max_bytes < self.shard_max_bytes:
+            raise ValueError("worker ingress bytes must cover at least one shard")
+        if self.control_reserve_records > self.shard_max_records:
+            raise ValueError("control reserve records exceed the control shard ceiling")
+        if self.control_reserve_bytes > self.shard_max_bytes:
+            raise ValueError("control reserve bytes exceed the control shard ceiling")
+        if self.control_reserve_bytes >= self.worker_max_bytes:
+            raise ValueError(
+                "control reserve bytes must be smaller than the worker ingress limit"
+            )
+        return self
 
 
 class DiskConfig(StrictModel):
@@ -633,13 +651,6 @@ class CollectorConfig(StrictModel):
         egress_ids = [egress.id for egress in self.network.egress_pool]
         if len(set(egress_ids)) != len(egress_ids):
             raise ValueError("egress IDs must be unique")
-        if self.ingress.worker_max_bytes < self.ingress.shard_max_bytes:
-            raise ValueError("worker ingress bytes must cover at least one shard")
-        if self.ingress.control_reserve_bytes >= self.ingress.worker_max_bytes:
-            raise ValueError(
-                "control reserve must be smaller than worker ingress limit"
-            )
-
         target_ids = [target.id for target in self.archive.targets]
         if len(set(target_ids)) != len(target_ids):
             raise ValueError("archive target IDs must be unique")
