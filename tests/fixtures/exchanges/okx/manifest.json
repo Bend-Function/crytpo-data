@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-04",
+  "source_document": "docs/exchanges/okx/sources/api-guide-en.html",
+  "source_document_sha256": "7b7fa15a91e0f3a86ca81b76aa6fc9d0d114e3dd0ffe98575c24dc4d34bf7331",
+  "entries": [
+    {
+      "file": "books-full.json",
+      "sha256": "e9846c837cd6ae055bcaaaf400d7fed23a2d4f2f2861ca2982075e271d2ab9cd",
+      "source_anchor": "#order-book-trading-market-data-get-full-order-book",
+      "adaptation": "Official response shape with exact decimal strings and an unknown forward-compatible field."
+    },
+    {
+      "file": "error-50011.json",
+      "sha256": "d5d97e34748868486d2aa654f1773fb5c135d14e2c1e92b0b8b1ef631dfa8d43",
+      "source_anchor": "#error-code-rest-api",
+      "adaptation": "Official business error code with an unknown forward-compatible field."
+    },
+    {
+      "file": "instruments-spot.json",
+      "sha256": "c65c3024ef174aa632fff9e169868ddb65126d036393617e7d910d31d6b8a29b",
+      "source_anchor": "#public-data-rest-api-get-instruments",
+      "adaptation": "Official SPOT fields covering live and preopen lifecycle semantics."
+    },
+    {
+      "file": "instruments-swap.json",
+      "sha256": "8111ac0256961d552e18f6ac5cdca87a2bd612fe102d7dd435427f9a49996be3",
+      "source_anchor": "#public-data-rest-api-get-instruments",
+      "adaptation": "Official SWAP fields covering linear USDT and filtered inverse identities."
+    },
+    {
+      "file": "tickers.json",
+      "sha256": "3d222466fb683cc4632ef4f391ae23e95e43a49b65dc90ae3d444561c9e1000a",
+      "source_anchor": "#order-book-trading-market-data-get-tickers",
+      "adaptation": "Official SWAP volume units, missing optional turnover inputs, and an unknown field."
+    }
+  ]
+}

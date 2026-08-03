@@ -1,0 +1,31 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "instType": "SWAP",
+      "instId": "BTC-USDT-SWAP",
+      "last": "100000",
+      "vol24h": "999999999",
+      "volCcy24h": "12.3456789",
+      "ts": "1760000000456",
+      "unknownTickerField": "preserve in raw response"
+    },
+    {
+      "instType": "SWAP",
+      "instId": "NEW-USDT-SWAP",
+      "last": "",
+      "vol24h": "0",
+      "volCcy24h": "",
+      "ts": "1760000000789"
+    },
+    {
+      "instType": "SWAP",
+      "instId": "NOT-IN-CATALOG-USDT-SWAP",
+      "last": "1",
+      "vol24h": "1",
+      "volCcy24h": "1",
+      "ts": "1760000000999"
+    }
+  ]
+}
