@@ -418,17 +418,17 @@ def test_reference_snapshot_freezes_symlinked_model_paths(
 ) -> None:
     first_data = config_tree / "first-data"
     second_data = config_tree / "second-data"
-    first_archive = config_tree / "first-archive"
-    second_archive = config_tree / "second-archive"
     first_mount = config_tree / "first-mount"
     second_mount = config_tree / "second-mount"
+    first_archive = first_mount / "archive"
+    second_archive = second_mount / "archive"
     for directory in (
         first_data,
         second_data,
-        first_archive,
-        second_archive,
         first_mount,
         second_mount,
+        first_archive,
+        second_archive,
     ):
         directory.mkdir()
 
