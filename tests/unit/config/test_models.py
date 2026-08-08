@@ -631,6 +631,7 @@ def test_filesystem_target_defaults_to_backup_only_and_infers_mount_root() -> No
     ("overrides", "message"),
     [
         ({"root": "/srv/archive"}, "root.*mount_root"),
+        ({"root": "/mnt/webdav"}, "strict descendant"),
         (
             {
                 "mount_guard": {
@@ -639,6 +640,25 @@ def test_filesystem_target_defaults_to_backup_only_and_infers_mount_root() -> No
                 }
             },
             "mount_guard.*mount_root",
+        ),
+        (
+            {
+                "mount_guard": {
+                    "path": "/mnt/webdav/archive/.collector-mount-id",
+                    "expected": "env:MOUNT_GUARD",
+                }
+            },
+            "mount_guard.*overlap root",
+        ),
+        (
+            {
+                "root": "/mnt/webdav/guard-parent/archive",
+                "mount_guard": {
+                    "path": "/mnt/webdav/guard-parent",
+                    "expected": "env:MOUNT_GUARD",
+                },
+            },
+            "mount_guard.*overlap root",
         ),
     ],
 )

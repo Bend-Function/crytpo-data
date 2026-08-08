@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ from crypto_collector.archive.receipt import ProviderChecksumV1
 from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     ArchiveTarget,
+    MultipartJournal,
+    MultipartJournalFactory,
     PutResult,
     ResumeState,
     TargetProbe,
@@ -128,6 +131,49 @@ def source(tmp_path: Path, role: str, content: bytes) -> ArchiveObjectSource:
 
 def test_target_protocol_is_runtime_checkable() -> None:
     assert isinstance(ScriptedTarget(), ArchiveTarget)
+
+
+def test_multipart_journal_protocol_freezes_job_scoped_cas_api() -> None:
+    class Journal:
+        def load(self) -> ResumeState | None:
+            return None
+
+        def save(
+            self,
+            state: ResumeState,
+            expected_upload_id: str | None,
+        ) -> None:
+            del state, expected_upload_id
+
+        def clear(self, expected_upload_id: str) -> None:
+            del expected_upload_id
+
+    class Factory:
+        def __call__(
+            self,
+            source: ArchiveObjectSource,
+            key: str,
+        ) -> Journal:
+            del source, key
+            return Journal()
+
+    assert isinstance(Journal(), MultipartJournal)
+    assert isinstance(Factory(), MultipartJournalFactory)
+    assert tuple(inspect.signature(MultipartJournal.load).parameters) == ("self",)
+    assert tuple(inspect.signature(MultipartJournal.save).parameters) == (
+        "self",
+        "state",
+        "expected_upload_id",
+    )
+    assert tuple(inspect.signature(MultipartJournal.clear).parameters) == (
+        "self",
+        "expected_upload_id",
+    )
+    assert tuple(inspect.signature(MultipartJournalFactory.__call__).parameters) == (
+        "self",
+        "source",
+        "key",
+    )
 
 
 def test_receipt_last_helper_requires_strong_verification_in_exact_order(
@@ -340,6 +386,15 @@ def test_probe_and_resume_models_reject_inconsistent_runtime_facts() -> None:
             mount_identity=None,
         )
 
+    for capability in (None, " hardlink", "hardlink "):
+        with pytest.raises(ValueError, match="no-replace capability"):
+            TargetProbe(
+                target_id="filesystem-a",
+                target_type="filesystem",
+                no_replace_capability=capability,  # type: ignore[arg-type]
+                mount_identity="test-mount",
+            )
+
     with pytest.raises(ValueError, match="sorted and unique"):
         ResumeState(
             upload_id="upload",
@@ -364,6 +419,37 @@ def test_receipt_last_validates_every_key_before_first_side_effect(
             source_manifest_key="objects/manifest",
             receipt=source(tmp_path, "receipt", b"receipt\n"),
             receipt_key="../escape",
+        )
+
+    assert target.trace == []
+
+
+@pytest.mark.parametrize(
+    ("data_key", "manifest_key", "receipt_key"),
+    (
+        ("objects/same", "objects/same", "objects/receipt"),
+        ("objects/data", "objects/same", "objects/same"),
+        ("objects/same", "objects/manifest", "objects/same"),
+        ("objects/same", "objects/same", "objects/same"),
+    ),
+)
+def test_receipt_last_rejects_duplicate_keys_before_first_side_effect(
+    tmp_path: Path,
+    data_key: str,
+    manifest_key: str,
+    receipt_key: str,
+) -> None:
+    target = ScriptedTarget()
+
+    with pytest.raises(ValueError, match="pairwise distinct"):
+        publish_receipt_last(
+            target,
+            data=source(tmp_path, "data", b"same-bytes"),
+            data_key=data_key,
+            source_manifest=source(tmp_path, "manifest", b"same-bytes"),
+            source_manifest_key=manifest_key,
+            receipt=source(tmp_path, "receipt", b"same-bytes"),
+            receipt_key=receipt_key,
         )
 
     assert target.trace == []
