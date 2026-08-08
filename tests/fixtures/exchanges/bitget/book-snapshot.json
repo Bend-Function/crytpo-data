@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "a": [["11", "1"]],
+      "b": [["10", "2"]],
+      "pseq": 0,
+      "seq": 100,
+      "maxDepth": "50",
+      "ts": "1746698732562",
+      "futureBookField": {"kept": "raw"}
+    }
+  ],
+  "arg": {
+    "instType": "usdt-futures",
+    "symbol": "BTCUSDT",
+    "topic": "books"
+  },
+  "action": "snapshot",
+  "ts": 1746698732563,
+  "futureTopLevel": [1, 2, 3]
+}

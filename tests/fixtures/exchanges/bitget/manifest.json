@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-08",
+  "entries": [
+    {
+      "file": "spot-instruments.json",
+      "sha256": "b121f99e954dd627afe627bf13b8f8c1c5eba3f57155279115be0c21391ecec1",
+      "source_document": "docs/exchanges/bitget/sources/rest-instruments.html",
+      "source_document_sha256": "410a8bfc5f08b1eaf40d09da9814be6221c638a99e206676408ccd0e994dec4b",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official SPOT response fields, including crypto and non-Reality scope markers, adapted to online and listed lifecycle vectors with one forward-compatible unknown field."
+    },
+    {
+      "file": "futures-instruments.json",
+      "sha256": "7bc18e9220c2bd18a7b1b8a65faeef7cd8027cd77761e1f63039dba9a4433a73",
+      "source_document": "docs/exchanges/bitget/sources/rest-instruments.html",
+      "source_document_sha256": "410a8bfc5f08b1eaf40d09da9814be6221c638a99e206676408ccd0e994dec4b",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official USDT-FUTURES fields, including the crypto scope marker and documented absence of the Spot-only Reality marker, adapted to perpetual, listed, and delivery filtering vectors."
+    },
+    {
+      "file": "book-snapshot.json",
+      "sha256": "7400f9be4967dd73d88bb6c216b0db3a2f5f736d54101788adcea345bb472e6c",
+      "source_document": "docs/exchanges/bitget/sources/ws-orderbook.html",
+      "source_document_sha256": "8ccd716445e19461d46d34b7a3669e9f772eca42a4603aac54fdb68cd033ce66",
+      "source_anchor": "#push-parameters",
+      "adaptation": "Official UTA v3 books snapshot shape with pseq zero and unknown fields retained."
+    },
+    {
+      "file": "book-first-update.json",
+      "sha256": "05cabf9560dcf559b91c8f2841c5c72a3ce354f6b6f06400fb975b639b817312",
+      "source_document": "docs/exchanges/bitget/sources/ws-orderbook.html",
+      "source_document_sha256": "8ccd716445e19461d46d34b7a3669e9f772eca42a4603aac54fdb68cd033ce66",
+      "source_anchor": "#push-parameters",
+      "adaptation": "Synthetic first-update sequence vector derived from the documented inclusive overlap rule. The zero quantity tests raw preservation only and is not evidence of deletion semantics."
+    },
+    {
+      "file": "book-update.json",
+      "sha256": "28a3d7afdc2ab5ad75b3d194016812588e56d16a432e5ace452829308a5ad9b6",
+      "source_document": "docs/exchanges/bitget/sources/ws-orderbook.html",
+      "source_document_sha256": "8ccd716445e19461d46d34b7a3669e9f772eca42a4603aac54fdb68cd033ce66",
+      "source_anchor": "#push-parameters",
+      "adaptation": "Synthetic later-update vector derived from the documented previous seq equals next pseq rule."
+    },
+    {
+      "file": "ws-session.jsonl",
+      "sha256": "668e43bf1fd4d729e5b49a86dce9dd2b7b4b824976ece3dd2edb1c3258f6c03f",
+      "source_document": "docs/exchanges/bitget/sources/ws-orderbook.html",
+      "source_document_sha256": "8ccd716445e19461d46d34b7a3669e9f772eca42a4603aac54fdb68cd033ce66",
+      "source_anchor": "#response-parameters",
+      "secondary_sources": [
+        {
+          "source_document": "docs/exchanges/bitget/sources/uta-guide.html",
+          "source_document_sha256": "e012972ce2f6d4d7f5558534ab24daa6090f78a6005cddc2c38bc6f6623757c6",
+          "source_anchor": "#connect",
+          "purpose": "Literal ping and pong heartbeat contract."
+        }
+      ],
+      "adaptation": "Official acknowledgement, books and literal pong shapes assembled into an offline session script; the error code is a protocol-only synthetic value."
+    }
+  ]
+}

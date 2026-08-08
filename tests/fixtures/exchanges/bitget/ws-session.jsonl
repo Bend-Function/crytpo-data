@@ -1,0 +1,5 @@
+{"name":"subscribe_ack","wire":"{\"event\":\"subscribe\",\"arg\":{\"instType\":\"usdt-futures\",\"topic\":\"books\",\"symbol\":\"BTCUSDT\"},\"connId\":\"bitget-conn-1\",\"futureAckField\":{\"kept\":true}}"}
+{"name":"book_snapshot","wire":"{\"data\":[{\"a\":[[\"11\",\"1\"]],\"b\":[[\"10\",\"2\"]],\"pseq\":0,\"seq\":100,\"maxDepth\":\"50\",\"ts\":\"1746698732562\",\"futureBookField\":{\"kept\":\"raw\"}}],\"arg\":{\"instType\":\"usdt-futures\",\"symbol\":\"BTCUSDT\",\"topic\":\"books\"},\"action\":\"snapshot\",\"ts\":1746698732563,\"futureTopLevel\":[1,2,3]}"}
+{"name":"book_first_update","wire":"{\"data\":[{\"a\":[],\"b\":[[\"10\",\"0\"]],\"pseq\":99,\"seq\":101,\"maxDepth\":\"50\",\"ts\":\"1746698732600\"}],\"arg\":{\"instType\":\"usdt-futures\",\"symbol\":\"BTCUSDT\",\"topic\":\"books\"},\"action\":\"update\",\"ts\":1746698732601}"}
+{"name":"pong","wire":"pong"}
+{"name":"subscription_error","wire":"{\"event\":\"error\",\"code\":\"30001\",\"msg\":\"request error\",\"connId\":\"bitget-conn-1\",\"futureErrorField\":42}"}

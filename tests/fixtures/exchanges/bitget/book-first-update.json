@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "a": [],
+      "b": [["10", "0"]],
+      "pseq": 99,
+      "seq": 101,
+      "maxDepth": "50",
+      "ts": "1746698732600"
+    }
+  ],
+  "arg": {
+    "instType": "usdt-futures",
+    "symbol": "BTCUSDT",
+    "topic": "books"
+  },
+  "action": "update",
+  "ts": 1746698732601
+}
