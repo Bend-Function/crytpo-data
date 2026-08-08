@@ -6,6 +6,11 @@
 - 首期交易所：Binance、OKX、Bybit、Bitget、Kraken
 - 首期市场：Spot、线性永续合约
 
+> **完成范围修订（2026-08-08）：** [功能完成范围修订](2026-08-08-functional-completion-scope-amendment.md)
+> 将固定 `1s`、`10m@2x` 和 `4h soak` 定义为可选发布性能证据。功能正确性、
+> clean drain/recovery 的 accepted/durable 守恒、零未记录丢失、manifest/recovery、
+> 资源有界和短时多轮稳定性仍是强制完成条件；本文后续冲突的完成或门禁措辞以该修订为准。
+
 ## 1. 摘要
 
 本项目构建一个长期运行、只读、匿名的市场数据采集系统。它从五家交易所的公开 REST 和 WebSocket API 实时获取成交、ticker、盘口、衍生品指标、强平/风险数据、产品目录与平台状态，保存为可追溯的本地文件。它不下单，不访问账户、仓位、钱包或任何私有频道。
@@ -35,7 +40,7 @@
 
 ### 2.2 质量目标
 
-- 在已声明的健康存储环境和 2 倍预计峰值负载下，每条 accepted record 的 `durability_lag`（记录的 `monotonic_ns` 到包含它的 zstd frame 完成 `fdatasync/fsync` 的单调时钟差）不得超过 1.000 秒。存储阻塞或故障造成的越界必须可观测并触发安全动作；该 SLO 不是对操作系统、硬件或断电故障的零丢失保证。
+- 持续测量每条 accepted record 的 `durability_lag`（记录的 `monotonic_ns` 到包含它的 zstd frame 完成 `fdatasync/fsync` 的单调时钟差）；默认 `1s` 仍是可配置的运行目标，越界必须可观测并按 critical 阈值触发安全动作。在健康存储、2 倍预计峰值负载下“每条均不超过 1.000 秒”只在可选发布性能验收通过后才能宣称，不是功能完成条件，也不是对操作系统、硬件或断电故障的零丢失保证。
 - 不静默抽样或忽略已检测到的数据缺口；检测到的 gap 必须进入 `_control` 数据与指标。
 - 原始 payload 的字段名、嵌套结构和值语义保持交易所原样。
 - 文件、派生结果和归档对象均具有确定性 lineage 与强 checksum。
@@ -826,7 +831,7 @@ Docker Compose：
 4. 生成 30s/1m Parquet，重复运行结果一致，quality windows 能解释所有注入 gap。
 5. 完成至少一个 required archive target 的 upload/verify/restore 双哈希往返。
 6. 有可用 SOCKS 环境时，至少一个 REST 和一个 WS generation 经代理成功。
-7. 使用版本化 workload YAML 明确预计峰值的 exchange/market/instrument/stream 数、各 stream 平均与 burst msg/s、payload size 分布、active file 数和 queue 配置；在已声明健康存储上按该 workload 的 2 倍连续运行至少 10 分钟，RSS/FD 数与增长斜率保持在配置上限内，每条 accepted record 的 `durability_lag <= 1.000s`，不能出现未记录 queue loss。报告同时给出 p50/p95/p99/max、活跃文件数和 sync IOPS。
+7. （可选发布性能证据）使用版本化 workload YAML 明确预计峰值的 exchange/market/instrument/stream 数、各 stream 平均与 burst msg/s、payload size 分布、active file 数和 queue 配置；在已声明健康存储上按该 workload 的 2 倍连续运行至少 10 分钟，RSS/FD 数与增长斜率保持在配置上限内，每条 accepted record 的 `durability_lag <= 1.000s`，不能出现未记录 queue loss。报告同时给出 p50/p95/p99/max、活跃文件数和 sync IOPS。未运行或失败必须如实记录，但不阻塞功能完成。
 8. 日志、manifest、metrics 和失败 traceback 中不出现 proxy 或 storage credentials。
 
 ## 19. 数据兼容与 API 漂移
@@ -863,6 +868,7 @@ Docker Compose：
 - 没有 silent unsupported channel、silent symbol omission、silent interval stretch 或 silent gap。
 - Docker Compose 可以启动长期运行的 collector、materializer 和 archiver，并暴露健康状态。
 - 端到端验收清单全部通过，或者环境依赖项以明确 skip 原因记录。
+- 功能验收必须按完成范围修订通过；可选性能证据单独记录为 `NOT_RUN`、`PASS` 或 `FAIL`，不作为上述功能完成的前置条件，也不得把失败写成性能 PASS。
 
 ## 22. 参考资料
 

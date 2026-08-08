@@ -2,13 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist every accepted raw record into independently recoverable zstd frames, close immutable manifests, and prove the one-second durability SLO on the target storage before scaling connector work.
+**Goal:** Persist every accepted raw record into independently recoverable zstd frames, close immutable manifests, and prove required writer conservation/recovery and bounded short multi-round stability. Retain one-second target qualification as optional release performance evidence.
 
 **Architecture:** Each exchange worker owns one raw-writer service and one durability coordinator. Stream files buffer JSONL records independently, while the coordinator synchronizes all dirty files with bounded concurrency and records record-level durability lag without modifying raw rows.
 
 **Tech Stack:** asyncio, simplejson with Decimal, python-zstandard, portable `fdatasync/fsync`, Pydantic, Prometheus client, pytest, Hypothesis.
 
 ---
+
+> **Completion scope amendment (2026-08-08):** The approved
+> [`functional-completion scope amendment`](../specs/2026-08-08-functional-completion-scope-amendment.md)
+> overrides later wording that makes `1s` or `10m@2x` qualification a prerequisite for
+> connector expansion or project completion. Tasks 1-6, functional writer evidence,
+> manifests/recovery, zero unrecorded loss, bounded resources, lag/watchdog behavior,
+> and `PAUSED_WRITER` remain required. The retained target qualification machinery and
+> its strict PASS/FAIL semantics remain available but optional.
 
 ## Authoritative Contract Amendment (2026-08-01)
 

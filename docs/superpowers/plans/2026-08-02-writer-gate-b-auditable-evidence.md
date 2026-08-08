@@ -14,6 +14,14 @@ self-qualify; only the final acceptance receipt can set
 
 **Tech Stack:** Python 3.11, asyncio, Pydantic v2, ruamel.yaml, simplejson, zstandard, SQLite, Typer, pytest, Ruff, mypy, POSIX/Linux filesystem APIs, Docker/BuildKit, Git.
 
+> **Completion scope (2026-08-08):** The approved
+> [`functional-completion scope amendment`](../specs/2026-08-08-functional-completion-scope-amendment.md)
+> makes target qualification, fixed `1s`, and `10m@2x` results optional release
+> performance evidence. Keep this plan's benchmark, lag, watchdog, provenance, and
+> strict verifier behavior. Tasks needed for short functional conservation/recovery,
+> boundedness, and multi-round stability remain required; optional qualification work
+> does not block connector plans or functional project completion.
+
 ---
 
 ## Authority And Execution Rules
@@ -21,6 +29,8 @@ self-qualify; only the final acceptance receipt can set
 This plan supersedes only Task 7 in
 `docs/superpowers/plans/2026-07-31-durable-raw-storage.md`. The approved design is
 `docs/superpowers/specs/2026-08-02-writer-gate-b-auditable-evidence-design.md`.
+For project completion classification, the 2026-08-08 scope amendment takes
+precedence over both documents.
 Tasks 1-6 of Plan02 remain implemented at commit `4927ac1`; design commit `f640d93`
 is the base for this plan.
 
@@ -1330,7 +1340,7 @@ user is `65532:65532`; labels/provenance/workload match. If Docker is unavailabl
 record this gate as pending without reverting or withholding reviewed implementation
 commits. A build fix is a new implementation commit and restarts this step.
 
-### Task 10: Run Real Linux Qualification And Commit Disclosure Separately
+### Task 10: Optional Real Linux Release Qualification And Separate Disclosure
 
 **Files:**
 - Create after successful target run: `docs/operations/evidence/gate-b-disclosure-v1.json`
