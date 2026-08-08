@@ -1,0 +1,46 @@
+[
+  {
+    "exchange": "okx",
+    "market": "spot",
+    "instrument_key": "BTC-USDT",
+    "window_start_ns": 1800000000000000000,
+    "window_end_ns": 1800000060000000000,
+    "open": "10.1",
+    "high": "10.3",
+    "low": "10.1",
+    "close": "10.2",
+    "vwap": "10.183333333333333333333333333333333333",
+    "base_volume": "6",
+    "quote_volume": "61.1",
+    "buy_base_volume": "5",
+    "sell_base_volume": "1",
+    "unknown_base_volume": "0",
+    "signed_base_volume": "4",
+    "event_time_ratio": "1",
+    "trade_count": 3,
+    "normalized_record_count": 3,
+    "aggregated_record_count": 0,
+    "duplicate_input_count": 1,
+    "duplicate_match_count": 1,
+    "first_effective_trade_time_ns": 1800000001000000000,
+    "last_effective_trade_time_ns": 1800000035000000000,
+    "event_time_count": 3,
+    "receive_missing_count": 0,
+    "receive_outlier_count": 0,
+    "first_source_locator": {
+      "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "zero_based_record_index": 0,
+      "item_ordinal": 0
+    },
+    "last_source_locator": {
+      "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "zero_based_record_index": 0,
+      "item_ordinal": 0
+    },
+    "deduplication_mode": "stable_id",
+    "lineage_manifest_sha256s": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+  }
+]

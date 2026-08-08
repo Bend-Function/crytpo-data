@@ -743,10 +743,23 @@ class _NoCleanupProofResolver:
 
 
 class RawManifestReader:
-    def __init__(self, manifest_path: Path) -> None:
+    def __init__(
+        self,
+        manifest_path: Path,
+        *,
+        expected_manifest_sha256: str | None = None,
+    ) -> None:
         if not isinstance(manifest_path, Path):
             raise TypeError("manifest_path must be Path")
+        if expected_manifest_sha256 is not None and (
+            type(expected_manifest_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None
+        ):
+            raise ValueError(
+                "expected_manifest_sha256 must be a lowercase SHA-256 digest"
+            )
         self.manifest_path = _normalized_absolute_path(manifest_path)
+        self.expected_manifest_sha256 = expected_manifest_sha256
         self._loaded: LoadedRawManifest | None = None
         self._lease: SourceLease | None = None
         self._data_file: BinaryIO | None = None
@@ -769,6 +782,13 @@ class RawManifestReader:
         if self._lease is not None:
             raise RuntimeError("raw manifest reader is already entered")
         loaded = load_raw_manifest(self.manifest_path)
+        if (
+            self.expected_manifest_sha256 is not None
+            and loaded.sha256 != self.expected_manifest_sha256
+        ):
+            raise ManifestValidationError(
+                "raw manifest SHA-256 differs from the expected source identity"
+            )
         data_root = self._infer_data_root(loaded)
         data_path = data_root / loaded.manifest.data_relative_path
         lease = SourceLease.shared(lease_path_for_data(data_path))

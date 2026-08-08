@@ -25,3 +25,25 @@ def test_fingerprint_ignores_materializer_interval_order() -> None:
         second,
         capability_registry_sha256="c" * 64,
     )
+
+
+def test_fingerprint_includes_materializer_event_time_policy() -> None:
+    baseline = CollectorConfig.model_validate(BASE)
+    changed_past = CollectorConfig.model_validate(
+        BASE | {"materializer": {"max_past_skew": "8d"}}
+    )
+    changed_future = CollectorConfig.model_validate(
+        BASE | {"materializer": {"max_future_skew": "6m"}}
+    )
+    baseline_sha = config_sha256(
+        baseline,
+        capability_registry_sha256="c" * 64,
+    )
+
+    assert (
+        config_sha256(changed_past, capability_registry_sha256="c" * 64) != baseline_sha
+    )
+    assert (
+        config_sha256(changed_future, capability_registry_sha256="c" * 64)
+        != baseline_sha
+    )
