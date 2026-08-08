@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-09",
+  "entries": [
+    {
+      "file": "spot-instruments.json",
+      "sha256": "7786f00c249569050fc68b4ffdc7eed08a1110b9bb3226c01393e8d3c5a2484b",
+      "source_document": "docs/exchanges/bybit/sources/rest-instruments-info.html",
+      "source_document_sha256": "9c406149ffda01275648f13ecc8ff14d0c1c47d6e1cec7cffa7e8158ec211e89",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official Spot response shape without nextPageCursor, retaining exact decimal strings and a future field."
+    },
+    {
+      "file": "linear-trading-page-1.json",
+      "sha256": "a7bd242ee515aac66ba6ce0016dd92c0b146f55413c7ae5c2aef253611fbbf48",
+      "source_document": "docs/exchanges/bybit/sources/rest-instruments-info.html",
+      "source_document_sha256": "9c406149ffda01275648f13ecc8ff14d0c1c47d6e1cec7cffa7e8158ec211e89",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official LinearPerpetual fields plus non-USDT and non-perpetual rows proving scoped filtering before unrelated lifecycle validation."
+    },
+    {
+      "file": "linear-trading-page-2.json",
+      "sha256": "e621b408c3db5555d9378f7e2e369964a261774c4648b8d78800b3f2346f1390",
+      "source_document": "docs/exchanges/bybit/sources/rest-instruments-info.html",
+      "source_document_sha256": "9c406149ffda01275648f13ecc8ff14d0c1c47d6e1cec7cffa7e8158ec211e89",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Terminal Trading page with an observed-before-capture launch time and explicit non-prelisting lifecycle fields."
+    },
+    {
+      "file": "linear-prelaunch.json",
+      "sha256": "cfe7b05f09e132cb84c5d814c4d6524799d5d006b27b27d0a239619e5f463f1e",
+      "source_document": "docs/exchanges/bybit/sources/rest-instruments-info.html",
+      "source_document_sha256": "9c406149ffda01275648f13ecc8ff14d0c1c47d6e1cec7cffa7e8158ec211e89",
+      "source_anchor": "#response-example",
+      "adaptation": "Official PreLaunch preListingInfo phases with an explicit ContinuousTrading start and terminal cursor."
+    },
+    {
+      "file": "ticker-sparse.json",
+      "sha256": "faf4839ef4d56dde0caa88596d447dd003a8b3c648450e28720e5981e006c6ad",
+      "source_document": "docs/exchanges/bybit/sources/rest-tickers.html",
+      "source_document_sha256": "260be428e16a709f59c8dd81cd5482e7274c0acc0f5faa3c9ce2a9dc3c9cd1cd",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Documented sparse ticker fields with high-precision decimal strings and no synthesized derivative fields."
+    },
+    {
+      "file": "book-standard-rest.json",
+      "sha256": "7dcbd882215feaeeb22a8332947b5318605e62ce5c2a3bc2dad3ed46fd340091",
+      "source_document": "docs/exchanges/bybit/sources/rest-orderbook.html",
+      "source_document_sha256": "1d25265f09c714ae07ca5d4dc66b1f4a99e7e863cd1ddcd3ba64e1e5097e8db1",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official standard REST snapshot fields with exact two-string levels and a future field."
+    },
+    {
+      "file": "book-rpi-rest.json",
+      "sha256": "2abd014e27982332ac2d46472947d7e582a7f2d46c2dcee8c27885aa03877043",
+      "source_document": "docs/exchanges/bybit/sources/rest-rpi-orderbook.html",
+      "source_document_sha256": "b48d15bdd259db9a0939002d0bac85a47b451e9348c89d71c099acbe99fb818c",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official RPI REST snapshot shape with exact three-string levels."
+    },
+    {
+      "file": "book-full-rest.json",
+      "sha256": "ce2820c9444b064a9f576c4c56a64790cbdbb51da2f113c19e8afa3fd22557f1",
+      "source_document": "docs/exchanges/bybit/sources/rest-full-orderbook.html",
+      "source_document_sha256": "e49d7a733980c96e9be97b241234e84def40e170e40c66b650035fde6262abce",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official full-order-book REST bootstrap shape reduced to exact representative levels."
+    },
+    {
+      "file": "recent-trades.json",
+      "sha256": "a9403189ba5533d01815a43092524a92b3e4875a72d37c4d68342ab348dbea9b",
+      "source_document": "docs/exchanges/bybit/sources/rest-recent-trades.html",
+      "source_document_sha256": "6064db478061400e46c41dd7f5481a60ec79829115d6443e658c703ecb22d794",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official public trade shape including block and RPI flags with exact decimal strings."
+    },
+    {
+      "file": "kline.json",
+      "sha256": "3d4447feb204c0c7c3df0d486680ed0d8e72e293dbee5495584bae3ecb8524d4",
+      "source_document": "docs/exchanges/bybit/sources/rest-kline.html",
+      "source_document_sha256": "86b521c8d4cca2f9901cefc7cebc5e2ce969f7b5a1820547b732bfb3f7456816",
+      "source_anchor": "#response-parameters",
+      "adaptation": "Official seven-string OHLCV/turnover row retaining decimal precision."
+    },
+    {
+      "file": "book-standard.json",
+      "sha256": "3de15ccebbc597b0189cd7bfef431f2a60c75bec55fdca1a08f47816e1e5069c",
+      "source_document": "docs/exchanges/bybit/sources/ws-orderbook.html",
+      "source_document_sha256": "9c806ce0622aa25ea8ce7697e76ace8e59a981fdc515be124c869789d5ab1f23",
+      "source_anchor": "#response-example",
+      "adaptation": "Official standard WebSocket snapshot, delta, reset, and level-one heartbeat shapes with exact decimal strings."
+    },
+    {
+      "file": "book-full-ws.json",
+      "sha256": "6e2d4c4fe9148fce070c2c559e313083ce725e5acba3b7053c4c07ddcb6f8296",
+      "source_document": "docs/exchanges/bybit/sources/ws-full-orderbook.html",
+      "source_document_sha256": "9795de21b134bc890cb7c2fa3cc270401184eacaa4748551395bf60be382183e",
+      "source_anchor": "#response-example",
+      "adaptation": "Official full-depth WebSocket handoff and subsequent delta shape with sequence evidence."
+    },
+    {
+      "file": "ws-session.jsonl",
+      "sha256": "2bd650ef2ebd97536856ba5860272ea7096ed8b37ad89a4ce041d80e282fe59c",
+      "source_document": "docs/exchanges/bybit/sources/ws-connect.html",
+      "source_document_sha256": "7ea48dbde7db55aaf44a66cf85f0f5370865e5acd2e5503aebe677419365c17a",
+      "source_anchor": "#how-to-send-the-heartbeat-packet",
+      "adaptation": "Exact JSONL session sequence covering subscribe acknowledgements, public data, and application heartbeat acknowledgement."
+    }
+  ]
+}

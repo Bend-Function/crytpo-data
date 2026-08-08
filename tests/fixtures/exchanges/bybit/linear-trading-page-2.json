@@ -1,0 +1,23 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "symbol": "LIVEUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "LIVE",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1786247000000",
+        "isPreListing": false,
+        "preListingInfo": null
+      }
+    ],
+    "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1786248002000
+}

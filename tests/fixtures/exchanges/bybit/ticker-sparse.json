@@ -1,0 +1,17 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "spot",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "lastPrice": "100000.123456789012345678",
+        "turnover24h": "123456789.987654321012345678",
+        "futureTickerField": {"keep": true}
+      }
+    ]
+  },
+  "retExtInfo": {},
+  "time": 1786248010000
+}

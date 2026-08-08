@@ -15,10 +15,13 @@ REST_URL = "https://api.bybit.com/v5/market/orderbook"
 SPOT_WS_URL = "wss://stream.bybit.com/v5/public/spot"
 SYMBOL = "BTCUSDT"
 
-pytestmark = pytest.mark.skipif(
-    not RUN_LIVE,
-    reason="set RUN_LIVE_API_TESTS=1 to call Bybit's public API",
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not RUN_LIVE,
+        reason="set RUN_LIVE_API_TESTS=1 to call Bybit's public API",
+    ),
+]
 
 
 def test_spot_orderbook_rest_is_public() -> None:

@@ -1,0 +1,57 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "symbol": "NEWUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "PreLaunch",
+        "baseCoin": "NEW",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1786248300000",
+        "isPreListing": true,
+        "preListingInfo": {
+          "curAuctionPhase": "CallAuction",
+          "phases": [
+            {
+              "phase": "CallAuction",
+              "startTime": "1786248000000",
+              "endTime": "1786248300000"
+            },
+            {
+              "phase": "ContinuousTrading",
+              "startTime": "1786248600000",
+              "endTime": ""
+            }
+          ]
+        }
+      },
+      {
+        "symbol": "ONLYUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "PreLaunch",
+        "baseCoin": "ONLY",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1786250000000",
+        "isPreListing": true,
+        "preListingInfo": {
+          "curAuctionPhase": "CallAuction",
+          "phases": [
+            {
+              "phase": "ContinuousTrading",
+              "startTime": "1786250300000",
+              "endTime": ""
+            }
+          ]
+        }
+      }
+    ],
+    "nextPageCursor": ""
+  },
+  "retExtInfo": {},
+  "time": 1786248003000
+}
