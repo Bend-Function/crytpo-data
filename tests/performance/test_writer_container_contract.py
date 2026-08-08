@@ -304,9 +304,9 @@ def test_runbook_freezes_the_evidence_command_order() -> None:
     offsets = _ordered_offsets(
         runbook,
         (
-            "## 2. Reproduce The Collector Image",
+            "## 2. Optional: Reproduce The Collector Image",
             "## 3. Declare The Target",
-            "## 4. Run The Qualification Writer",
+            "## 4. Optional: Run The Qualification Writer",
             "## 5. Verify Runtime In A Fresh Container",
             "## 6. Build The Private File Inventory",
             "## 7. Archive Private Immutable Evidence",
@@ -351,9 +351,9 @@ def test_runbook_retains_containers_until_host_provenance_inspection() -> None:
 
 def test_runbook_hard_limits_writer_memory_and_proves_the_retained_config() -> None:
     runbook = _read_required(RUNBOOK)
-    writer_section = runbook.split("## 4. Run The Qualification Writer", maxsplit=1)[
-        1
-    ].split("## 5. Verify Runtime In A Fresh Container", maxsplit=1)[0]
+    writer_section = runbook.split(
+        "## 4. Optional: Run The Qualification Writer", maxsplit=1
+    )[1].split("## 5. Verify Runtime In A Fresh Container", maxsplit=1)[0]
 
     assert writer_section.count("--memory 4g") == 1
     assert writer_section.count("--memory-swap 4g") == 1
