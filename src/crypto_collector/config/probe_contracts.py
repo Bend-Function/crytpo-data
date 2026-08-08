@@ -133,11 +133,45 @@ class PublicTimeProbe:
 
 
 @dataclass(frozen=True, slots=True)
+class TransportReachabilityProbe:
+    transport: Literal["http", "websocket"]
+    endpoint_role: str
+    reachable: bool
+    observed_at_ns: int
+    raw_reference: str
+
+    def __post_init__(self) -> None:
+        if type(self.transport) is not str or self.transport not in {
+            "http",
+            "websocket",
+        }:
+            raise ValueError("transport must be http or websocket")
+        object.__setattr__(
+            self,
+            "endpoint_role",
+            _nonempty(self.endpoint_role, field="endpoint_role"),
+        )
+        if type(self.reachable) is not bool:
+            raise TypeError("reachable must be a boolean")
+        object.__setattr__(
+            self,
+            "observed_at_ns",
+            _integer(self.observed_at_ns, field="observed_at_ns"),
+        )
+        object.__setattr__(
+            self,
+            "raw_reference",
+            _nonempty(self.raw_reference, field="raw_reference"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EgressReachabilityProbe:
     egress_id: str
     reachable: bool
     observed_at_ns: int
     raw_reference: str
+    transports: tuple[TransportReachabilityProbe, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -154,6 +188,55 @@ class EgressReachabilityProbe:
             self,
             "raw_reference",
             _nonempty(self.raw_reference, field="raw_reference"),
+        )
+        if type(self.transports) is not tuple or any(
+            type(item) is not TransportReachabilityProbe for item in self.transports
+        ):
+            raise TypeError("transports must be a tuple of TransportReachabilityProbe")
+        keys = tuple((item.transport, item.endpoint_role) for item in self.transports)
+        if len(set(keys)) != len(keys):
+            raise ValueError("transport reachability keys must be unique")
+        if self.transports:
+            kinds = {item.transport for item in self.transports}
+            if kinds != {"http", "websocket"}:
+                raise ValueError(
+                    "detailed reachability must include HTTP and WebSocket evidence"
+                )
+            if self.reachable is not all(item.reachable for item in self.transports):
+                raise ValueError(
+                    "egress reachable must equal all detailed transport evidence"
+                )
+            if self.observed_at_ns != max(
+                item.observed_at_ns for item in self.transports
+            ):
+                raise ValueError(
+                    "egress observed_at_ns must equal the latest transport observation"
+                )
+        object.__setattr__(
+            self,
+            "transports",
+            tuple(
+                sorted(
+                    self.transports,
+                    key=lambda item: (item.transport, item.endpoint_role),
+                )
+            ),
+        )
+
+    @property
+    def http_reachable(self) -> bool:
+        if not self.transports:
+            return self.reachable
+        return all(
+            item.reachable for item in self.transports if item.transport == "http"
+        )
+
+    @property
+    def websocket_reachable(self) -> bool:
+        if not self.transports:
+            return self.reachable
+        return all(
+            item.reachable for item in self.transports if item.transport == "websocket"
         )
 
 
@@ -235,10 +318,12 @@ class EndpointBudgetProbe:
 @dataclass(frozen=True, slots=True, init=False)
 class EndpointWork:
     logical_endpoint: str
-    kind: Literal["deep_snapshot"]
-    depth: int | Literal["max_supported"]
+    kind: Literal["deep_snapshot", "periodic_reference"]
+    depth: int | Literal["max_supported"] | None
     cost: Decimal
     jobs_per_instrument: int
+    jobs_per_market: int
+    requested_interval_ns: int | None
     observed_at_ns: int
     raw_reference: str
 
@@ -248,8 +333,10 @@ class EndpointWork:
         cost: Decimal,
         *,
         jobs_per_instrument: int,
-        kind: Literal["deep_snapshot"] = "deep_snapshot",
-        depth: int | Literal["max_supported"] = "max_supported",
+        jobs_per_market: int = 0,
+        kind: Literal["deep_snapshot", "periodic_reference"] = "deep_snapshot",
+        depth: int | Literal["max_supported"] | None = None,
+        requested_interval_ns: int | None = None,
         observed_at_ns: int,
         raw_reference: str,
     ) -> None:
@@ -258,10 +345,29 @@ class EndpointWork:
             "logical_endpoint",
             _nonempty(logical_endpoint, field="logical_endpoint"),
         )
-        if type(kind) is not str or kind != "deep_snapshot":
-            raise ValueError("endpoint work kind must be deep_snapshot")
-        if depth != "max_supported":
-            depth = _integer(depth, field="endpoint work depth", minimum=1)
+        if type(kind) is not str or kind not in {
+            "deep_snapshot",
+            "periodic_reference",
+        }:
+            raise ValueError(
+                "endpoint work kind must be deep_snapshot or periodic_reference"
+            )
+        if kind == "deep_snapshot":
+            depth = "max_supported" if depth is None else depth
+            if depth != "max_supported":
+                depth = _integer(depth, field="endpoint work depth", minimum=1)
+            if requested_interval_ns is not None:
+                raise ValueError(
+                    "deep snapshot workload cadence comes from effective config"
+                )
+        else:
+            if depth is not None:
+                raise ValueError("periodic reference workload must not declare depth")
+            requested_interval_ns = _integer(
+                requested_interval_ns,
+                field="periodic reference requested_interval_ns",
+                minimum=1,
+            )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "depth", depth)
         object.__setattr__(
@@ -272,12 +378,22 @@ class EndpointWork:
         object.__setattr__(
             self,
             "jobs_per_instrument",
-            _integer(
-                jobs_per_instrument,
-                field="jobs_per_instrument",
-                minimum=1,
-            ),
+            _integer(jobs_per_instrument, field="jobs_per_instrument"),
         )
+        object.__setattr__(
+            self,
+            "jobs_per_market",
+            _integer(jobs_per_market, field="jobs_per_market"),
+        )
+        if self.jobs_per_instrument == 0 and self.jobs_per_market == 0:
+            raise ValueError("endpoint work must schedule a positive number of jobs")
+        if kind == "deep_snapshot" and (
+            self.jobs_per_instrument == 0 or self.jobs_per_market != 0
+        ):
+            raise ValueError(
+                "deep snapshot work must schedule only per-instrument jobs"
+            )
+        object.__setattr__(self, "requested_interval_ns", requested_interval_ns)
         object.__setattr__(
             self,
             "observed_at_ns",
@@ -497,6 +613,7 @@ class ProbeRequest:
     exchange: Exchange
     markets: tuple[CatalogScope, ...]
     egress_ids: tuple[str, ...]
+    initial_lookback_ns: Mapping[tuple[Market, str | None], int]
     config_sha256: str
     observed_at_ns: int
     date_gates: tuple[DateGateRequest, ...] = ()
@@ -520,6 +637,54 @@ class ProbeRequest:
             raise TypeError("egress_ids must be a tuple of strings")
         if len(set(self.egress_ids)) != len(self.egress_ids):
             raise ValueError("egress_ids must be unique")
+        if not isinstance(self.initial_lookback_ns, Mapping):
+            raise TypeError("initial_lookback_ns must be a mapping")
+        requested_markets = {item.market for item in self.markets}
+        normalized_lookbacks: dict[tuple[Market, str | None], int] = {}
+        for key, value in self.initial_lookback_ns.items():
+            if (
+                type(key) is not tuple
+                or len(key) != 2
+                or type(key[0]) is not Market
+                or (key[1] is not None and (type(key[1]) is not str or not key[1]))
+            ):
+                raise TypeError(
+                    "initial_lookback_ns keys must be "
+                    "(Market, instrument_key | None) tuples"
+                )
+            if key[0] not in requested_markets:
+                raise ValueError(
+                    "initial_lookback_ns keys must belong to requested markets"
+                )
+            normalized_lookbacks[key] = _integer(
+                value,
+                field="initial_lookback_ns value",
+            )
+        base_markets = {
+            market
+            for market, instrument_key in normalized_lookbacks
+            if instrument_key is None
+        }
+        if base_markets != requested_markets:
+            raise ValueError(
+                "initial_lookback_ns must define a market-level fallback for "
+                "every requested market"
+            )
+        object.__setattr__(
+            self,
+            "initial_lookback_ns",
+            MappingProxyType(
+                dict(
+                    sorted(
+                        normalized_lookbacks.items(),
+                        key=lambda item: (
+                            item[0][0].value,
+                            "" if item[0][1] is None else item[0][1],
+                        ),
+                    )
+                )
+            ),
+        )
         object.__setattr__(
             self,
             "config_sha256",
@@ -542,7 +707,6 @@ class ProbeRequest:
             "date_gates",
             tuple(sorted(self.date_gates, key=lambda item: item.feature_id)),
         )
-        requested_markets = {item.market for item in self.markets}
         if any(
             not set(item.markets).issubset(requested_markets)
             for item in self.date_gates
@@ -550,6 +714,22 @@ class ProbeRequest:
             raise ValueError(
                 "date gate request markets must belong to the probe request"
             )
+
+    def initial_lookback_for(
+        self,
+        market: Market,
+        instrument_key: str,
+    ) -> int:
+        if type(market) is not Market:
+            raise TypeError("market must be Market")
+        key = _nonempty(instrument_key, field="instrument_key")
+        try:
+            return self.initial_lookback_ns.get(
+                (market, key),
+                self.initial_lookback_ns[(market, None)],
+            )
+        except KeyError:
+            raise ValueError("market does not belong to the probe request") from None
 
 
 class ProbeProvider(Protocol):
@@ -613,7 +793,7 @@ class ProbeShard:
 @dataclass(frozen=True, slots=True)
 class ProbeIntervalCohort:
     logical_endpoint: str
-    depth: int | Literal["max_supported"]
+    depth: int | Literal["max_supported"] | None
     instrument_keys: tuple[str, ...]
     plan: IntervalPlan
 
@@ -623,7 +803,7 @@ class ProbeIntervalCohort:
             "logical_endpoint",
             _nonempty(self.logical_endpoint, field="cohort logical_endpoint"),
         )
-        if self.depth != "max_supported":
+        if self.depth is not None and self.depth != "max_supported":
             object.__setattr__(
                 self,
                 "depth",
@@ -633,10 +813,10 @@ class ProbeIntervalCohort:
             type(item) is not str or not item for item in self.instrument_keys
         ):
             raise TypeError("cohort instrument_keys must be a tuple of strings")
-        if not self.instrument_keys or self.instrument_keys != tuple(
-            sorted(set(self.instrument_keys))
-        ):
+        if self.instrument_keys != tuple(sorted(set(self.instrument_keys))):
             raise ValueError("cohort instrument_keys must be sorted and unique")
+        if self.depth is not None and not self.instrument_keys:
+            raise ValueError("deep snapshot cohort instrument_keys must be non-empty")
         if type(self.plan) is not IntervalPlan:
             raise TypeError("cohort plan must be IntervalPlan")
 
@@ -645,7 +825,7 @@ class ProbeIntervalCohort:
 class ProbeRestCapacityRejection:
     instrument_key: str
     logical_endpoint: str
-    depth: int | Literal["max_supported"]
+    depth: int | Literal["max_supported"] | None
     requested_interval_ns: int
     cost: Decimal
     jobs_per_instrument: int
@@ -668,7 +848,7 @@ class ProbeRestCapacityRejection:
             "logical_endpoint",
             _nonempty(self.logical_endpoint, field="REST rejection logical_endpoint"),
         )
-        if self.depth != "max_supported":
+        if self.depth is not None and self.depth != "max_supported":
             object.__setattr__(
                 self,
                 "depth",
@@ -1034,7 +1214,7 @@ class _ConnectionReservation:
 class _IntervalDemand:
     scope: CatalogScope
     logical_endpoint: str
-    depth: int | Literal["max_supported"]
+    depth: int | Literal["max_supported"] | None
     instrument_keys: tuple[str, ...]
     requested_ns: int
     policy: str
@@ -1185,6 +1365,11 @@ class ProbeEngine:
                 exchange=exchange,
                 markets=scopes,
                 egress_ids=tuple(item.id for item in config.network.egress_pool),
+                initial_lookback_ns=self._initial_lookback_policy(
+                    bundle,
+                    exchange_id=exchange_id,
+                    scopes=scopes,
+                ),
                 config_sha256=bundle.config_sha256,
                 observed_at_ns=request_started_at_ns,
                 date_gates=self._date_gate_requests(
@@ -1260,6 +1445,32 @@ class ProbeEngine:
         )
 
     @staticmethod
+    def _initial_lookback_policy(
+        bundle: ConfigBundle,
+        *,
+        exchange_id: str,
+        scopes: tuple[CatalogScope, ...],
+    ) -> Mapping[tuple[Market, str | None], int]:
+        exchange_config = bundle.config.exchanges[exchange_id]
+        policy: dict[tuple[Market, str | None], int] = {}
+        for scope in scopes:
+            market_id = scope.market.value
+            policy[(scope.market, None)] = effective_scope(
+                bundle.config,
+                exchange_id,
+                market_id,
+            ).selection.new_listings.initial_lookback_ns
+            market_config = exchange_config.markets[market_id]
+            for instrument_key in sorted(market_config.symbols):
+                policy[(scope.market, instrument_key)] = effective_scope(
+                    bundle.config,
+                    exchange_id,
+                    market_id,
+                    instrument_key,
+                ).selection.new_listings.initial_lookback_ns
+        return MappingProxyType(policy)
+
+    @staticmethod
     def _date_gate_requests(
         bundle: ConfigBundle,
         *,
@@ -1317,6 +1528,11 @@ class ProbeEngine:
         timestamps = [
             evidence.public_time.observed_at_ns,
             *(item.observed_at_ns for item in evidence.egresses),
+            *(
+                transport.observed_at_ns
+                for item in evidence.egresses
+                for transport in item.transports
+            ),
             *(item.observed_at_ns for item in evidence.endpoint_budgets),
             *(item.observed_at_ns for item in evidence.date_gates),
         ]
@@ -1397,9 +1613,20 @@ class ProbeEngine:
             else:
                 disabled_optional.append(requested_gate.feature_id)
 
-        reachable = frozenset(
-            item.egress_id for item in evidence.egresses if item.reachable
+        websocket_reachable = frozenset(
+            item.egress_id for item in evidence.egresses if item.websocket_reachable
         )
+        http_reachable = frozenset(
+            item.egress_id for item in evidence.egresses if item.http_reachable
+        )
+        if not websocket_reachable:
+            failures.append(
+                ProbeFailure(
+                    exchange=exchange,
+                    code="websocket_unavailable",
+                    message="no requested egress passed required WebSocket probes",
+                )
+            )
         drafts: dict[CatalogScope, _MarketDraft] = {}
         for scope in request.markets:
             item = market_evidence.get(scope.market)
@@ -1417,7 +1644,7 @@ class ProbeEngine:
                 drafts[scope] = self._prepare_market(
                     bundle,
                     item,
-                    reachable,
+                    websocket_reachable,
                     now_ns=observed_at_ns,
                 )
             except FixedPairResolutionError as error:
@@ -1453,12 +1680,12 @@ class ProbeEngine:
             total_connections = sum(
                 item.max_ws_connections
                 for item in bundle.config.network.egress_pool
-                if item.id in reachable
+                if item.id in websocket_reachable
             )
             healthy_egresses = tuple(
                 item
                 for item in bundle.config.network.egress_pool
-                if item.id in reachable
+                if item.id in websocket_reachable
             )
             active_drafts = dict(drafts)
             rest_rejections: defaultdict[
@@ -1540,7 +1767,7 @@ class ProbeEngine:
                             drafts=active_drafts,
                             reports=candidate_reports,
                             endpoint_budgets=evidence.endpoint_budgets,
-                            reachable=reachable,
+                            reachable=http_reachable,
                         )
                     except _RestCapacityReduction as reduction:
                         rest_rejections[reduction.scope][
@@ -1948,14 +2175,40 @@ class ProbeEngine:
             work_cohorts: defaultdict[
                 tuple[
                     str,
-                    int | Literal["max_supported"],
+                    int | Literal["max_supported"] | None,
                     int,
                     str,
                     Decimal,
                     int,
+                    int,
                 ],
                 list[str],
             ] = defaultdict(list)
+            for work in draft.evidence.endpoint_work:
+                if work.kind != "periodic_reference" or work.jobs_per_market == 0:
+                    continue
+                requested_interval_ns = (
+                    draft.scope_config.selection.refresh_interval_ns
+                    if work.logical_endpoint == "instruments"
+                    else work.requested_interval_ns
+                )
+                if requested_interval_ns is None:  # pragma: no cover - model validates.
+                    raise _IntervalAllocationError(
+                        "endpoint_work_unavailable",
+                        "periodic reference workload has no requested interval",
+                        (scope,),
+                    )
+                work_cohorts[
+                    (
+                        work.logical_endpoint,
+                        None,
+                        requested_interval_ns,
+                        "stretch_with_warning",
+                        work.cost,
+                        work.jobs_per_instrument,
+                        work.jobs_per_market,
+                    )
+                ]
             for instrument_key in report.admission.admitted:
                 books = effective_scope(
                     bundle.config,
@@ -1963,29 +2216,53 @@ class ProbeEngine:
                     scope.market.value,
                     instrument_key,
                 ).books.deep_snapshot
-                if not books.enabled:
-                    continue
-                matching_work = tuple(
-                    work
-                    for work in draft.evidence.endpoint_work
-                    if work.kind == "deep_snapshot" and work.depth == books.depth
-                )
-                if not matching_work:
-                    raise _IntervalAllocationError(
-                        "endpoint_work_unavailable",
-                        "enabled deep snapshot has no matching provider workload "
-                        f"for depth {books.depth}",
-                        (scope,),
+                if books.enabled:
+                    matching_work = tuple(
+                        work
+                        for work in draft.evidence.endpoint_work
+                        if work.kind == "deep_snapshot"
+                        and (work.depth == books.depth or work.depth == "max_supported")
                     )
-                for work in matching_work:
+                    if not matching_work:
+                        raise _IntervalAllocationError(
+                            "endpoint_work_unavailable",
+                            "enabled deep snapshot has no matching provider workload "
+                            f"for depth {books.depth}",
+                            (scope,),
+                        )
+                    for work in matching_work:
+                        work_cohorts[
+                            (
+                                work.logical_endpoint,
+                                books.depth,
+                                books.requested_interval_ns,
+                                books.overload_policy,
+                                work.cost,
+                                work.jobs_per_instrument,
+                                work.jobs_per_market,
+                            )
+                        ].append(instrument_key)
+                for work in draft.evidence.endpoint_work:
+                    if (
+                        work.kind != "periodic_reference"
+                        or work.jobs_per_instrument == 0
+                    ):
+                        continue
+                    if work.requested_interval_ns is None:  # pragma: no cover
+                        raise _IntervalAllocationError(
+                            "endpoint_work_unavailable",
+                            "periodic reference workload has no requested interval",
+                            (scope,),
+                        )
                     work_cohorts[
                         (
                             work.logical_endpoint,
-                            books.depth,
-                            books.requested_interval_ns,
-                            books.overload_policy,
+                            None,
+                            work.requested_interval_ns,
+                            "stretch_with_warning",
                             work.cost,
                             work.jobs_per_instrument,
+                            work.jobs_per_market,
                         )
                     ].append(instrument_key)
             for (
@@ -1995,6 +2272,7 @@ class ProbeEngine:
                 policy,
                 cost,
                 jobs_per_instrument,
+                jobs_per_market,
             ), instrument_keys in sorted(
                 work_cohorts.items(),
                 key=lambda item: (
@@ -2012,7 +2290,9 @@ class ProbeEngine:
                         instrument_keys=normalized_keys,
                         requested_ns=requested_ns,
                         policy=policy,
-                        jobs=len(normalized_keys) * jobs_per_instrument,
+                        jobs=(
+                            len(normalized_keys) * jobs_per_instrument + jobs_per_market
+                        ),
                         jobs_per_instrument=jobs_per_instrument,
                         cost=cost,
                     )
@@ -2279,4 +2559,5 @@ __all__ = [
     "ProbeRestCapacityRejection",
     "ProbeShard",
     "PublicTimeProbe",
+    "TransportReachabilityProbe",
 ]
