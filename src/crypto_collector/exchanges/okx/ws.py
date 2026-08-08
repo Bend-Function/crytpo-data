@@ -30,31 +30,73 @@ OKX_WS_OPERATION_LIMIT_PER_HOUR = 480
 
 _PUBLIC_PATH = "/ws/v5/public"
 _BUSINESS_PATH = "/ws/v5/business"
-_PUBLIC_CHANNELS = frozenset(
+_PUBLIC_SYMBOL_CHANNELS = frozenset(
     {
-        "adl-warning",
         "bbo-tbt",
         "books",
         "books-rpi",
         "books5",
         "funding-rate",
         "index-tickers",
-        "instruments",
-        "liquidation-orders",
         "mark-price",
         "open-interest",
         "price-limit",
-        "status",
         "tickers",
         "trades",
     }
 )
-_BUSINESS_CHANNEL = re.compile(
-    r"(?:trades-all|(?:candle|index-candle|mark-price-candle)[A-Za-z0-9]+)\Z"
+_PUBLIC_MARKET_CHANNELS = frozenset(
+    {"adl-warning", "instruments", "liquidation-orders", "status"}
 )
+_PUBLIC_CHANNELS = _PUBLIC_SYMBOL_CHANNELS | _PUBLIC_MARKET_CHANNELS
+_COMMON_CANDLE_BARS = frozenset(
+    {
+        "3M",
+        "1M",
+        "1W",
+        "1D",
+        "2D",
+        "3D",
+        "5D",
+        "12H",
+        "6H",
+        "4H",
+        "2H",
+        "1H",
+        "30m",
+        "15m",
+        "5m",
+        "3m",
+        "1m",
+    }
+)
+_UTC_CANDLE_BARS = frozenset(
+    {
+        "3Mutc",
+        "1Mutc",
+        "1Wutc",
+        "1Dutc",
+        "2Dutc",
+        "3Dutc",
+        "5Dutc",
+        "12Hutc",
+        "6Hutc",
+    }
+)
+_BUSINESS_CANDLE_CHANNELS = frozenset(
+    {
+        *(f"candle{bar}" for bar in _COMMON_CANDLE_BARS | _UTC_CANDLE_BARS),
+        "candle1s",
+        *(f"index-candle{bar}" for bar in _COMMON_CANDLE_BARS | _UTC_CANDLE_BARS),
+        *(f"mark-price-candle{bar}" for bar in _COMMON_CANDLE_BARS | _UTC_CANDLE_BARS),
+        "mark-price-candle1Yutc",
+    }
+)
+_BUSINESS_CHANNELS = _BUSINESS_CANDLE_CHANNELS | frozenset({"trades-all"})
 _REQUEST_ID = re.compile(r"[A-Za-z0-9]{1,32}\Z")
 _RESERVED_ARGUMENT_FIELDS = frozenset({"channel", "instId"})
 _INCREMENTAL_BOOK_CHANNELS = frozenset({"books", "books-rpi"})
+_SUPPORTED_INSTRUMENT_TYPES = frozenset({"SPOT", "SWAP"})
 
 
 class OkxWsProtocolError(ValueError):
@@ -342,8 +384,67 @@ def _validate_channel(subscription: WebSocketSubscription) -> None:
     if path == _PUBLIC_PATH:
         if channel not in _PUBLIC_CHANNELS:
             raise ValueError("channel is not allowed on the OKX public endpoint")
-    elif _BUSINESS_CHANNEL.fullmatch(channel) is None:
+    elif channel not in _BUSINESS_CHANNELS:
         raise ValueError("channel is not allowed on the OKX business endpoint")
+
+
+def _reject_reserved_params(subscription: WebSocketSubscription) -> None:
+    for key in subscription.params:
+        if key in _RESERVED_ARGUMENT_FIELDS:
+            raise ValueError(f"subscription params must not replace {key}")
+
+
+def _require_no_params(subscription: WebSocketSubscription) -> None:
+    if subscription.params:
+        raise ValueError(f"{subscription.channel} does not accept subscription params")
+
+
+def _require_market_scope(subscription: WebSocketSubscription) -> None:
+    if subscription.wire_symbol is not None:
+        raise ValueError(f"{subscription.channel} must not contain instId")
+
+
+def _inst_type_argument(
+    subscription: WebSocketSubscription,
+    *,
+    allowed: frozenset[str],
+) -> dict[str, JsonPayload]:
+    _require_market_scope(subscription)
+    if set(subscription.params) != {"instType"}:
+        raise ValueError(f"{subscription.channel} requires only instType")
+    inst_type = subscription.params["instType"]
+    if type(inst_type) is not str:
+        raise TypeError(f"{subscription.channel} instType must be a string")
+    if inst_type not in allowed:
+        expected = " or ".join(sorted(allowed))
+        raise ValueError(f"{subscription.channel} instType must be {expected}")
+    return {"channel": subscription.channel, "instType": inst_type}
+
+
+def _adl_warning_argument(
+    subscription: WebSocketSubscription,
+) -> dict[str, JsonPayload]:
+    _require_market_scope(subscription)
+    keys = set(subscription.params)
+    if "instType" not in keys or not keys <= {"instType", "instFamily"}:
+        raise ValueError("adl-warning requires instType and optional instFamily")
+    inst_type = subscription.params["instType"]
+    if type(inst_type) is not str:
+        raise TypeError("adl-warning instType must be a string")
+    if inst_type != "SWAP":
+        raise ValueError("adl-warning instType must be SWAP")
+    argument: dict[str, JsonPayload] = {
+        "channel": subscription.channel,
+        "instType": inst_type,
+    }
+    if "instFamily" in subscription.params:
+        family = subscription.params["instFamily"]
+        if type(family) is not str:
+            raise TypeError("adl-warning instFamily must be a string")
+        if not family:
+            raise ValueError("adl-warning instFamily must be non-empty")
+        argument["instFamily"] = family
+    return argument
 
 
 def subscription_argument(
@@ -352,16 +453,28 @@ def subscription_argument(
     if type(subscription) is not WebSocketSubscription:
         raise TypeError("subscription must be WebSocketSubscription")
     _validate_channel(subscription)
-    argument: dict[str, JsonPayload] = {"channel": subscription.channel}
-    if subscription.wire_symbol is not None:
-        argument["instId"] = subscription.wire_symbol
-    for key, value in subscription.params.items():
-        if key in _RESERVED_ARGUMENT_FIELDS:
-            raise ValueError(f"subscription params must not replace {key}")
-        if type(value) not in {str, int, bool}:
-            raise TypeError("OKX WebSocket subscription params must be scalar values")
-        argument[key] = cast(str | int | bool, value)
-    return argument
+    _reject_reserved_params(subscription)
+    if subscription.channel == "instruments":
+        return _inst_type_argument(
+            subscription,
+            allowed=_SUPPORTED_INSTRUMENT_TYPES,
+        )
+    if subscription.channel == "liquidation-orders":
+        return _inst_type_argument(subscription, allowed=frozenset({"SWAP"}))
+    if subscription.channel == "adl-warning":
+        return _adl_warning_argument(subscription)
+    if subscription.channel == "status":
+        _require_market_scope(subscription)
+        _require_no_params(subscription)
+        return {"channel": subscription.channel}
+
+    if subscription.wire_symbol is None:
+        raise ValueError(f"{subscription.channel} requires instId")
+    _require_no_params(subscription)
+    return {
+        "channel": subscription.channel,
+        "instId": subscription.wire_symbol,
+    }
 
 
 def _normalized_subscriptions(

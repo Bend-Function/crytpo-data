@@ -129,10 +129,20 @@ def test_unknown_non_control_stream_defaults_to_symbol_scope() -> None:
         )
 
 
-def test_declared_market_stream_may_omit_instrument_identity() -> None:
+@pytest.mark.parametrize(
+    ("logical_stream", "native_channel"),
+    [
+        ("instrument", "instruments"),
+        ("liquidation", "liquidation-orders"),
+    ],
+)
+def test_declared_market_stream_may_omit_instrument_identity(
+    logical_stream: str,
+    native_channel: str,
+) -> None:
     draft = make_native_event_draft(
-        logical_stream="instrument",
-        native_channel="instruments",
+        logical_stream=logical_stream,
+        native_channel=native_channel,
         instrument_key=None,
         wire_symbol=None,
     )

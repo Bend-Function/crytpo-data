@@ -151,6 +151,24 @@ def test_crossing_update_is_atomic_and_invalidates_generation() -> None:
     assert state.sequence_id == 100
 
 
+def test_preopen_policy_can_accept_documented_crossed_book() -> None:
+    state = OkxBookState(allow_crossed=True)
+
+    outcome = state.apply(
+        frame(
+            action="snapshot",
+            prev_seq=-1,
+            seq=100,
+            bids=(level("12", "1"),),
+            asks=(level("11", "1"),),
+        )
+    )
+
+    assert outcome.action is BookAction.SNAPSHOT
+    assert outcome.integrity is IntegrityMode.SEQUENCE_VERIFIED
+    assert outcome.generation_valid
+
+
 def test_parser_keeps_native_level_fields_and_converts_milliseconds() -> None:
     frames = parse_book_message(
         {

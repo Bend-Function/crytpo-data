@@ -58,7 +58,7 @@ def test_ws_fixture_is_pinned_by_the_shared_provenance_manifest() -> None:
         if isinstance(entry, dict) and entry.get("file") == _FIXTURE.name
     )
     assert ws_entry["sha256"] == sha256(_FIXTURE.read_bytes()).hexdigest()
-    assert ws_entry["source_anchor"] == "#websocket"
+    assert ws_entry["source_anchor"] == "#overview-websocket"
 
 
 def _subscription(
@@ -220,24 +220,77 @@ def test_public_subscription_message_is_exact_and_anonymous() -> None:
     assert len(raw.encode()) < OKX_WS_ARGUMENT_LIMIT_BYTES
 
 
-def test_business_anonymous_channels_and_market_wide_params_are_supported() -> None:
-    trades = _subscription(
-        channel="trades-all",
-        endpoint="wss://ws.okx.test/ws/v5/business",
-    )
-    instruments = _subscription(
-        channel="instruments",
-        wire_symbol=None,
-        params={"instType": "SPOT"},
-    )
+@pytest.mark.parametrize(
+    ("channel", "endpoint"),
+    [
+        ("bbo-tbt", "wss://ws.okx.test/ws/v5/public"),
+        ("books", "wss://ws.okx.test/ws/v5/public"),
+        ("books-rpi", "wss://ws.okx.test/ws/v5/public"),
+        ("books5", "wss://ws.okx.test/ws/v5/public"),
+        ("funding-rate", "wss://ws.okx.test/ws/v5/public"),
+        ("index-tickers", "wss://ws.okx.test/ws/v5/public"),
+        ("mark-price", "wss://ws.okx.test/ws/v5/public"),
+        ("open-interest", "wss://ws.okx.test/ws/v5/public"),
+        ("price-limit", "wss://ws.okx.test/ws/v5/public"),
+        ("tickers", "wss://ws.okx.test/ws/v5/public"),
+        ("trades", "wss://ws.okx.test/ws/v5/public"),
+        ("trades-all", "wss://ws.okx.test/ws/v5/business"),
+        ("candle1s", "wss://ws.okx.test/ws/v5/business"),
+        ("candle3Mutc", "wss://ws.okx.test/ws/v5/business"),
+        ("index-candle2H", "wss://ws.okx.test/ws/v5/business"),
+        ("mark-price-candle1Yutc", "wss://ws.okx.test/ws/v5/business"),
+    ],
+)
+def test_symbol_channels_require_exactly_inst_id(
+    channel: str,
+    endpoint: str,
+) -> None:
+    subscription = _subscription(channel=channel, endpoint=endpoint)
 
-    assert subscription_argument(trades) == {
-        "channel": "trades-all",
+    assert subscription_argument(subscription) == {
+        "channel": channel,
         "instId": "BTC-USDT",
     }
-    assert subscription_argument(instruments) == {
+
+
+@pytest.mark.parametrize("inst_type", ["SPOT", "SWAP"])
+def test_instruments_channel_accepts_only_supported_market_types(
+    inst_type: str,
+) -> None:
+    subscription = _subscription(
+        channel="instruments",
+        wire_symbol=None,
+        params={"instType": inst_type},
+    )
+
+    assert subscription_argument(subscription) == {
         "channel": "instruments",
-        "instType": "SPOT",
+        "instType": inst_type,
+    }
+
+
+def test_market_wide_channels_have_exact_channel_specific_arguments() -> None:
+    liquidation = _subscription(
+        channel="liquidation-orders",
+        wire_symbol=None,
+        params={"instType": "SWAP"},
+    )
+    status = _subscription(channel="status", wire_symbol=None)
+    adl = _subscription(
+        channel="adl-warning",
+        wire_symbol=None,
+        params={"instType": "SWAP", "instFamily": "BTC-USDT"},
+    )
+
+    assert subscription_argument(liquidation) == {
+        "channel": "liquidation-orders",
+        "instType": "SWAP",
+    }
+    assert subscription_argument(status) == {"channel": "status"}
+    assert subscription_argument(adl) == {
+        "channel": "adl-warning",
+        "instType": "SWAP",
+        "instFamily": "BTC-USDT",
     }
 
 
@@ -291,25 +344,122 @@ def test_subscription_builder_rejects_ambiguous_or_oversized_batches() -> None:
     with pytest.raises(ValueError, match="1-32"):
         build_subscribe_message((first,), request_id=1)  # type: ignore[arg-type]
     huge = _subscription(
-        channel="instruments",
-        wire_symbol=None,
-        params={"instType": "S" * OKX_WS_ARGUMENT_LIMIT_BYTES},
+        channel="books",
+        wire_symbol="S" * OKX_WS_ARGUMENT_LIMIT_BYTES,
     )
     with pytest.raises(ValueError, match="64 KiB"):
         build_subscribe_message((huge,), request_id="req1")
 
 
-def test_subscription_params_cannot_override_routing_or_use_arrays() -> None:
+@pytest.mark.parametrize(
+    "subscription",
+    [
+        _subscription(channel="books", wire_symbol=None),
+        _subscription(channel="books", params={"instType": "SPOT"}),
+        _subscription(
+            channel="candle1m",
+            endpoint="wss://ws.okx.test/ws/v5/business",
+            wire_symbol=None,
+        ),
+        _subscription(
+            channel="candle1m",
+            endpoint="wss://ws.okx.test/ws/v5/business",
+            params={"bar": "1m"},
+        ),
+        _subscription(channel="instruments", wire_symbol=None),
+        _subscription(
+            channel="instruments",
+            wire_symbol=None,
+            params={"instType": "MARGIN"},
+        ),
+        _subscription(
+            channel="instruments",
+            wire_symbol=None,
+            params={"instType": "SPOT", "instFamily": "BTC-USDT"},
+        ),
+        _subscription(
+            channel="liquidation-orders",
+            wire_symbol=None,
+            params={"instType": "SPOT"},
+        ),
+        _subscription(
+            channel="liquidation-orders",
+            wire_symbol=None,
+            params={"instType": "SWAP", "instFamily": "BTC-USDT"},
+        ),
+        _subscription(channel="status"),
+        _subscription(channel="status", wire_symbol=None, params={"instType": "SPOT"}),
+        _subscription(
+            channel="adl-warning",
+            wire_symbol=None,
+            params={"instType": "FUTURES"},
+        ),
+    ],
+)
+def test_channel_specific_schema_rejects_missing_extra_or_invalid_fields(
+    subscription: WebSocketSubscription,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        subscription_argument(subscription)
+
+
+@pytest.mark.parametrize(
+    "channel",
+    [
+        "candle2s",
+        "candle1Yutc",
+        "index-candle1s",
+        "index-candle1Yutc",
+        "mark-price-candle1s",
+        "mark-price-candle2s",
+    ],
+)
+def test_business_channel_rejects_undocumented_candle_bars(channel: str) -> None:
+    with pytest.raises(ValueError, match="channel"):
+        subscription_argument(
+            _subscription(
+                channel=channel,
+                endpoint="wss://ws.okx.test/ws/v5/business",
+            )
+        )
+
+
+def test_subscription_params_cannot_override_routing_or_use_wrong_types() -> None:
     with pytest.raises(ValueError, match="must not replace"):
         subscription_argument(
             _subscription(channel="books", params={"instId": "ETH-USDT"})
         )
-    with pytest.raises(TypeError, match="scalar"):
+    with pytest.raises(TypeError, match="must be a string"):
         subscription_argument(
             _subscription(
                 channel="instruments",
                 wire_symbol=None,
                 params={"instType": ["SPOT", "SWAP"]},
+            )
+        )
+
+
+@pytest.mark.parametrize("sensitive_key", ["apiKey", "authorization", "secret"])
+def test_subscription_contract_rejects_sensitive_fields(
+    sensitive_key: str,
+) -> None:
+    with pytest.raises(ValueError, match="sensitive"):
+        subscription_argument(
+            _subscription(
+                channel="instruments",
+                wire_symbol=None,
+                params={"instType": "SPOT", sensitive_key: "not-allowed"},
+            )
+        )
+
+
+def test_subscription_schema_rejects_unknown_passphrase_field() -> None:
+    with pytest.raises(ValueError, match="requires only instType"):
+        subscription_argument(
+            _subscription(
+                channel="instruments",
+                wire_symbol=None,
+                params={"instType": "SPOT", "passphrase": "not-allowed"},
             )
         )
 
