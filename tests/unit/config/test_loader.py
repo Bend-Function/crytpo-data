@@ -657,6 +657,28 @@ markets:
     assert canary not in str(captured.value)
 
 
+def test_exchange_endpoint_named_archive_keeps_public_endpoint_classification(
+    config_tree: Path,
+) -> None:
+    canary = "exchange-endpoint-canary"
+    _write(
+        config_tree / "config" / "exchanges" / "okx.yaml",
+        f"""\
+endpoints:
+  archive: https://user:{canary}@example.test
+markets:
+  spot: {{}}
+""",
+    )
+
+    with pytest.raises(ReferenceDocumentError, match="public endpoint") as captured:
+        load_reference_config(config_tree)
+
+    message = str(captured.value)
+    assert "archive endpoint" not in message
+    assert canary not in message
+
+
 def test_reference_snapshot_allows_pathful_websocket_overrides(
     config_tree: Path,
 ) -> None:

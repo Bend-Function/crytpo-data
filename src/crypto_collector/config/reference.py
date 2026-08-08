@@ -150,8 +150,14 @@ def _validate_public_endpoint(value: str, *, path: tuple[str, ...]) -> None:
             or (port is not None and not 1 <= port <= 65_535)
         )
     if invalid:
+        identities = tuple(_identifier(component) for component in path)
+        endpoint_kind = (
+            "archive endpoint"
+            if identities[:2] == ("sourcedocument", "archive")
+            else "public endpoint"
+        )
         raise ReferenceDocumentError(
-            f"{_path_text(path)} must be an unambiguous anonymous public endpoint"
+            f"{_path_text(path)}: {endpoint_kind} must be unambiguous and anonymous"
         )
 
 

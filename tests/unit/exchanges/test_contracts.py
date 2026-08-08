@@ -564,10 +564,24 @@ def test_stream_expectation_distinguishes_control_market_and_instrument_scope() 
 
 
 def test_registry_rejects_duplicate_exchange_and_unknown_lookup() -> None:
+    class IncompleteAdapter:
+        exchange = Exchange.OKX
+
     class Adapter:
         exchange = Exchange.OKX
 
+        def fetch_catalog(self) -> None:
+            pass
+
+        def plan(self) -> None:
+            pass
+
+        def run(self) -> None:
+            pass
+
     registry = AdapterRegistry()
+    with pytest.raises(TypeError, match="fetch_catalog"):
+        registry.register(IncompleteAdapter())  # type: ignore[arg-type]
     registry.register(Adapter())
 
     with pytest.raises(ValueError, match="already registered"):
