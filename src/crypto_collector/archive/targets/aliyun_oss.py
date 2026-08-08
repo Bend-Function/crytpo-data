@@ -30,6 +30,7 @@ from crypto_collector.archive.state import (
 from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     MultipartJournal,
+    MultipartJournalConflict,
     MultipartJournalFactory,
     PutResult,
     ResumeState,
@@ -1295,10 +1296,10 @@ class AliyunOssTarget:
         journal: MultipartJournal,
         state: ResumeState,
         *,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         try:
-            journal.save(state, expected_upload_id)
+            journal.save(state, expected)
         except ArchiveTargetError:
             raise
         except Exception:  # noqa: BLE001 - journal boundary is fail-closed.
@@ -1308,10 +1309,10 @@ class AliyunOssTarget:
         self,
         journal: MultipartJournal,
         *,
-        expected_upload_id: str,
+        expected: ResumeState | None,
     ) -> None:
         try:
-            journal.clear(expected_upload_id)
+            journal.clear(expected)
         except ArchiveTargetError:
             raise
         except Exception:  # noqa: BLE001 - journal boundary is fail-closed.
@@ -1331,7 +1332,7 @@ class AliyunOssTarget:
         except OssProviderError as error:
             if not _is_no_such_upload(error):
                 self._raise_mapped(error)
-        self._journal_clear(journal, expected_upload_id=state.upload_id)
+        self._journal_clear(journal, expected=state)
 
     def _read_remote(
         self,
@@ -1562,7 +1563,7 @@ class AliyunOssTarget:
     ) -> ResumeState | None:
         loaded = self._journal_load(journal)
         if explicit is not None and loaded != explicit:
-            raise TargetVerificationError(
+            raise MultipartJournalConflict(
                 "explicit OSS resume state differs from durable checkpoint"
             )
         return explicit if explicit is not None else loaded
@@ -1588,7 +1589,7 @@ class AliyunOssTarget:
             raise TargetVerificationError("OSS multipart upload ID is invalid")
         state = ResumeState(upload_id=upload_id, parts=())
         try:
-            self._journal_save(journal, state, expected_upload_id=None)
+            self._journal_save(journal, state, expected=None)
         except ArchiveTargetError:
             try:
                 self._provider_call(
@@ -1632,7 +1633,7 @@ class AliyunOssTarget:
                 if _is_no_such_upload(error):
                     self._journal_clear(
                         journal,
-                        expected_upload_id=state.upload_id,
+                        expected=state,
                     )
                     raise OssTargetUnavailable(
                         operation="list_parts",
@@ -1710,7 +1711,7 @@ class AliyunOssTarget:
         self._journal_save(
             journal,
             updated,
-            expected_upload_id=state.upload_id,
+            expected=state,
         )
         return updated
 
@@ -1788,6 +1789,11 @@ class AliyunOssTarget:
     def _selected_batch_error(
         errors: list[tuple[int, ArchiveTargetError]],
     ) -> ArchiveTargetError:
+        ownership = [
+            item for item in errors if isinstance(item[1], MultipartJournalConflict)
+        ]
+        if ownership:
+            return min(ownership, key=lambda item: item[0])[1]
         terminal = [
             item for item in errors if not isinstance(item[1], TargetUnavailable)
         ]
@@ -1942,7 +1948,7 @@ class AliyunOssTarget:
                 isinstance(first_error, OssTargetUnavailable)
                 and first_error.error_code == "NoSuchUpload"
             ):
-                self._journal_clear(journal, expected_upload_id=state.upload_id)
+                self._journal_clear(journal, expected=state)
             elif not isinstance(first_error, TargetUnavailable):
                 self._abort_and_clear(key, state, journal)
             raise first_error
@@ -2031,7 +2037,7 @@ class AliyunOssTarget:
                 self._abort_and_clear(key, state, journal)
                 return self._existing_result(key, source, resumed=was_resumed)
             if _is_no_such_upload(error):
-                self._journal_clear(journal, expected_upload_id=state.upload_id)
+                self._journal_clear(journal, expected=state)
                 try:
                     return self._existing_result(key, source, resumed=True)
                 except OssBusinessError as existing_error:
@@ -2051,11 +2057,11 @@ class AliyunOssTarget:
             self._abort_and_clear(key, state, journal)
             raise TargetVerificationError("OSS multipart completion result is invalid")
         if result.crc64 != identity.crc64:
-            self._journal_clear(journal, expected_upload_id=state.upload_id)
+            self._journal_clear(journal, expected=state)
             raise StoredObjectMismatch(
                 "OSS multipart full-object CRC64 disagrees with uploaded bytes"
             )
-        self._journal_clear(journal, expected_upload_id=state.upload_id)
+        self._journal_clear(journal, expected=state)
         self._remember_crc_evidence(key, result.provider_version_id, identity)
         return PutResult(
             key=key,

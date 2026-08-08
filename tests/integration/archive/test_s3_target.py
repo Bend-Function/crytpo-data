@@ -9,6 +9,7 @@ import pytest
 from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     MultipartJournal,
+    MultipartJournalConflict,
     ResumeState,
 )
 from crypto_collector.archive.targets.s3 import (
@@ -37,7 +38,7 @@ class MemoryJournal(MultipartJournal):
     def save(
         self,
         resume: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         self.save_calls += 1
         if (
@@ -45,15 +46,13 @@ class MemoryJournal(MultipartJournal):
             and self.save_calls > self.fail_after_saves
         ):
             raise OSError("injected durable journal failure")
-        current_upload_id = None if self.resume is None else self.resume.upload_id
-        if current_upload_id != expected_upload_id:
-            raise AssertionError("multipart journal CAS mismatch")
+        if self.resume != expected:
+            raise MultipartJournalConflict("multipart journal CAS mismatch")
         self.resume = resume
 
-    def clear(self, expected_upload_id: str) -> None:
-        current_upload_id = None if self.resume is None else self.resume.upload_id
-        if current_upload_id != expected_upload_id:
-            raise AssertionError("multipart journal CAS mismatch")
+    def clear(self, expected: ResumeState | None) -> None:
+        if self.resume != expected:
+            raise MultipartJournalConflict("multipart journal CAS mismatch")
         self.resume = None
 
 
@@ -141,8 +140,7 @@ def test_real_boto_client_put_verify_idempotency_and_multipart(
     )
 
     assert multipart.created
-    assert journal.resume is not None
-    assert len(journal.resume.parts) == 2
+    assert journal.resume is None
     assert multipart_verification.method == "readback_sha256"
     assert multipart_verification.cleanup_strong
 
@@ -179,7 +177,6 @@ def test_real_boto_multipart_resume_reconciles_remote_parts_after_crash(
 
     assert resumed.created
     assert resumed.resumed
-    assert journal.resume is not None
-    assert len(journal.resume.parts) == 3
+    assert journal.resume is None
     assert verification.verified
     assert verification.cleanup_strong

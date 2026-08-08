@@ -38,6 +38,7 @@ from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     ArchiveTarget,
     MultipartJournal,
+    MultipartJournalConflict,
     MultipartJournalFactory,
     ResumeState,
     TargetClosed,
@@ -109,6 +110,7 @@ class MemoryJournal(MultipartJournal):
     def __init__(self) -> None:
         self.state: ResumeState | None = None
         self.events: list[tuple[str, str, tuple[int, ...]]] = []
+        self.clear_expected_states: list[ResumeState | None] = []
 
     def load(self) -> ResumeState | None:
         return self.state
@@ -116,25 +118,25 @@ class MemoryJournal(MultipartJournal):
     def save(
         self,
         state: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         current = self.state
-        if expected_upload_id is None:
-            if current is not None:
-                raise RuntimeError("checkpoint create lost compare-and-swap")
-        elif current is None or current.upload_id != expected_upload_id:
-            raise RuntimeError("checkpoint update lost compare-and-swap")
+        if current != expected:
+            raise MultipartJournalConflict("checkpoint update lost compare-and-swap")
         self.state = state
         self.events.append(
             ("save", state.upload_id, tuple(part.part_number for part in state.parts))
         )
 
-    def clear(self, expected_upload_id: str) -> None:
+    def clear(self, expected: ResumeState | None) -> None:
         current = self.state
-        if current is None or current.upload_id != expected_upload_id:
-            raise RuntimeError("checkpoint clear lost compare-and-swap")
+        if current != expected:
+            raise MultipartJournalConflict("checkpoint clear lost compare-and-swap")
         self.state = None
-        self.events.append(("clear", expected_upload_id, ()))
+        self.clear_expected_states.append(expected)
+        self.events.append(
+            ("clear", "" if expected is None else expected.upload_id, ())
+        )
 
 
 class FailOnePartCheckpointJournal(MemoryJournal):
@@ -145,14 +147,14 @@ class FailOnePartCheckpointJournal(MemoryJournal):
     def save(
         self,
         state: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         if state.parts and not self._failed:
             self._failed = True
             raise RuntimeError("injected checkpoint failure")
         super().save(
             state,
-            expected_upload_id,
+            expected,
         )
 
 
@@ -160,9 +162,9 @@ class FailInitialCheckpointJournal(MemoryJournal):
     def save(
         self,
         state: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
-        del state, expected_upload_id
+        del state, expected
         raise RuntimeError("injected initial checkpoint failure")
 
 
@@ -174,11 +176,11 @@ class SignalingJournal(MemoryJournal):
     def save(
         self,
         state: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         super().save(
             state,
-            expected_upload_id,
+            expected,
         )
         if state.parts:
             self.part_checkpointed.set()
@@ -734,6 +736,11 @@ def test_multipart_persists_upload_id_then_each_completed_part(
     saved_part_sets = [event[2] for event in journal.events if event[0] == "save"]
     assert saved_part_sets[-1] == (1, 2, 3)
     assert journal.events[-1] == ("clear", "upload-1", ())
+    assert journal.clear_expected_states
+    assert journal.clear_expected_states[-1] is not None
+    assert tuple(
+        part.part_number for part in journal.clear_expected_states[-1].parts
+    ) == (1, 2, 3)
 
 
 def test_concurrent_part_is_checkpointed_before_slower_peer_finishes(
@@ -794,6 +801,85 @@ def test_part_checkpoint_failure_reuploads_untrusted_remote_part(
     assert recovered.resumed is True
     assert journal.load() is None
     assert [entry[3] for entry in transport.trace if entry[0] == "part"] == [1, 1, 2]
+
+
+def test_same_upload_checkpoint_cas_contention_is_retryable_without_abort(
+    tmp_path: Path,
+) -> None:
+    class ContendingJournal(MemoryJournal):
+        def save(
+            self,
+            state: ResumeState,
+            expected: ResumeState | None,
+        ) -> None:
+            if expected is not None and state.parts:
+                candidate = state.parts[0]
+                self.state = ResumeState(
+                    upload_id=expected.upload_id,
+                    parts=(
+                        MultipartPartV1(
+                            part_number=candidate.part_number,
+                            etag="competing-etag",
+                            size_bytes=candidate.size_bytes,
+                            checksum=candidate.checksum,
+                        ),
+                    ),
+                )
+                raise MultipartJournalConflict("checkpoint CAS conflict")
+            super().save(state, expected)
+
+    transport = FakeOssTransport()
+    journal = ContendingJournal()
+    archive_target = target(transport=transport, journal=journal)
+    source = source_file(tmp_path, b"x" * (PART_SIZE + 1))
+
+    with pytest.raises(MultipartJournalConflict, match="CAS conflict"):
+        archive_target.put(source, "research/_archive/v1/cas-contention.bin")
+
+    assert journal.state is not None
+    assert journal.state.upload_id == "upload-1"
+    assert journal.state.parts[0].etag == "competing-etag"
+    assert "upload-1" in transport.uploads
+    assert not any(entry[0] == "abort" for entry in transport.trace)
+
+
+def test_complete_clear_cas_contention_converges_to_existing_without_abort(
+    tmp_path: Path,
+) -> None:
+    class ClearContendingJournal(MemoryJournal):
+        def __init__(self) -> None:
+            super().__init__()
+            self._contended = False
+
+        def clear(self, expected: ResumeState | None) -> None:
+            if not self._contended:
+                self._contended = True
+                assert expected is not None
+                self.state = ResumeState(upload_id=expected.upload_id, parts=())
+                raise MultipartJournalConflict("checkpoint clear CAS conflict")
+            super().clear(expected)
+
+    transport = FakeOssTransport()
+    journal = ClearContendingJournal()
+    archive_target = target(transport=transport, journal=journal)
+    source = source_file(tmp_path, b"x" * (PART_SIZE + 1))
+    key = "research/_archive/v1/clear-contention.bin"
+
+    with pytest.raises(MultipartJournalConflict, match="clear CAS conflict"):
+        archive_target.put(source, key)
+
+    durable = journal.state
+    assert durable is not None
+    assert durable.upload_id not in transport.uploads
+    assert key in transport.latest_versions
+    assert not any(entry[0] == "abort" for entry in transport.trace)
+
+    recovered = archive_target.put(source, key, resume=durable)
+
+    assert recovered.created is False
+    assert recovered.resumed is True
+    assert journal.state is None
+    assert not any(entry[0] == "abort" for entry in transport.trace)
 
 
 def test_multipart_requires_durable_journal_before_network(tmp_path: Path) -> None:

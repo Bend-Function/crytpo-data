@@ -23,6 +23,7 @@ from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     ArchiveTarget,
     MultipartJournal,
+    MultipartJournalConflict,
     ResumeState,
     TargetClosed,
     UnsafeObjectKey,
@@ -301,8 +302,8 @@ class MemoryJournal(MultipartJournal):
     def __init__(self, checkpoint: ResumeState | None = None) -> None:
         self.checkpoint = checkpoint
         self.saved: list[ResumeState] = []
-        self.save_expected_upload_ids: list[str | None] = []
-        self.cleared: list[str] = []
+        self.save_expected_states: list[ResumeState | None] = []
+        self.cleared: list[ResumeState | None] = []
         self.fail_next_save = False
         self.conflict_next_save = False
         self.fail_next_clear = False
@@ -313,7 +314,7 @@ class MemoryJournal(MultipartJournal):
     def save(
         self,
         checkpoint: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         if self.fail_next_save:
             self.fail_next_save = False
@@ -321,27 +322,21 @@ class MemoryJournal(MultipartJournal):
         if self.conflict_next_save:
             self.conflict_next_save = False
             self.checkpoint = ResumeState(upload_id="competing-upload", parts=())
-            raise S3CheckpointConflict("checkpoint CAS conflict")
-        current_upload_id = (
-            None if self.checkpoint is None else self.checkpoint.upload_id
-        )
-        if current_upload_id != expected_upload_id:
-            raise S3CheckpointConflict("checkpoint CAS conflict")
+            raise MultipartJournalConflict("checkpoint CAS conflict")
+        if self.checkpoint != expected:
+            raise MultipartJournalConflict("checkpoint CAS conflict")
         self.checkpoint = checkpoint
         self.saved.append(checkpoint)
-        self.save_expected_upload_ids.append(expected_upload_id)
+        self.save_expected_states.append(expected)
 
-    def clear(self, expected_upload_id: str) -> None:
+    def clear(self, expected: ResumeState | None) -> None:
         if self.fail_next_clear:
             self.fail_next_clear = False
             raise OSError("durable store unavailable")
-        current_upload_id = (
-            None if self.checkpoint is None else self.checkpoint.upload_id
-        )
-        if current_upload_id != expected_upload_id:
-            raise S3CheckpointConflict("checkpoint CAS conflict")
+        if self.checkpoint != expected:
+            raise MultipartJournalConflict("checkpoint CAS conflict")
         self.checkpoint = None
-        self.cleared.append(expected_upload_id)
+        self.cleared.append(expected)
 
 
 class CountingSnapshot:
@@ -807,8 +802,11 @@ def test_multipart_interruption_persists_and_reuses_matching_parts(
     assert interrupted.upload_id == "upload-1"
     assert tuple(part.part_number for part in interrupted.parts) == (1, 2)
     assert all(part.checksum is not None for part in interrupted.parts)
-    assert journal.save_expected_upload_ids[0] is None
-    assert set(journal.save_expected_upload_ids[1:]) == {"upload-1"}
+    assert journal.save_expected_states[0] is None
+    assert all(
+        expected is not None and expected.upload_id == "upload-1"
+        for expected in journal.save_expected_states[1:]
+    )
 
     client.fail_upload_part_after = None
     before_resume = client.upload_part_calls
@@ -821,6 +819,10 @@ def test_multipart_interruption_persists_and_reuses_matching_parts(
     assert result.created
     assert result.resumed
     assert client.upload_part_calls == before_resume + 1
+    assert journal.checkpoint is None
+    completed = journal.cleared[-1]
+    assert completed is not None
+    assert tuple(part.part_number for part in completed.parts) == (1, 2, 3)
     verification = target.verify(
         result.key,
         source.size_bytes,
@@ -857,7 +859,7 @@ def test_source_changed_between_retries_aborts_and_clears_durable_upload(
 
     assert interrupted.upload_id not in client.uploads
     assert journal.checkpoint is None
-    assert journal.cleared == [interrupted.upload_id]
+    assert journal.cleared == [interrupted]
 
 
 def test_upload_part_incomplete_success_evidence_is_reconciled_on_retry(
@@ -935,6 +937,51 @@ def test_complete_incomplete_success_evidence_is_recovered_on_retry(
     assert not recovered.created
     assert recovered.resumed
     assert journal.checkpoint is None
+    assert journal.cleared == [interrupted]
+
+
+def test_complete_clear_cas_contention_retries_without_aborting_committed_upload(
+    tmp_path: Path,
+) -> None:
+    class ClearContendingJournal(MemoryJournal):
+        def __init__(self) -> None:
+            super().__init__()
+            self._contended = False
+
+        def clear(self, expected: ResumeState | None) -> None:
+            if not self._contended:
+                self._contended = True
+                assert expected is not None
+                self.checkpoint = ResumeState(
+                    upload_id=expected.upload_id,
+                    parts=(),
+                )
+                raise MultipartJournalConflict("checkpoint clear CAS conflict")
+            super().clear(expected)
+
+    client = FakeS3Client()
+    source = _source(tmp_path, b"z" * (PART_SIZE + 1))
+    journal = ClearContendingJournal()
+    target = _target(client, journal=journal)
+
+    with pytest.raises(MultipartJournalConflict, match="clear CAS conflict"):
+        target.put(source, key="archive/clear-contention.bin")
+
+    durable = journal.checkpoint
+    assert durable is not None
+    assert durable.upload_id not in client.uploads
+    assert "archive/clear-contention.bin" in client.objects
+    assert "abort_multipart_upload" not in _operations(client)
+
+    recovered = target.put(
+        source,
+        key="archive/clear-contention.bin",
+        resume=durable,
+    )
+
+    assert not recovered.created
+    assert recovered.resumed
+    assert journal.checkpoint is None
 
 
 def test_resume_lists_all_pages_before_reusing_parts(tmp_path: Path) -> None:
@@ -942,25 +989,16 @@ def test_resume_lists_all_pages_before_reusing_parts(tmp_path: Path) -> None:
     source = _source(tmp_path, b"b" * (PART_SIZE * 2 + 1))
     journal = MemoryJournal()
     target = _target(client, journal=journal)
-    client.fail_upload_part_after = 3
-    result = target.put(source, key="archive/large.bin")
-    assert result.created
+    client.complete_retry_error = _client_error(
+        "SlowDown",
+        503,
+        "CompleteMultipartUpload",
+    )
+    with pytest.raises(S3RetryableError):
+        target.put(source, key="archive/large.bin")
     checkpoint = journal.checkpoint
     assert checkpoint is not None
 
-    # Simulate a crash after completion but before the workflow consumed the journal.
-    client.objects.clear()
-    client.uploads[checkpoint.upload_id] = {}
-    client.upload_keys[checkpoint.upload_id] = "archive/large.bin"
-    with source.path.open("rb") as stream:
-        for part in checkpoint.parts:
-            data = stream.read(part.size_bytes)
-            assert part.checksum is not None
-            client.uploads[checkpoint.upload_id][part.part_number] = (
-                data,
-                part.etag,
-                part.checksum,
-            )
     client.list_page_size = 1
     before = client.upload_part_calls
 
@@ -1147,21 +1185,21 @@ def test_checkpoint_conflict_overrides_concurrent_retryable_part_error(
         def save(
             self,
             checkpoint: ResumeState,
-            expected_upload_id: str | None,
+            expected: ResumeState | None,
         ) -> None:
-            if expected_upload_id is not None:
+            if expected is not None:
                 self.checkpoint = ResumeState(
                     upload_id="competing-upload",
                     parts=(),
                 )
-                raise S3CheckpointConflict("checkpoint CAS conflict")
-            super().save(checkpoint, expected_upload_id)
+                raise MultipartJournalConflict("checkpoint CAS conflict")
+            super().save(checkpoint, expected)
 
     client = MixedFailureClient()
     source = _source(tmp_path, b"m" * (PART_SIZE * 2 + 1))
     journal = ConflictingJournal()
 
-    with pytest.raises(S3CheckpointConflict, match="CAS conflict"):
+    with pytest.raises(MultipartJournalConflict, match="CAS conflict"):
         _target(
             client,
             config=_config(concurrency=2),
@@ -1169,7 +1207,7 @@ def test_checkpoint_conflict_overrides_concurrent_retryable_part_error(
         ).put(source, key="archive/large.bin")
 
     assert client.upload_part_calls == 2
-    assert "upload-1" not in client.uploads
+    assert "upload-1" in client.uploads
     assert journal.checkpoint == ResumeState(
         upload_id="competing-upload",
         parts=(),
@@ -1222,7 +1260,9 @@ def test_upload_part_missing_upload_clears_checkpoint_and_is_retryable(
     assert captured.value.operation == "UploadPart"
     assert captured.value.error_code == "NoSuchUpload"
     assert journal.checkpoint is None
-    assert journal.cleared == [expected_upload_id]
+    assert len(journal.cleared) == 1
+    assert journal.cleared[0] is not None
+    assert journal.cleared[0].upload_id == expected_upload_id
     assert client.upload_part_calls == 2
 
 
@@ -1289,7 +1329,7 @@ def test_remote_part_checksum_divergence_aborts_resets_and_fails_closed(
 
     assert "upload-existing" not in client.uploads
     assert journal.checkpoint is None
-    assert journal.cleared == ["upload-existing"]
+    assert journal.cleared == [checkpoint]
     assert "complete_multipart_upload" not in _operations(client)
 
 
@@ -1303,7 +1343,7 @@ def test_checkpoint_binding_mismatch_fails_before_network(tmp_path: Path) -> Non
     requested = ResumeState(upload_id="different-upload", parts=())
     journal = MemoryJournal(checkpoint)
 
-    with pytest.raises(S3CheckpointConflict):
+    with pytest.raises(MultipartJournalConflict):
         _target(client, journal=journal).put(
             source,
             key="archive/large.bin",
@@ -1330,9 +1370,8 @@ def test_missing_remote_upload_resets_checkpoint_and_starts_again(
         resume=stale,
     )
 
-    assert journal.cleared == ["missing-upload"]
-    assert journal.checkpoint is not None
-    assert journal.checkpoint.upload_id == "upload-1"
+    assert journal.cleared[0] == stale
+    assert journal.checkpoint is None
     assert not result.resumed
 
 
@@ -1362,7 +1401,7 @@ def test_completed_before_crash_is_recovered_by_exact_existing_object(
     assert not result.created
     assert result.resumed
     assert result.provider_version_id == "completed-version"
-    assert journal.cleared == ["completed-upload"]
+    assert journal.cleared == [stale]
     assert "abort_multipart_upload" in _operations(client)
     assert "create_multipart_upload" not in _operations(client)
 
@@ -1497,7 +1536,7 @@ def test_initial_save_and_abort_failure_repersists_upload_for_retry(
     assert result.resumed
 
 
-def test_initial_checkpoint_cas_conflict_is_terminal_and_aborts_new_upload(
+def test_initial_checkpoint_cas_conflict_is_retryable_and_aborts_new_upload(
     tmp_path: Path,
 ) -> None:
     client = FakeS3Client()
@@ -1505,7 +1544,7 @@ def test_initial_checkpoint_cas_conflict_is_terminal_and_aborts_new_upload(
     journal = MemoryJournal()
     journal.conflict_next_save = True
 
-    with pytest.raises(S3CheckpointConflict, match="CAS conflict"):
+    with pytest.raises(MultipartJournalConflict, match="CAS conflict"):
         _target(client, journal=journal).put(source, key="archive/large.bin")
 
     assert _operations(client) == [
@@ -1520,35 +1559,43 @@ def test_initial_checkpoint_cas_conflict_is_terminal_and_aborts_new_upload(
     )
 
 
-def test_part_checkpoint_cas_conflict_aborts_upload_and_preserves_competitor(
+def test_part_checkpoint_cas_conflict_keeps_shared_upload_and_competitor_state(
     tmp_path: Path,
 ) -> None:
     class ConflictAfterInitialSaveJournal(MemoryJournal):
         def save(
             self,
             checkpoint: ResumeState,
-            expected_upload_id: str | None,
+            expected: ResumeState | None,
         ) -> None:
-            if expected_upload_id is not None:
+            if expected is not None:
+                candidate = checkpoint.parts[0]
                 self.checkpoint = ResumeState(
-                    upload_id="competing-upload",
-                    parts=(),
+                    upload_id=expected.upload_id,
+                    parts=(
+                        MultipartPartV1(
+                            part_number=candidate.part_number,
+                            etag='"competing-etag"',
+                            size_bytes=candidate.size_bytes,
+                            checksum=candidate.checksum,
+                        ),
+                    ),
                 )
-                raise S3CheckpointConflict("checkpoint CAS conflict")
-            super().save(checkpoint, expected_upload_id)
+                raise MultipartJournalConflict("checkpoint CAS conflict")
+            super().save(checkpoint, expected)
 
     client = FakeS3Client()
     source = _source(tmp_path, b"p" * (PART_SIZE + 1))
     journal = ConflictAfterInitialSaveJournal()
 
-    with pytest.raises(S3CheckpointConflict, match="CAS conflict"):
+    with pytest.raises(MultipartJournalConflict, match="CAS conflict"):
         _target(client, journal=journal).put(source, key="archive/large.bin")
 
-    assert client.uploads == {}
-    assert journal.checkpoint == ResumeState(
-        upload_id="competing-upload",
-        parts=(),
-    )
+    assert "upload-1" in client.uploads
+    assert "abort_multipart_upload" not in _operations(client)
+    assert journal.checkpoint is not None
+    assert journal.checkpoint.upload_id == "upload-1"
+    assert journal.checkpoint.parts[0].etag == '"competing-etag"'
 
 
 def test_source_truncated_during_part_upload_aborts_and_clears_checkpoint(
@@ -1571,7 +1618,9 @@ def test_source_truncated_during_part_upload_aborts_and_clears_checkpoint(
 
     assert client.uploads == {}
     assert journal.checkpoint is None
-    assert journal.cleared == ["upload-1"]
+    assert len(journal.cleared) == 1
+    assert journal.cleared[0] is not None
+    assert journal.cleared[0].upload_id == "upload-1"
 
 
 def test_abort_failure_preserves_checkpoint_and_reports_fail_closed(

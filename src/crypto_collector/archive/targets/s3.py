@@ -39,6 +39,7 @@ from crypto_collector.archive.state import (
 from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     MultipartJournal,
+    MultipartJournalConflict,
     MultipartJournalFactory,
     PutResult,
     ResumeState,
@@ -639,10 +640,10 @@ class S3Target:
         journal: MultipartJournal,
         checkpoint: ResumeState,
         *,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None:
         try:
-            journal.save(checkpoint, expected_upload_id)
+            journal.save(checkpoint, expected)
         except ArchiveTargetError:
             raise
         except Exception:  # noqa: BLE001 - durable journal boundary
@@ -682,10 +683,10 @@ class S3Target:
     def _clear_journal(
         journal: MultipartJournal,
         *,
-        expected_upload_id: str,
+        expected: ResumeState | None,
     ) -> None:
         try:
-            journal.clear(expected_upload_id)
+            journal.clear(expected)
         except ArchiveTargetError:
             raise
         except Exception:  # noqa: BLE001 - durable journal boundary
@@ -845,7 +846,7 @@ class S3Target:
             journal = self._journal_for(source, key=key)
             checkpoint = self._load_journal(journal)
             if checkpoint != resume:
-                raise S3CheckpointConflict(
+                raise MultipartJournalConflict(
                     "requested resume state does not match the durable journal"
                 )
             if checkpoint is not None:
@@ -1029,7 +1030,7 @@ class S3Target:
             self._save_journal(
                 journal,
                 checkpoint,
-                expected_upload_id=None,
+                expected=None,
             )
         except ArchiveTargetError:
             abort_error: ArchiveTargetError | None = None
@@ -1042,7 +1043,7 @@ class S3Target:
                     self._save_journal(
                         journal,
                         checkpoint,
-                        expected_upload_id=None,
+                        expected=None,
                     )
                 except ArchiveTargetError:
                     pass
@@ -1136,7 +1137,7 @@ class S3Target:
         self._abort_remote(checkpoint, key=key)
         self._clear_journal(
             journal,
-            expected_upload_id=checkpoint.upload_id,
+            expected=checkpoint,
         )
 
     def _reconcile(
@@ -1152,7 +1153,7 @@ class S3Target:
         except _S3UploadNotFound:
             self._clear_journal(
                 journal,
-                expected_upload_id=checkpoint.upload_id,
+                expected=checkpoint,
             )
             return self._new_multipart(
                 source,
@@ -1208,15 +1209,11 @@ class S3Target:
             parts=tuple(reusable[number] for number in sorted(reusable)),
         )
         if reconciled != checkpoint:
-            try:
-                self._save_journal(
-                    journal,
-                    reconciled,
-                    expected_upload_id=checkpoint.upload_id,
-                )
-            except S3CheckpointConflict:
-                self._abort_and_clear(checkpoint, journal, key=key)
-                raise
+            self._save_journal(
+                journal,
+                reconciled,
+                expected=checkpoint,
+            )
         return reconciled, True
 
     def _upload_part(
@@ -1289,6 +1286,8 @@ class S3Target:
         remaining = iter(missing)
 
         def error_priority(error: BaseException) -> int:
+            if isinstance(error, MultipartJournalConflict):
+                return 4
             if isinstance(error, S3CheckpointConflict):
                 return 3
             if isinstance(error, RetryableTargetError):
@@ -1322,16 +1321,23 @@ class S3Target:
                     part_number = futures.pop(future)
                     try:
                         part = future.result()
-                        parts[part.part_number] = part
-                        checkpoint = ResumeState(
+                        expected = checkpoint
+                        updated_parts = dict(parts)
+                        updated_parts[part.part_number] = part
+                        updated = ResumeState(
                             upload_id=checkpoint.upload_id,
-                            parts=tuple(parts[number] for number in sorted(parts)),
+                            parts=tuple(
+                                updated_parts[number]
+                                for number in sorted(updated_parts)
+                            ),
                         )
                         self._save_journal(
                             journal,
-                            checkpoint,
-                            expected_upload_id=checkpoint.upload_id,
+                            updated,
+                            expected=expected,
                         )
+                        parts = updated_parts
+                        checkpoint = updated
                     except Exception as error:  # noqa: BLE001 - worker/provider boundary
                         priority = error_priority(error)
                         if priority > selected_priority or (
@@ -1345,6 +1351,20 @@ class S3Target:
                     while len(futures) < self._concurrency and submit_next(executor):
                         pass
         if selected_error is not None:
+            if isinstance(selected_error, MultipartJournalConflict):
+                raise selected_error
+            if isinstance(selected_error, S3CheckpointConflict):
+                self._abort_and_clear(checkpoint, journal, key=key)
+                raise selected_error
+            if isinstance(selected_error, _S3UploadNotFound):
+                self._clear_journal(journal, expected=checkpoint)
+                raise S3RetryableError(
+                    "S3 multipart upload disappeared while uploading a part",
+                    operation="UploadPart",
+                    status_code=404,
+                    error_code="NoSuchUpload",
+                    retry_after_ns=None,
+                ) from None
             raise selected_error
         return checkpoint
 
@@ -1402,28 +1422,12 @@ class S3Target:
                 checkpoint=checkpoint,
                 journal=journal,
             )
-        try:
-            checkpoint = self._upload_missing_parts(
-                source,
-                key=key,
-                checkpoint=checkpoint,
-                journal=journal,
-            )
-        except S3CheckpointConflict:
-            self._abort_and_clear(checkpoint, journal, key=key)
-            raise
-        except _S3UploadNotFound:
-            self._clear_journal(
-                journal,
-                expected_upload_id=checkpoint.upload_id,
-            )
-            raise S3RetryableError(
-                "S3 multipart upload disappeared while uploading a part",
-                operation="UploadPart",
-                status_code=404,
-                error_code="NoSuchUpload",
-                retry_after_ns=None,
-            ) from None
+        checkpoint = self._upload_missing_parts(
+            source,
+            key=key,
+            checkpoint=checkpoint,
+            journal=journal,
+        )
         try:
             self._validate_source(source)
         except S3CheckpointConflict:
@@ -1463,12 +1467,12 @@ class S3Target:
             if existing is not None:
                 self._clear_journal(
                     journal,
-                    expected_upload_id=checkpoint.upload_id,
+                    expected=checkpoint,
                 )
                 return existing
             self._clear_journal(
                 journal,
-                expected_upload_id=checkpoint.upload_id,
+                expected=checkpoint,
             )
             raise S3RetryableError(
                 "S3 multipart upload disappeared before completion",
@@ -1492,6 +1496,7 @@ class S3Target:
                 error_code=None,
                 retry_after_ns=None,
             ) from None
+        self._clear_journal(journal, expected=checkpoint)
         return PutResult(
             key=key,
             size_bytes=source.size_bytes,

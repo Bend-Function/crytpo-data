@@ -41,6 +41,10 @@ class TargetUnavailable(RetryableTargetError):
     pass
 
 
+class MultipartJournalConflict(TargetUnavailable):
+    """A local owner lost compare-and-swap authority for a multipart job."""
+
+
 class TargetClosed(ArchiveTargetError):
     pass
 
@@ -167,10 +171,10 @@ class MultipartJournal(Protocol):
     def save(
         self,
         state: ResumeState,
-        expected_upload_id: str | None,
+        expected: ResumeState | None,
     ) -> None: ...
 
-    def clear(self, expected_upload_id: str) -> None: ...
+    def clear(self, expected: ResumeState | None) -> None: ...
 
 
 @runtime_checkable
@@ -475,6 +479,7 @@ __all__ = [
     "ArchiveObjectSource",
     "ArchiveTarget",
     "MultipartJournal",
+    "MultipartJournalConflict",
     "MultipartJournalFactory",
     "PublishedObject",
     "PutResult",

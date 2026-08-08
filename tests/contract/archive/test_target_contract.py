@@ -14,10 +14,12 @@ from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     ArchiveTarget,
     MultipartJournal,
+    MultipartJournalConflict,
     MultipartJournalFactory,
     PutResult,
     ResumeState,
     TargetProbe,
+    TargetUnavailable,
     TargetVerificationError,
     VerifyResult,
     publish_receipt_last,
@@ -141,12 +143,12 @@ def test_multipart_journal_protocol_freezes_job_scoped_cas_api() -> None:
         def save(
             self,
             state: ResumeState,
-            expected_upload_id: str | None,
+            expected: ResumeState | None,
         ) -> None:
-            del state, expected_upload_id
+            del state, expected
 
-        def clear(self, expected_upload_id: str) -> None:
-            del expected_upload_id
+        def clear(self, expected: ResumeState | None) -> None:
+            del expected
 
     class Factory:
         def __call__(
@@ -159,15 +161,16 @@ def test_multipart_journal_protocol_freezes_job_scoped_cas_api() -> None:
 
     assert isinstance(Journal(), MultipartJournal)
     assert isinstance(Factory(), MultipartJournalFactory)
+    assert issubclass(MultipartJournalConflict, TargetUnavailable)
     assert tuple(inspect.signature(MultipartJournal.load).parameters) == ("self",)
     assert tuple(inspect.signature(MultipartJournal.save).parameters) == (
         "self",
         "state",
-        "expected_upload_id",
+        "expected",
     )
     assert tuple(inspect.signature(MultipartJournal.clear).parameters) == (
         "self",
-        "expected_upload_id",
+        "expected",
     )
     assert tuple(inspect.signature(MultipartJournalFactory.__call__).parameters) == (
         "self",
