@@ -33,6 +33,7 @@ from crypto_collector.archive.models import (
     WorkflowCheckpoint,
     build_generation_fact,
     canonical_json_bytes,
+    validate_source_manifest,
 )
 from crypto_collector.archive.policy import (
     ArchivePolicyError,
@@ -1537,6 +1538,10 @@ class ArchiveState:
     ) -> ArchiveDiscoveryV1:
         if type(source) is not ArchiveSourceManifestV1:
             raise TypeError("source must be ArchiveSourceManifestV1")
+        try:
+            source = validate_source_manifest(source)
+        except ValidationError as error:
+            raise ArchiveStateError("source manifest is invalid") from error
         if type(cleanup_gates) is not CleanupGatePolicyV1:
             raise TypeError("cleanup_gates must be CleanupGatePolicyV1")
         if policy is None:

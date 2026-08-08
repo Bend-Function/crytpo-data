@@ -10,11 +10,13 @@ from pydantic import ValidationError
 
 from crypto_collector.archive.models import (
     ArchiveJobState,
+    ArchiveSourceGenerationFactV1,
     ArchiveSourceManifestV1,
     CleanupGatePolicyV1,
     MultipartPartV1,
     SourceArtifact,
     WorkflowCheckpoint,
+    build_generation_fact,
     canonical_json_bytes,
 )
 from crypto_collector.archive.policy import ArchivePolicyError, freeze_policy
@@ -811,6 +813,121 @@ def test_source_artifacts_must_be_sorted_and_roles_unique() -> None:
                 )
             }
         )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "_encoded/zstd/v1/collision.zst",
+        "_manifests/collision.manifest.json",
+        "_receipts/collision.archive-receipt.json",
+        "other/collision.bin",
+        "raw",
+    ),
+)
+def test_source_path_model_load_rejects_non_source_namespaces(
+    relative_path: str,
+) -> None:
+    with pytest.raises(ValidationError, match="raw or derived"):
+        SourceArtifact.model_validate(
+            {
+                "relative_path": relative_path,
+                "size_bytes": 1,
+                "sha256": "d" * 64,
+                "artifact_role": "data",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_manifest_relative_path", "derived/source.manifest.json"),
+        (
+            "artifacts",
+            (
+                SourceArtifact(
+                    relative_path="derived/data.parquet",
+                    size_bytes=1,
+                    sha256="d" * 64,
+                    artifact_role="data",
+                ),
+            ),
+        ),
+    ),
+)
+def test_source_paths_must_match_manifest_kind(field: str, value: object) -> None:
+    document = source_manifest().model_dump(mode="python")
+    document[field] = value
+
+    with pytest.raises(ValidationError, match="manifest kind"):
+        ArchiveSourceManifestV1.model_validate(document)
+
+
+def test_generation_fact_revalidates_forged_source_model_instance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "archive/archive.sqlite"
+    source = source_manifest()
+    store = ArchiveState.open(path)
+    store.discover(source, policy=frozen_policy(source), cleanup_gates=RAW_GATES)
+    store.close()
+    fact = ArchiveSourceGenerationFactV1.model_validate_json(
+        (
+            path.parent
+            / "sources"
+            / source.source_manifest_sha256
+            / "generation-1.json"
+        ).read_bytes()
+    )
+    forged_artifact = fact.source.artifacts[0].model_copy(
+        update={"relative_path": "_encoded/collision.zst"}
+    )
+    forged_source = fact.source.model_copy(update={"artifacts": (forged_artifact,)})
+
+    with pytest.raises(ValidationError, match="raw or derived"):
+        build_generation_fact(
+            source=forged_source,
+            generation=fact.generation,
+            policy_sha256=fact.policy_sha256,
+            previous_policy_sha256=fact.previous_policy_sha256,
+            predecessor_generation_fact_sha256=(
+                fact.predecessor_generation_fact_sha256
+            ),
+            migration_reason=fact.migration_reason,
+            required_target_ids=fact.required_target_ids,
+            optional_target_ids=fact.optional_target_ids,
+            cleanup_facts=fact.cleanup_facts,
+            jobs=fact.jobs,
+        )
+
+
+def test_rebuild_rejects_rehashed_reserved_source_path(tmp_path: Path) -> None:
+    path = tmp_path / "archive/archive.sqlite"
+    source = source_manifest()
+    store = ArchiveState.open(path)
+    store.discover(source, policy=frozen_policy(source), cleanup_gates=RAW_GATES)
+    store.close()
+    source_root = path.parent / "sources" / source.source_manifest_sha256
+    generation_path = source_root / "generation-1.json"
+    document = json.loads(generation_path.read_bytes())
+    document["source"]["artifacts"][0]["relative_path"] = (
+        "_receipts/collision.archive-receipt.json"
+    )
+    unhashed = {
+        key: value for key, value in document.items() if key != "generation_fact_sha256"
+    }
+    fact_sha = hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    document["generation_fact_sha256"] = fact_sha
+    generation_path.write_bytes(canonical_json_bytes(document) + b"\n")
+    (source_root / "active.json").write_bytes(
+        canonical_json_bytes({"generation": 1, "generation_fact_sha256": fact_sha})
+        + b"\n"
+    )
+    path.unlink()
+
+    with pytest.raises(ArchiveStateError, match="generation fact"):
+        ArchiveState.open(path, rebuild=True)
 
 
 def test_raw_source_adapter_requires_exact_present_closed_source(tmp_path) -> None:

@@ -43,6 +43,14 @@ def _normalized_relative_path(value: str) -> str:
     return value
 
 
+def _archive_source_relative_path(value: str) -> str:
+    normalized = _normalized_relative_path(value)
+    parts = normalized.split("/")
+    if len(parts) < 2 or parts[0] not in {"raw", "derived"}:
+        raise ValueError("archive source path must begin with raw or derived")
+    return normalized
+
+
 def _safe_identifier(value: str) -> str:
     if _SAFE_IDENTIFIER.fullmatch(value) is None:
         raise ValueError("identifier is not path safe")
@@ -83,6 +91,10 @@ def _credential_reference(value: str) -> str:
 
 
 NormalizedRelativePath = Annotated[str, AfterValidator(_normalized_relative_path)]
+ArchiveSourceRelativePath = Annotated[
+    str,
+    AfterValidator(_archive_source_relative_path),
+]
 SafeIdentifier = Annotated[str, AfterValidator(_safe_identifier)]
 NormalizedRemotePrefix = Annotated[str, AfterValidator(_normalized_remote_prefix)]
 NormalizedAbsolutePathString = Annotated[
@@ -203,7 +215,7 @@ TERMINAL_JOB_STATES = frozenset(
 
 
 class SourceArtifact(FrozenStrictModel):
-    relative_path: NormalizedRelativePath
+    relative_path: ArchiveSourceRelativePath
     size_bytes: PositiveInt
     sha256: Sha256
     artifact_role: SafeIdentifier
@@ -214,7 +226,7 @@ class ArchiveSourceManifestV1(FrozenStrictModel):
     manifest_kind: Literal["raw", "derived"]
     manifest_schema: SafeIdentifier
     manifest_schema_version: PositiveInt
-    source_manifest_relative_path: NormalizedRelativePath
+    source_manifest_relative_path: ArchiveSourceRelativePath
     source_manifest_size_bytes: PositiveInt
     source_manifest_sha256: Sha256
     closed: Literal[True]
@@ -224,6 +236,12 @@ class ArchiveSourceManifestV1(FrozenStrictModel):
 
     @model_validator(mode="after")
     def validate_artifacts(self) -> Self:
+        source_paths = (
+            self.source_manifest_relative_path,
+            *(artifact.relative_path for artifact in self.artifacts),
+        )
+        if any(path.split("/", 1)[0] != self.manifest_kind for path in source_paths):
+            raise ValueError("archive source paths must match the manifest kind")
         identities = tuple(
             (artifact.artifact_role, artifact.relative_path, artifact.sha256)
             for artifact in self.artifacts
@@ -323,6 +341,14 @@ class ArchiveSourceManifestV1(FrozenStrictModel):
                 ),
             ),
         )
+
+
+def validate_source_manifest(
+    source: ArchiveSourceManifestV1,
+) -> ArchiveSourceManifestV1:
+    if type(source) is not ArchiveSourceManifestV1:
+        raise TypeError("source must be ArchiveSourceManifestV1")
+    return ArchiveSourceManifestV1.model_validate(source.model_dump(mode="python"))
 
 
 class CredentialReferenceV1(FrozenStrictModel):
@@ -643,6 +669,7 @@ class ArchiveSourceGenerationFactV1(FrozenStrictModel):
 
     @model_validator(mode="after")
     def validate_fact(self) -> Self:
+        validate_source_manifest(self.source)
         if (
             self.cleanup_facts.grace_anchor_ns != self.source.closed_at_ns
             or self.cleanup_facts.storage_partition_end_ns
@@ -743,6 +770,7 @@ def build_generation_fact(
     cleanup_facts: ArchiveCleanupFactsV1,
     jobs: tuple[ArchiveGenerationJobV1, ...],
 ) -> ArchiveSourceGenerationFactV1:
+    source = validate_source_manifest(source)
     payload = {
         "schema_version": 1,
         "source": source.model_dump(mode="json"),
@@ -796,4 +824,5 @@ __all__ = [
     "build_generation_fact",
     "build_policy",
     "canonical_json_bytes",
+    "validate_source_manifest",
 ]
