@@ -13,6 +13,14 @@ from crypto_collector.storage.manifest import (
     lease_path_for_data,
 )
 
+_MAX_SIGNED_INT64 = 2**63 - 1
+
+
+class TimeSource(StrEnum):
+    EVENT = "event"
+    RECEIVE_MISSING = "receive_missing"
+    RECEIVE_OUTLIER = "receive_outlier"
+
 
 def _is_sha256(value: str) -> bool:
     return (
@@ -51,8 +59,14 @@ class SourceRecord:
 
 @dataclass(frozen=True, slots=True)
 class TimedSourceRecord:
+    """A time choice for a raw envelope that represents exactly one derived item.
+
+    Batch payloads must first expand to stable item-level locators and times.
+    """
+
     source: SourceRecord
     effective_event_time_ns: int
+    time_source: TimeSource
 
     def __post_init__(self) -> None:
         if type(self.source) is not SourceRecord:
@@ -60,8 +74,42 @@ class TimedSourceRecord:
         if (
             type(self.effective_event_time_ns) is not int
             or self.effective_event_time_ns < 0
+            or self.effective_event_time_ns > _MAX_SIGNED_INT64
         ):
-            raise ValueError("effective_event_time_ns must be a non-negative integer")
+            raise ValueError(
+                "effective_event_time_ns must be a non-negative signed 64-bit integer"
+            )
+        if type(self.time_source) is not TimeSource:
+            raise TypeError("time_source must be TimeSource")
+
+        envelope = self.source.envelope
+        event_time_ns = envelope.event_time_ns
+        received_at_ns = envelope.received_at_ns
+        if received_at_ns > _MAX_SIGNED_INT64 or (
+            event_time_ns is not None and event_time_ns > _MAX_SIGNED_INT64
+        ):
+            raise ValueError(
+                "source envelope timestamps must fit signed 64-bit integers"
+            )
+        if self.time_source is TimeSource.EVENT:
+            consistent = (
+                event_time_ns is not None
+                and self.effective_event_time_ns == event_time_ns
+            )
+        elif self.time_source is TimeSource.RECEIVE_MISSING:
+            consistent = (
+                event_time_ns is None and self.effective_event_time_ns == received_at_ns
+            )
+        else:
+            consistent = (
+                event_time_ns is not None
+                and event_time_ns != received_at_ns
+                and self.effective_event_time_ns == received_at_ns
+            )
+        if not consistent:
+            raise ValueError(
+                "time_source must match the envelope and effective event time"
+            )
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -260,5 +308,6 @@ __all__ = [
     "ReplayOrderedRecord",
     "SourceLocator",
     "SourceRecord",
+    "TimeSource",
     "TimedSourceRecord",
 ]

@@ -299,6 +299,48 @@ def test_materializer_intervals_are_canonicalized() -> None:
     )
 
 
+def test_materializer_event_time_skew_defaults_are_explicit_and_serialized() -> None:
+    materializer = CollectorConfig.model_validate(BASE).materializer
+
+    assert materializer.max_past_skew_ns == 7 * 24 * 60 * 60 * 1_000_000_000
+    assert materializer.max_future_skew_ns == 5 * 60 * 1_000_000_000
+    serialized = materializer.model_dump(by_alias=True)
+    assert serialized["max_past_skew"] == materializer.max_past_skew_ns
+    assert serialized["max_future_skew"] == materializer.max_future_skew_ns
+
+
+def test_materializer_event_time_skew_is_configurable_and_nonnegative() -> None:
+    config = CollectorConfig.model_validate(
+        BASE
+        | {
+            "materializer": {
+                "max_past_skew": "0s",
+                "max_future_skew": "10m",
+            }
+        }
+    )
+
+    assert config.materializer.max_past_skew_ns == 0
+    assert config.materializer.max_future_skew_ns == 600_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_past_skew", -1),
+        ("max_past_skew", "9223372037s"),
+        ("max_future_skew", True),
+        ("max_future_skew", "9223372037s"),
+    ],
+)
+def test_materializer_event_time_skew_rejects_invalid_duration(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError, match=field_name):
+        CollectorConfig.model_validate(BASE | {"materializer": {field_name: value}})
+
+
 def test_socks_type_must_match_resolved_url_scheme(monkeypatch) -> None:
     monkeypatch.setenv("SOCKS_URL", "socks5://127.0.0.1:1080")
     config = CollectorConfig.model_validate(BASE)

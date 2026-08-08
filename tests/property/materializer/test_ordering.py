@@ -14,6 +14,7 @@ from crypto_collector.materializer.models import (
     SourceLocator,
     SourceRecord,
     TimedSourceRecord,
+    TimeSource,
 )
 from crypto_collector.materializer.ordering import (
     DuplicateSourceLocator,
@@ -135,9 +136,11 @@ EVENT_ROWS = (
             monotonic_ns=1,
             received_at_ns=100,
             writer_sequence=1,
+            event_time_ns=20,
             manifest_sha256="c" * 64,
         ),
         effective_event_time_ns=20,
+        time_source=TimeSource.EVENT,
     ),
     TimedSourceRecord(
         source=_source(
@@ -145,10 +148,12 @@ EVENT_ROWS = (
             monotonic_ns=2,
             received_at_ns=101,
             writer_sequence=2,
+            event_time_ns=10,
             manifest_sha256="b" * 64,
             record_index=1,
         ),
         effective_event_time_ns=10,
+        time_source=TimeSource.EVENT,
     ),
     TimedSourceRecord(
         source=_source(
@@ -156,10 +161,12 @@ EVENT_ROWS = (
             monotonic_ns=3,
             received_at_ns=100,
             writer_sequence=3,
+            event_time_ns=10,
             manifest_sha256="b" * 64,
             record_index=0,
         ),
         effective_event_time_ns=10,
+        time_source=TimeSource.EVENT,
     ),
     TimedSourceRecord(
         source=_source(
@@ -167,10 +174,12 @@ EVENT_ROWS = (
             monotonic_ns=4,
             received_at_ns=100,
             writer_sequence=4,
+            event_time_ns=10,
             manifest_sha256="a" * 64,
             record_index=9,
         ),
         effective_event_time_ns=10,
+        time_source=TimeSource.EVENT,
     ),
 )
 
@@ -200,7 +209,7 @@ def test_canonical_event_sort_key_is_the_frozen_four_part_key() -> None:
     )
 
 
-@pytest.mark.parametrize("effective_event_time_ns", [True, -1])
+@pytest.mark.parametrize("effective_event_time_ns", [True, -1, 2**63])
 def test_timed_source_record_requires_non_negative_integer_time(
     effective_event_time_ns: object,
 ) -> None:
@@ -208,6 +217,7 @@ def test_timed_source_record_requires_non_negative_integer_time(
         TimedSourceRecord(
             source=EVENT_ROWS[0].source,
             effective_event_time_ns=effective_event_time_ns,  # type: ignore[arg-type]
+            time_source=TimeSource.EVENT,
         )
 
 
@@ -218,7 +228,8 @@ def test_event_order_rejects_duplicate_source_locators() -> None:
             envelope=EVENT_ROWS[1].source.envelope,
             locator=first.source.locator,
         ),
-        effective_event_time_ns=1,
+        effective_event_time_ns=10,
+        time_source=TimeSource.EVENT,
     )
 
     with pytest.raises(DuplicateSourceLocator):

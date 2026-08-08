@@ -303,6 +303,16 @@ class DiskConfig(StrictModel):
 class MaterializerConfig(StrictModel):
     enabled: bool = True
     delay_ns: DurationNs = Field(300_000_000_000, alias="delay")
+    max_past_skew_ns: DurationNs = Field(
+        604_800_000_000_000,
+        alias="max_past_skew",
+        le=_MAX_SIGNED_INT64,
+    )
+    max_future_skew_ns: DurationNs = Field(
+        300_000_000_000,
+        alias="max_future_skew",
+        le=_MAX_SIGNED_INT64,
+    )
     intervals_ns: DurationTuple = Field(
         (
             30_000_000_000,
