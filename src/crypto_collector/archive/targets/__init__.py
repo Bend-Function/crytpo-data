@@ -1,5 +1,19 @@
 """Archive provider target contracts."""
 
+from crypto_collector.archive.targets.aliyun_oss import (
+    AliyunOssTarget,
+    OssBusinessError,
+    OssObjectMetadata,
+    OssPartPage,
+    OssProviderError,
+    OssProviderErrorKind,
+    OssRemotePart,
+    OssTargetUnavailable,
+    OssTransport,
+    OssUploadResult,
+    build_aliyun_oss_target,
+    crc64_ecma,
+)
 from crypto_collector.archive.targets.base import (
     ArchiveObjectSource,
     ArchiveTarget,
@@ -22,12 +36,22 @@ from crypto_collector.archive.targets.filesystem import (
 )
 
 __all__ = [
+    "AliyunOssTarget",
     "ArchiveObjectSource",
     "ArchiveTarget",
     "FilesystemNoReplaceCapability",
     "FilesystemTarget",
     "MultipartJournal",
     "MultipartJournalFactory",
+    "OssBusinessError",
+    "OssObjectMetadata",
+    "OssPartPage",
+    "OssProviderError",
+    "OssProviderErrorKind",
+    "OssRemotePart",
+    "OssTargetUnavailable",
+    "OssTransport",
+    "OssUploadResult",
     "PutResult",
     "ReceiptLastCommit",
     "ResumeState",
@@ -37,5 +61,7 @@ __all__ = [
     "TargetVerificationError",
     "UnsafeObjectKey",
     "VerifyResult",
+    "build_aliyun_oss_target",
+    "crc64_ecma",
     "publish_receipt_last",
 ]
