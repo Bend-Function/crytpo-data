@@ -10,7 +10,7 @@ scope.
 | Binance | [`binance/README.md`](binance/README.md) | 14 | `tests/smoke/test_binance_public_api.py` |
 | OKX | [`okx/README.md`](okx/README.md) | 2 | `tests/smoke/test_okx_public_api.py` |
 | Bybit | [`bybit/README.md`](bybit/README.md) | 38 | `tests/smoke/test_bybit_public_api.py` |
-| Bitget | [`bitget/index.md`](bitget/index.md) | 22 plus checksum manifest | `tests/smoke/test_bitget_public_api.py` |
+| Bitget | [`bitget/index.md`](bitget/index.md) | 21 plus checksum manifest | `tests/smoke/test_bitget_public_api.py` |
 | Kraken | [`kraken/README.md`](kraken/README.md) | 28 | `tests/smoke/test_kraken_public_api.py` |
 
 Each exchange note records source URLs, retrieval time, SHA-256 values, REST

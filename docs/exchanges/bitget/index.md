@@ -1,6 +1,6 @@
 # Bitget public market API notes
 
-检索与实测日期：2026-07-31。范围限定为无需 API key 的公开行情数据，优先使用 Bitget 推荐的 Unified Trading Account (UTA) v3 接口。本文不是交易接口说明。
+检索与实测日期：2026-08-08。范围限定为无需 API key 的公开行情数据，优先使用 Bitget 推荐的 Unified Trading Account (UTA) v3 接口。本文不是交易接口说明。
 
 原始官方页面保存在 [`sources/`](sources/)，URL、UTC 下载时间和 SHA256 见 [`sources/manifest.csv`](sources/manifest.csv)。HTML 是检索时点快照；实现前仍应检查 UTA changelog。
 
@@ -11,6 +11,8 @@
 | REST | `https://api.bitget.com` | 本文列出的 `/api/v3/market/*` 端点无需认证 |
 | Public WebSocket | `wss://ws.bitget.com/v3/ws/public` | 无需登录 |
 | Demo public WebSocket | `wss://wspap.bitget.com/v3/ws/public` | 仅用于 demo 环境，不用于生产采集 |
+
+2026-08-08 刷新的 UTA guide 新增了需要向 BD/RM 申请的机构 Lo-La 域名。它们不属于默认匿名公共接入面，本项目仍只使用上表 common domain；guide 现在也明确 6,000 requests/IP/min 的总体限制适用于 common domain。
 
 产品类型大小写不同，配置层不要直接复用：REST 使用 `SPOT`、`USDT-FUTURES`；v3 WebSocket 使用 `spot`、`usdt-futures`。Bitget 原生 symbol 为无分隔符大写形式，例如 `BTCUSDT`。
 
@@ -67,7 +69,9 @@ GET /api/v3/market/instruments?... -> HTTP 200, code 00000
 
 Ticker `turnover24h` is quote-currency turnover and is the appropriate field for per-market Top-N selection; `volume24h` is base-asset volume and is not directly comparable across symbols.
 
-Candles support intervals `1m`, `3m`, `5m`, `15m`, `30m`, `1H`, `4H`, `6H`, `12H`, `1D` and types `market`, `mark`, `index`, `premium`. The recent-candle page is internally inconsistent: its description says up to 1,000 candles, while its parameter table says default 1,000 and maximum 100. Treat 100 as the conservative request limit until a live contract test establishes otherwise.
+The category responses also contain stocks, metals, commodities, and Reality tokens. This collector includes only rows with `symbolType=crypto`; Spot additionally requires `isReality=no`. Known explicit non-target values are excluded. A missing or unknown scope discriminator rejects the complete snapshot instead of silently removing instruments or treating them as cryptocurrency. Bitget defines `offline` as either delisted or under maintenance, so it remains an unknown inactive lifecycle phase instead of being asserted as a delisting.
+
+Candles support intervals `1m`, `3m`, `5m`, `15m`, `30m`, `1H`, `4H`, `6H`, `12H`, `1D`. Anonymous probes on 2026-08-08 accept `market` and `index` for Spot; USDT futures accepts `market`, `mark`, `index`, and `premium`. The recent-candle parameter table still says maximum 100, but the versioned UTA changelog records the 2025-11-28 increase to 1,000 and an anonymous `limit=1000` probe returns 1,000 rows. Use 1,000 for the recent endpoint and retain 100 for historical candles.
 
 ## WebSocket public channels
 
@@ -105,7 +109,7 @@ The liquidation stream is lossy by design: each second contains only the largest
 - Send the literal text `ping` every 30 seconds and expect literal `pong`; reconnect if pong is absent.
 - Server disconnects a connection that sends no `ping` for 2 minutes.
 - Maximum 10 client messages per second per connection, including ping, login, subscribe and unsubscribe messages.
-- The UTA guide does not repeat a fixed connection lifetime. Bitget's common changelog says WebSockets are forcibly disconnected every 24 hours, so collectors must implement planned rotation/reconnect and resubscription.
+- The versioned UTA evidence does not substantiate a fixed 24-hour connection lifetime, so the protocol layer does not force one. Ordinary planned/admin reconnect and resubscription remain supported independently.
 - REST and WebSocket share rate-limit accounting; the UTA guide also states an overall 6,000 requests/IP/minute ceiling. Individual public REST endpoint limits still apply.
 
 ## Full order-book state machine
@@ -118,7 +122,7 @@ Use `books` when incremental full depth is required. `books1`, `books5`, and `bo
 4. Treat `pseq=0` as a possible server sequence reset. Discard the derived book and obtain a new snapshot.
 5. On a gap, duplicate/out-of-order sequence, disconnect, parse failure, or subscription error, mark the book invalid; reconnect/resubscribe and wait for a new snapshot before publishing derived state.
 
-`maxDepth` can vary by symbol and is documented in the range 0-1000. The v3 page documents no checksum field and does not explicitly define zero-quantity deletion semantics. Raw collection can preserve messages losslessly, but a later book materializer should validate deletion behavior against captured fixtures before relying on reconstructed state.
+`maxDepth` can vary by symbol and is documented in the range 0-1000 on the WebSocket depth push. The current UTA instruments response does not expose this field, so it must not be invented during catalog parsing; validate it from the actual `books` stream or a dedicated live probe. The v3 page documents no checksum field and does not explicitly define zero-quantity deletion semantics. Raw collection can preserve messages losslessly, but a later book materializer should validate deletion behavior against captured fixtures before relying on reconstructed state.
 
 The REST order-book snapshot contains no sequence linkage to the WebSocket stream. Do not splice REST asks/bids into `books` updates; use the WebSocket's own initial snapshot for a consistent incremental state.
 
@@ -133,6 +137,7 @@ Reality/rToken order-book and fill APIs are whitelist-gated and are outside this
 - UTA v3 is marked recommended; Classic v2 remains online and has different WS URLs, subscription keys and payload fields. Do not mix examples across versions.
 - The instruments path conflict described above proves guide pages can lag endpoint pages.
 - UTA changelog entries were still changing market schemas in July 2026; pin raw payloads and monitor the changelog.
+- The former `/api-doc/common/changelog` URL now redirects to the UTA introduction page; it is not retained as changelog evidence and cannot support a 24-hour lifetime claim.
 - Classic `books1` had a documented frequency change in January 2026. The UTA v3 depth page still states 1 ms; version-specific docs take precedence.
 - Preserve unknown fields and the complete original payload. Do not fail collection when Bitget adds optional fields.
 - Treat documented push intervals as targets, not delivery guarantees. Record local receive time and connection/gap events.
