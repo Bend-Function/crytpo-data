@@ -29,6 +29,9 @@ _MINUTE_NS = 60_000_000_000
 _HOUR_NS = 3_600_000_000_000
 _MAX_SIGNED_INT64 = 2**63 - 1
 _MAX_SCHEDULER_COLLECTION_ITEMS = 1_000_000
+_S3_MIN_MULTIPART_SIZE_BYTES = 5 * 1024**2
+_OSS_MIN_MULTIPART_SIZE_BYTES = 100 * 1024
+_OBJECT_STORAGE_MAX_MULTIPART_SIZE_BYTES = 5 * 1024**3
 
 
 def _duration_ns(value: object) -> int:
@@ -83,7 +86,43 @@ def _normalized_unique_selection_strings(
     return normalized
 
 
+def _normalized_archive_prefix(value: str) -> str:
+    if value == "":
+        return value
+    parts = value.split("/")
+    if (
+        "\x00" in value
+        or "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError("archive prefix must be a normalized POSIX relative path")
+    return value
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _validate_multipart_size(
+    *,
+    provider: str,
+    value: int,
+    minimum: int,
+) -> None:
+    if not minimum <= value <= _OBJECT_STORAGE_MAX_MULTIPART_SIZE_BYTES:
+        raise ValueError(
+            f"{provider} multipart_size must be between {minimum} and "
+            f"{_OBJECT_STORAGE_MAX_MULTIPART_SIZE_BYTES} bytes"
+        )
+
+
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
+ArchiveTargetId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$"),
+]
 DurationNs = Annotated[int, BeforeValidator(_duration_ns), Field(ge=0)]
 PositiveDurationNs = Annotated[int, BeforeValidator(_duration_ns), Field(gt=0)]
 SizeBytes = Annotated[int, BeforeValidator(_size_bytes), Field(ge=0)]
@@ -445,7 +484,7 @@ class MountGuardConfig(StrictModel):
 
 
 class ArchiveTargetBase(StrictModel):
-    id: NonEmptyString
+    id: ArchiveTargetId
     enabled: bool = True
     required: bool = False
     prefix: str = ""
@@ -460,6 +499,17 @@ class ArchiveTargetBase(StrictModel):
         default_factory=lambda: CompressionConfig.model_validate({})
     )
 
+    @field_validator("prefix", mode="after")
+    @classmethod
+    def validate_prefix(cls, value: str) -> str:
+        return _normalized_archive_prefix(value)
+
+    @model_validator(mode="after")
+    def validate_required_target(self) -> Self:
+        if self.required and not self.enabled:
+            raise ValueError("required archive target cannot be disabled")
+        return self
+
 
 class AliyunOssTargetConfig(ArchiveTargetBase):
     type: Literal["aliyun_oss"]
@@ -469,6 +519,15 @@ class AliyunOssTargetConfig(ArchiveTargetBase):
     storage_class: NonEmptyString | None = None
     credentials: AliyunCredentials
 
+    @model_validator(mode="after")
+    def validate_multipart_size(self) -> Self:
+        _validate_multipart_size(
+            provider="OSS",
+            value=self.multipart_size_bytes,
+            minimum=_OSS_MIN_MULTIPART_SIZE_BYTES,
+        )
+        return self
+
 
 class S3TargetConfig(ArchiveTargetBase):
     type: Literal["s3"]
@@ -476,13 +535,54 @@ class S3TargetConfig(ArchiveTargetBase):
     endpoint: NonEmptyString | None = None
     region: NonEmptyString | None = None
     storage_class: NonEmptyString | None = None
+    addressing_style: Literal["auto", "path", "virtual"] = "auto"
     credentials: S3Credentials
+
+    @model_validator(mode="after")
+    def validate_multipart_size(self) -> Self:
+        _validate_multipart_size(
+            provider="S3",
+            value=self.multipart_size_bytes,
+            minimum=_S3_MIN_MULTIPART_SIZE_BYTES,
+        )
+        return self
 
 
 class FilesystemTargetConfig(ArchiveTargetBase):
     type: Literal["filesystem"]
     root: ResolvedPath
+    mount_root: ResolvedPath
     mount_guard: MountGuardConfig
+    durability_capability: Literal[
+        "backup_only",
+        "operator_attested_fsync_readback",
+    ] = "backup_only"
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_legacy_mount_root(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "mount_root" in value:
+            return value
+        guard = value.get("mount_guard")
+        if not isinstance(guard, Mapping):
+            return value
+        guard_path = guard.get("path")
+        if type(guard_path) is not str:
+            return value
+        normalized = dict(value)
+        normalized["mount_root"] = str(Path(guard_path).parent)
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_mount_paths(self) -> Self:
+        if self.root != self.mount_root and self.mount_root not in self.root.parents:
+            raise ValueError("filesystem root must be inside mount_root")
+        guard_path = self.mount_guard.path
+        if guard_path == self.mount_root or self.mount_root not in guard_path.parents:
+            raise ValueError("filesystem mount_guard.path must be inside mount_root")
+        if guard_path == self.root:
+            raise ValueError("filesystem mount_guard.path must not equal root")
+        return self
 
 
 ArchiveTargetConfig = Annotated[
@@ -493,6 +593,13 @@ ArchiveTargetConfig = Annotated[
 
 class ArchiveConfig(StrictModel):
     targets: Annotated[tuple[ArchiveTargetConfig, ...], BeforeValidator(_tuple)] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_target_ids(self) -> Self:
+        target_ids = [target.id for target in self.targets]
+        if len(set(target_ids)) != len(target_ids):
+            raise ValueError("archive target IDs must be unique")
+        return self
 
 
 class LocalCleanupConfig(StrictModel):
@@ -651,15 +758,40 @@ class CollectorConfig(StrictModel):
         egress_ids = [egress.id for egress in self.network.egress_pool]
         if len(set(egress_ids)) != len(egress_ids):
             raise ValueError("egress IDs must be unique")
-        target_ids = [target.id for target in self.archive.targets]
-        if len(set(target_ids)) != len(target_ids):
-            raise ValueError("archive target IDs must be unique")
         for target in self.archive.targets:
-            if isinstance(target, FilesystemTargetConfig) and (
-                target.root == self.data_root or self.data_root in target.root.parents
+            if isinstance(target, FilesystemTargetConfig) and any(
+                _paths_overlap(self.data_root, path)
+                for path in (
+                    target.mount_root,
+                    target.root,
+                    target.mount_guard.path,
+                )
             ):
                 raise ValueError(
-                    "archive filesystem root must not equal or be nested inside data_root"
+                    "archive filesystem mount_root, root, and mount_guard.path "
+                    "must not overlap data_root"
+                )
+        if self.local_cleanup.enabled:
+            required_targets = tuple(
+                target
+                for target in self.archive.targets
+                if target.enabled and target.required
+            )
+            if not required_targets:
+                raise ValueError(
+                    "local cleanup requires at least one enabled required target"
+                )
+            backup_only_filesystems = tuple(
+                target.id
+                for target in required_targets
+                if isinstance(target, FilesystemTargetConfig)
+                and target.durability_capability != "operator_attested_fsync_readback"
+            )
+            if backup_only_filesystems:
+                raise ValueError(
+                    "required filesystem targets must set durability_capability="
+                    "operator_attested_fsync_readback before local cleanup: "
+                    + ", ".join(sorted(backup_only_filesystems))
                 )
         return self
 

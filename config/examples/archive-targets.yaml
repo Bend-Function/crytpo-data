@@ -21,6 +21,7 @@ archive:
       required: false
       bucket: market-data-backup
       region: ap-southeast-2
+      addressing_style: auto
       credentials:
         access_key_id: env:S3_ACCESS_KEY_ID
         secret_access_key: env:S3_SECRET_ACCESS_KEY
@@ -34,7 +35,9 @@ archive:
     - id: webdav-mounted
       type: filesystem
       required: false
+      mount_root: /mnt/webdav
       root: /mnt/webdav/crypto-market-data
+      durability_capability: backup_only
       mount_guard:
         path: /mnt/webdav/.collector-mount-id
         expected: env:WEBDAV_MOUNT_ID
