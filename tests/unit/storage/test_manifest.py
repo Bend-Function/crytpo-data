@@ -660,6 +660,55 @@ def test_raw_manifest_reader_streams_rows_while_holding_shared_lease(
         pass
 
 
+def test_raw_manifest_reader_accepts_the_exact_expected_manifest_sha256(
+    tmp_path: Path,
+) -> None:
+    _data_root, manifest_path, envelope, _manifest = _write_readable_part(tmp_path)
+    loaded = load_raw_manifest(manifest_path)
+
+    with RawManifestReader(
+        manifest_path,
+        expected_manifest_sha256=loaded.sha256,
+    ) as reader:
+        assert list(reader) == [envelope]
+
+
+def test_raw_manifest_reader_rejects_an_unexpected_manifest_before_rows(
+    tmp_path: Path,
+) -> None:
+    data_root, manifest_path, _envelope, manifest = _write_readable_part(tmp_path)
+    lease_path = lease_path_for_data(data_root / manifest.data_relative_path)
+
+    with (
+        pytest.raises(ManifestValidationError, match="expected source identity"),
+        RawManifestReader(
+            manifest_path,
+            expected_manifest_sha256="0" * 64,
+        ),
+    ):
+        pass
+
+    with SourceLease.exclusive(lease_path, blocking=False):
+        pass
+
+
+@pytest.mark.parametrize(
+    "expected_manifest_sha256",
+    [True, "A" * 64, "a" * 63, "not-a-digest"],
+)
+def test_raw_manifest_reader_rejects_invalid_expected_manifest_sha256(
+    tmp_path: Path,
+    expected_manifest_sha256: object,
+) -> None:
+    _data_root, manifest_path, _envelope, _manifest = _write_readable_part(tmp_path)
+
+    with pytest.raises(ValueError, match="expected_manifest_sha256"):
+        RawManifestReader(
+            manifest_path,
+            expected_manifest_sha256=expected_manifest_sha256,  # type: ignore[arg-type]
+        )
+
+
 def _track_data_file_opens(
     monkeypatch: pytest.MonkeyPatch,
     data_path: Path,
