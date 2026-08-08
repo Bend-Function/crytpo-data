@@ -609,13 +609,15 @@ class FilesystemTargetConfig(ArchiveTargetBase):
 
     @model_validator(mode="after")
     def validate_mount_paths(self) -> Self:
-        if self.root != self.mount_root and self.mount_root not in self.root.parents:
-            raise ValueError("filesystem root must be inside mount_root")
+        if self.mount_root not in self.root.parents:
+            raise ValueError(
+                "filesystem root must be a strict descendant of mount_root"
+            )
         guard_path = self.mount_guard.path
         if guard_path == self.mount_root or self.mount_root not in guard_path.parents:
             raise ValueError("filesystem mount_guard.path must be inside mount_root")
-        if guard_path == self.root:
-            raise ValueError("filesystem mount_guard.path must not equal root")
+        if _paths_overlap(guard_path, self.root):
+            raise ValueError("filesystem mount_guard.path must not overlap root")
         return self
 
 
