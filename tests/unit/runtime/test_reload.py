@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
+from crypto_collector.capabilities.registry import CapabilityRegistry
 from crypto_collector.runtime.reload import (
     ReferenceConfigSnapshot,
     ReferenceDocumentError,
@@ -168,12 +170,114 @@ def test_reference_config_decoder_migrates_legacy_version_one(
     assert b'"schema_version":2' in encode_reference_config(migrated)
 
 
+def test_v3_reference_config_binds_the_public_capability_document(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry.load_builtin()
+    document = registry.to_public_document()
+    snapshot = ReferenceConfigSnapshot(
+        schema_version=3,
+        config_sha256="a" * 64,
+        capability_registry_sha256=registry.sha256,
+        capability_registry_document=document,
+        config_path=str(tmp_path / "collector.yaml"),
+        base_dir=str(tmp_path),
+        source_document={"enabled": True},
+    )
+
+    restored = decode_reference_config(encode_reference_config(snapshot))
+
+    assert restored == snapshot
+    assert restored.capability_registry_document is not None
+    assert (
+        CapabilityRegistry.from_public_document(restored.capability_registry_document)
+        == registry
+    )
+
+    tampered = deepcopy(document)
+    tampered["records"][0]["anonymous_only"] = False  # type: ignore[index]
+    with pytest.raises(ReferenceDocumentError, match="capability registry digest"):
+        ReferenceConfigSnapshot(
+            schema_version=3,
+            config_sha256="a" * 64,
+            capability_registry_sha256=registry.sha256,
+            capability_registry_document=tampered,
+            config_path=str(tmp_path / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+
+def test_v3_reference_config_rejects_unknown_registry_schema_without_canary(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry.load_builtin()
+    unknown_schema = deepcopy(registry.to_public_document())
+    unknown_schema["schema_version"] = 99
+
+    with pytest.raises(ReferenceDocumentError, match="capability registry"):
+        ReferenceConfigSnapshot(
+            schema_version=3,
+            config_sha256="a" * 64,
+            capability_registry_sha256=registry.sha256,
+            capability_registry_document=unknown_schema,
+            config_path=str(tmp_path / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+    canary = "registry-plaintext-secret-canary"
+    secret_document = deepcopy(registry.to_public_document())
+    secret_document["records"][0]["api_key"] = canary  # type: ignore[index]
+    with pytest.raises(ReferenceDocumentError) as captured:
+        ReferenceConfigSnapshot(
+            schema_version=3,
+            config_sha256="a" * 64,
+            capability_registry_sha256=registry.sha256,
+            capability_registry_document=secret_document,
+            config_path=str(tmp_path / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+    assert canary not in str(captured.value)
+
+    invalid_record = deepcopy(registry.to_public_document())
+    invalid_record["records"][0]["anonymous_only"] = canary  # type: ignore[index]
+    with pytest.raises(ReferenceDocumentError) as graph_capture:
+        ReferenceConfigSnapshot(
+            schema_version=3,
+            config_sha256="a" * 64,
+            capability_registry_sha256=registry.sha256,
+            capability_registry_document=invalid_record,
+            config_path=str(tmp_path / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+    pending: list[BaseException] = [graph_capture.value]
+    diagnostics: list[str] = []
+    seen: set[int] = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        diagnostics.extend((str(error), repr(error), repr(error.args)))
+        if error.__cause__ is not None:
+            pending.append(error.__cause__)
+        if error.__context__ is not None:
+            pending.append(error.__context__)
+    assert graph_capture.value.__cause__ is None
+    assert graph_capture.value.__context__ is None
+    assert canary not in "\n".join(diagnostics)
+
+
 def test_reference_config_rejects_future_schema_and_noncanonical_paths(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(ReferenceDocumentError, match="schema_version"):
         ReferenceConfigSnapshot(
-            schema_version=3,
+            schema_version=4,
             config_sha256="a" * 64,
             capability_registry_sha256="b" * 64,
             config_path=str(tmp_path / "collector.yaml"),
@@ -298,3 +402,37 @@ def test_capability_hash_and_process_model_changes_are_reported(tmp_path: Path) 
         "runtime.process_model",
     )
     assert diff.restart_required_keys == ("process_model",)
+
+
+def test_reload_diff_is_unchanged_by_equivalent_v3_registry_documents(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry.load_builtin()
+    common = {
+        "schema_version": 3,
+        "capability_registry_sha256": registry.sha256,
+        "capability_registry_document": registry.to_public_document(),
+        "config_path": str(tmp_path / "collector.yaml"),
+        "base_dir": str(tmp_path),
+    }
+    old = ReferenceConfigSnapshot(
+        config_sha256="a" * 64,
+        source_document={"selection": {"top_n": 10}},
+        **common,  # type: ignore[arg-type]
+    )
+    new = ReferenceConfigSnapshot(
+        config_sha256="b" * 64,
+        source_document={"selection": {"top_n": 11}},
+        **common,  # type: ignore[arg-type]
+    )
+    legacy = ReferenceConfigSnapshot(
+        schema_version=2,
+        config_sha256=old.config_sha256,
+        capability_registry_sha256=registry.sha256,
+        config_path=old.config_path,
+        base_dir=old.base_dir,
+        source_document=old.source_document,
+    )
+
+    assert classify_reload(legacy, old).changed_paths == ()
+    assert classify_reload(old, new).changed_paths == ("selection.top_n",)

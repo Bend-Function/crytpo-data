@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from crypto_collector.capabilities.registry import CapabilityError
+from crypto_collector.capabilities.registry import CapabilityError, CapabilityRegistry
 from crypto_collector.config.fingerprint import config_sha256
 from crypto_collector.config.loader import (
     ConfigSecretError,
@@ -362,6 +362,55 @@ def test_reference_snapshot_freezes_the_actual_merged_document(
     (config_tree / "config" / "exchanges" / "binance.yaml").unlink()
 
     assert rehydrate_bundle(snapshot) == original
+
+
+def test_v3_snapshot_rehydrates_after_builtin_registry_changes(
+    config_tree: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = load_reference_config(config_tree)
+    expected = rehydrate_bundle(snapshot)
+
+    assert snapshot.schema_version == 3
+    assert snapshot.capability_registry_document is not None
+
+    def fail_if_builtin_is_read(cls: type[CapabilityRegistry]) -> CapabilityRegistry:
+        raise AssertionError("v3 rehydrate read the current binary registry")
+
+    monkeypatch.setattr(
+        CapabilityRegistry,
+        "load_builtin",
+        classmethod(fail_if_builtin_is_read),
+    )
+
+    assert rehydrate_bundle(snapshot) == expected
+
+
+def test_legacy_v2_snapshot_keeps_builtin_registry_fail_closed_semantics(
+    config_tree: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = load_reference_config(config_tree)
+    legacy = ReferenceConfigSnapshot(
+        schema_version=2,
+        config_sha256=current.config_sha256,
+        capability_registry_sha256=current.capability_registry_sha256,
+        config_path=current.config_path,
+        base_dir=current.base_dir,
+        source_document=current.source_document,
+    )
+    builtin = CapabilityRegistry.load_builtin()
+    mutated = CapabilityRegistry(records=builtin.records, sha256="0" * 64)
+    monkeypatch.setattr(
+        CapabilityRegistry,
+        "load_builtin",
+        classmethod(lambda cls: mutated),
+    )
+
+    with pytest.raises(ReferenceDocumentError, match="built-in registry"):
+        rehydrate_bundle(legacy)
+
+    assert legacy.capability_registry_document is None
 
 
 def test_reference_snapshot_freezes_symlinked_model_paths(

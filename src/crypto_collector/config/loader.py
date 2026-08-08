@@ -283,8 +283,10 @@ def load_reference_config(path: Path) -> ReferenceConfigSnapshot:
 
     root_path, source_document, bundle = _load_config_and_document(path)
     snapshot = ReferenceConfigSnapshot(
+        schema_version=3,
         config_sha256=bundle.config_sha256,
         capability_registry_sha256=bundle.capabilities.sha256,
+        capability_registry_document=bundle.capabilities.to_public_document(),
         config_path=str(root_path),
         base_dir=str(root_path.parent),
         source_document=source_document,
@@ -300,14 +302,36 @@ def rehydrate_bundle(snapshot: ReferenceConfigSnapshot) -> ConfigBundle:
         raise TypeError("snapshot must be ReferenceConfigSnapshot")
 
     validated = decode_reference_config(encode_reference_config(snapshot))
-    registry = CapabilityRegistry.load_builtin()
-    if not hmac.compare_digest(
-        validated.capability_registry_sha256,
-        registry.sha256,
-    ):
-        raise ReferenceDocumentError(
-            "reference config capability registry digest does not match built-in registry"
-        )
+    registry_document = validated.capability_registry_document
+    if registry_document is None:
+        registry = CapabilityRegistry.load_builtin()
+        if not hmac.compare_digest(
+            validated.capability_registry_sha256,
+            registry.sha256,
+        ):
+            raise ReferenceDocumentError(
+                "reference config capability registry digest does not match "
+                "built-in registry"
+            )
+    else:
+        document_registry: CapabilityRegistry | None
+        try:
+            document_registry = CapabilityRegistry.from_public_document(
+                registry_document
+            )
+        except CapabilityError:
+            document_registry = None
+        if document_registry is None:
+            raise ReferenceDocumentError("invalid public capability registry document")
+        registry = document_registry
+        if not hmac.compare_digest(
+            validated.capability_registry_sha256,
+            registry.sha256,
+        ):
+            raise ReferenceDocumentError(
+                "reference config capability registry digest does not match its "
+                "public document"
+            )
 
     config = CollectorConfig.model_validate(
         thaw_reference_document(validated.source_document),

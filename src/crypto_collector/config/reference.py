@@ -13,8 +13,11 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
+from crypto_collector.capabilities.registry import CapabilityError, CapabilityRegistry
+
 _LEGACY_SCHEMA_VERSION = 1
-_SCHEMA_VERSION = 2
+_DIGEST_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 _MAX_INT64 = (1 << 63) - 1
@@ -29,7 +32,8 @@ _LEGACY_ENVELOPE_KEYS = frozenset(
         "source_document",
     }
 )
-_ENVELOPE_KEYS = _LEGACY_ENVELOPE_KEYS | {"document_sha256"}
+_DIGEST_ENVELOPE_KEYS = _LEGACY_ENVELOPE_KEYS | {"document_sha256"}
+_ENVELOPE_KEYS = _DIGEST_ENVELOPE_KEYS | {"capability_registry_document"}
 
 
 class ReferenceDocumentError(ValueError):
@@ -275,6 +279,7 @@ def _reference_document_sha256(
     config_path: str,
     base_dir: str,
     source_document: Mapping[str, object],
+    capability_registry_document: Mapping[str, object] | None,
 ) -> str:
     unsigned = {
         "base_dir": base_dir,
@@ -284,6 +289,8 @@ def _reference_document_sha256(
         "schema_version": schema_version,
         "source_document": source_document,
     }
+    if schema_version == _SCHEMA_VERSION:
+        unsigned["capability_registry_document"] = capability_registry_document
     return hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
 
 
@@ -322,8 +329,12 @@ class ReferenceConfigSnapshot:
     config_path: str
     base_dir: str
     source_document: Mapping[str, object] = field(repr=False)
+    capability_registry_document: Mapping[str, object] | None = field(
+        default=None,
+        repr=False,
+    )
     document_sha256: str | None = field(default=None, repr=False)
-    schema_version: int = _SCHEMA_VERSION
+    schema_version: int = _DIGEST_SCHEMA_VERSION
     _legacy_encoding: bytes | None = field(
         default=None,
         init=False,
@@ -332,11 +343,13 @@ class ReferenceConfigSnapshot:
     )
 
     def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != _SCHEMA_VERSION
-        ):
-            raise ReferenceDocumentError(f"schema_version must equal {_SCHEMA_VERSION}")
+        if type(self.schema_version) is not int or self.schema_version not in {
+            _DIGEST_SCHEMA_VERSION,
+            _SCHEMA_VERSION,
+        }:
+            raise ReferenceDocumentError(
+                f"schema_version must equal {_DIGEST_SCHEMA_VERSION} or {_SCHEMA_VERSION}"
+            )
         object.__setattr__(
             self,
             "config_sha256",
@@ -361,6 +374,50 @@ class ReferenceConfigSnapshot:
         frozen = freeze_reference_document(self.source_document)
         object.__setattr__(self, "source_document", frozen)
 
+        registry_document = self.capability_registry_document
+        if self.schema_version == _DIGEST_SCHEMA_VERSION:
+            if registry_document is not None:
+                raise ReferenceDocumentError(
+                    "version 2 reference config cannot contain a capability registry "
+                    "document"
+                )
+            frozen_registry_document = None
+        else:
+            if not isinstance(registry_document, Mapping):
+                raise ReferenceDocumentError(
+                    "version 3 reference config requires a capability registry document"
+                )
+            frozen_registry = _freeze_reference_value(
+                registry_document,
+                path=("capability_registry_document",),
+            )
+            if not isinstance(frozen_registry, Mapping):  # pragma: no cover
+                raise ReferenceDocumentError(
+                    "capability registry document must be a JSON object"
+                )
+            registry: CapabilityRegistry | None
+            try:
+                registry = CapabilityRegistry.from_public_document(frozen_registry)
+            except CapabilityError:
+                registry = None
+            if registry is None:
+                raise ReferenceDocumentError(
+                    "invalid public capability registry document"
+                )
+            if not hmac.compare_digest(
+                self.capability_registry_sha256,
+                registry.sha256,
+            ):
+                raise ReferenceDocumentError(
+                    "capability registry digest does not match its public document"
+                )
+            frozen_registry_document = frozen_registry
+        object.__setattr__(
+            self,
+            "capability_registry_document",
+            frozen_registry_document,
+        )
+
         computed_digest = _reference_document_sha256(
             schema_version=self.schema_version,
             config_sha256=self.config_sha256,
@@ -368,6 +425,7 @@ class ReferenceConfigSnapshot:
             config_path=config_path,
             base_dir=base_dir,
             source_document=frozen,
+            capability_registry_document=frozen_registry_document,
         )
         if self.document_sha256 is not None:
             supplied_digest = _validate_sha256(
@@ -443,6 +501,7 @@ def _validated_reference_config(
         schema_version=snapshot.schema_version,
         config_sha256=snapshot.config_sha256,
         capability_registry_sha256=snapshot.capability_registry_sha256,
+        capability_registry_document=snapshot.capability_registry_document,
         config_path=snapshot.config_path,
         base_dir=snapshot.base_dir,
         source_document=snapshot.source_document,
@@ -453,17 +512,18 @@ def _validated_reference_config(
 def _encode_validated_reference_config_unbounded(
     snapshot: ReferenceConfigSnapshot,
 ) -> bytes:
-    return _encode_reference_payload_unbounded(
-        {
-            "base_dir": snapshot.base_dir,
-            "capability_registry_sha256": snapshot.capability_registry_sha256,
-            "config_path": snapshot.config_path,
-            "config_sha256": snapshot.config_sha256,
-            "document_sha256": snapshot.document_sha256,
-            "schema_version": snapshot.schema_version,
-            "source_document": snapshot.source_document,
-        }
-    )
+    document: dict[str, object] = {
+        "base_dir": snapshot.base_dir,
+        "capability_registry_sha256": snapshot.capability_registry_sha256,
+        "config_path": snapshot.config_path,
+        "config_sha256": snapshot.config_sha256,
+        "document_sha256": snapshot.document_sha256,
+        "schema_version": snapshot.schema_version,
+        "source_document": snapshot.source_document,
+    }
+    if snapshot.schema_version == _SCHEMA_VERSION:
+        document["capability_registry_document"] = snapshot.capability_registry_document
+    return _encode_reference_payload_unbounded(document)
 
 
 def encode_reference_config(snapshot: ReferenceConfigSnapshot) -> bytes:
@@ -503,12 +563,24 @@ def _decode_reference_config_document(
                 "reference config envelope must contain exactly the version 1 fields"
             )
         document_sha256 = None
-    elif schema_version == _SCHEMA_VERSION:
-        if frozenset(document) != _ENVELOPE_KEYS:
+        capability_registry_document = None
+        target_schema_version = _DIGEST_SCHEMA_VERSION
+    elif schema_version == _DIGEST_SCHEMA_VERSION:
+        if frozenset(document) != _DIGEST_ENVELOPE_KEYS:
             raise ReferenceDocumentError(
                 "reference config envelope must contain exactly the version 2 fields"
             )
         document_sha256 = document["document_sha256"]
+        capability_registry_document = None
+        target_schema_version = _DIGEST_SCHEMA_VERSION
+    elif schema_version == _SCHEMA_VERSION:
+        if frozenset(document) != _ENVELOPE_KEYS:
+            raise ReferenceDocumentError(
+                "reference config envelope must contain exactly the version 3 fields"
+            )
+        document_sha256 = document["document_sha256"]
+        capability_registry_document = document["capability_registry_document"]
+        target_schema_version = _SCHEMA_VERSION
     else:
         raise ReferenceDocumentError(
             f"unsupported reference config schema_version {schema_version}"
@@ -518,9 +590,10 @@ def _decode_reference_config_document(
         raise ReferenceDocumentError("source_document must be a JSON object")
     return (
         ReferenceConfigSnapshot(
-            schema_version=_SCHEMA_VERSION,
+            schema_version=target_schema_version,
             config_sha256=document["config_sha256"],  # type: ignore[arg-type]
             capability_registry_sha256=document["capability_registry_sha256"],  # type: ignore[arg-type]
+            capability_registry_document=capability_registry_document,  # type: ignore[arg-type]
             config_path=document["config_path"],  # type: ignore[arg-type]
             base_dir=document["base_dir"],  # type: ignore[arg-type]
             source_document=source,

@@ -10,7 +10,10 @@ import pytest
 
 from crypto_collector.capabilities.registry import CapabilityRegistry
 from crypto_collector.config.fingerprint import config_sha256
-from crypto_collector.config.loader import rehydrate_bundle
+from crypto_collector.config.loader import (
+    load_reference_config,
+    rehydrate_bundle,
+)
 from crypto_collector.config.models import CollectorConfig
 from crypto_collector.runtime.reload import (
     ReferenceConfigSnapshot,
@@ -291,6 +294,60 @@ def test_store_reopens_exact_limit_legacy_snapshot_without_oversized_rewrite(
         )
     assert persisted == encoded
     assert json.loads(persisted)["schema_version"] == 1
+
+
+def test_store_reopens_v3_snapshot_with_its_bound_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "data_root: ./data\nstate_root: ./state\n",
+        encoding="utf-8",
+    )
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "network.yaml").write_text(
+        "egress_pool:\n  - id: direct\n    type: direct\n",
+        encoding="utf-8",
+    )
+    snapshot = load_reference_config(tmp_path)
+    path = tmp_path / "reload.sqlite3"
+    with ReloadStateStore.open(path) as store:
+        store.commit_initial_epoch(
+            snapshot,
+            supervisor_instance_id="supervisor-a",
+            request_id="startup-1",
+            committed_at_ns=10,
+        )
+
+    monkeypatch.setattr(
+        CapabilityRegistry,
+        "load_builtin",
+        classmethod(
+            lambda cls: (_ for _ in ()).throw(
+                AssertionError("v3 rehydrate read current binary registry")
+            )
+        ),
+    )
+    with ReloadStateStore.open(path) as reopened:
+        current = reopened.current_epoch()
+        assert current is not None
+        assert current.snapshot.schema_version == 3
+        assert current.snapshot.capability_registry_document is not None
+        assert (
+            rehydrate_bundle(current.snapshot).config_sha256 == snapshot.config_sha256
+        )
+
+    with sqlite3.connect(path) as connection:
+        persisted = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT config_snapshot FROM reload_epoch WHERE epoch = 1"
+                ).fetchone()[0]
+            )
+        )
+    assert persisted["schema_version"] == 3
+    assert persisted["capability_registry_document"]["records"]
 
 
 def test_ack_fence_rejects_stale_supervisor_request_worker_and_generation(
