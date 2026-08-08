@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-08",
+  "entries": [
+    {
+      "file": "spot-exchange-info.json",
+      "sha256": "2046f45f90cb5ba76d73c8938443197533b14071bf5f0c38a96c299426c694e7",
+      "source_document": "docs/exchanges/binance/sources/spot-rest-public-market.md",
+      "source_document_sha256": "49ea6809243fc7fb426e07f2fe662097736c7bb405bd2da5eef637d715427999",
+      "source_anchor": "#exchange-information",
+      "adaptation": "Official exchangeInfo shape with Spot permission sets, a non-Spot row, an unknown lifecycle status, exact filters, and a forward-compatible field."
+    },
+    {
+      "file": "futures-exchange-info.json",
+      "sha256": "1959e030b9b4ff667f6e3b21f6b92518d8d18ae2986c60b3d2e3bbc0853ccb61",
+      "source_document": "docs/exchanges/binance/sources/futures-rest-market-data-sdk.py",
+      "source_document_sha256": "6a5f6f45fb80e73b1bf09c24ccbf7a45dbb1604fbad2e163847d3379a456cd05",
+      "source_anchor": "MarketDataApi.exchange_information",
+      "additional_sources": [
+        {
+          "path": "docs/exchanges/binance/sources/futures-rest-exchange-info-response.py",
+          "sha256": "84dc0e0acad0ffae737cca6d5cfdadc17f92d61b4eaedb1187641b9b212da51f"
+        },
+        {
+          "path": "docs/exchanges/binance/sources/futures-rest-exchange-symbol-response.py",
+          "sha256": "c05e619c68dff07893c8440c3d11f4969f74c2dac6909407839f66dc2e301559"
+        }
+      ],
+      "adaptation": "Official live USD-M exchangeInfo shape with top-level futuresType=U_MARGINED, no row st, and a Unicode new-coin symbol; adapted across perpetual, pending, unknown, quarterly, USDC, plus a future mixed-universe st=2 rejection row."
+    },
+    {
+      "file": "spot-depth.json",
+      "sha256": "0d2a8e5e0720dae5bcd78b77e7f45493af11eba370f2127c9f43ac68a1a41ba9",
+      "source_document": "docs/exchanges/binance/sources/spot-rest-public-market.md",
+      "source_document_sha256": "49ea6809243fc7fb426e07f2fe662097736c7bb405bd2da5eef637d715427999",
+      "source_anchor": "#order-book",
+      "adaptation": "Official Spot depth response with exact decimal strings and one unknown field retained by the raw capture."
+    },
+    {
+      "file": "futures-depth.json",
+      "sha256": "f1a12f789845b17f81ac9e0a2ff98032a30dd3a96cf57f35fbef52bc068abd67",
+      "source_document": "docs/exchanges/binance/sources/futures-rest-market-data-sdk.py",
+      "source_document_sha256": "6a5f6f45fb80e73b1bf09c24ccbf7a45dbb1604fbad2e163847d3379a456cd05",
+      "source_anchor": "MarketDataApi.order_book",
+      "additional_sources": [
+        {
+          "path": "docs/exchanges/binance/sources/futures-rest-order-book-response.py",
+          "sha256": "7ed3baa92d05df003617be72f8a2ce6fbcd77352118eb6570bfb49a29915d1d3"
+        }
+      ],
+      "adaptation": "Official Futures depth shape with event/transaction timestamps, exact decimal strings, and a forward-compatible field."
+    },
+    {
+      "file": "ws-session.json",
+      "sha256": "705bd848b2b584f5463e1be3f627c63e60b76632d62f34be7757111167d5a791",
+      "source_document": "docs/exchanges/binance/sources/futures-ws-connect.md",
+      "source_document_sha256": "912f2dad9da21b5c1801d73f052473b6a1d7136a43b2ff3e7a1c2cdc54abdde2",
+      "source_anchor": "#websocket-market-streams",
+      "additional_sources": [
+        {
+          "path": "docs/exchanges/binance/sources/spot-websocket-streams.md",
+          "sha256": "32bf73a0bed3b75e3ca981fdbaf48c53544bbdfb5944ef8ed1c4d7af9aceba0a"
+        },
+        {
+          "path": "docs/exchanges/binance/sources/futures-ws-market-sdk.py",
+          "sha256": "6b0a7c5d68ab39b849f027b43a6d51fcc624cf1ce73ba9983dd25b6b2493b196"
+        },
+        {
+          "path": "docs/exchanges/binance/sources/futures-ws-public-sdk.py",
+          "sha256": "5ed435cc9201faddb3d074d8ac65277671b2fc110912dcf59b9ffd74ec40149d"
+        },
+        {
+          "path": "docs/exchanges/binance/sources/futures-orderbook-sync.md",
+          "sha256": "d6a94d17fb32450c67ad598c0f923bf9df12ecdc43ced4928798a9fa56d62622"
+        }
+      ],
+      "adaptation": "Exact wire strings covering ack/error, Spot and routed Futures books, USD-M/COIN-M merger indicators, lossy liquidation, contract changes, and server shutdown."
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "spot_ack": "{\"result\":null,\"id\":\"spot1\",\"futureAckField\":{\"kept\":true}}",
+  "spot_depth": "{\"stream\":\"btcusdt@depth@100ms\",\"data\":{\"e\":\"depthUpdate\",\"E\":1672515782136,\"s\":\"BTCUSDT\",\"U\":157,\"u\":160,\"b\":[[\"0.0024\",\"10\"]],\"a\":[[\"0.0026\",\"100\"]],\"futureDepthField\":{\"kept\":true}}}",
+  "futures_depth": "{\"stream\":\"btcusdt@depth@100ms\",\"data\":{\"e\":\"depthUpdate\",\"E\":1672515782136,\"T\":1672515782135,\"s\":\"BTCUSDT\",\"U\":201,\"u\":202,\"pu\":200,\"b\":[[\"20000.10\",\"1.25\"]],\"a\":[[\"20001.20\",\"0\"]],\"st\":1,\"ps\":\"BTCUSDT\"}}",
+  "coin_m_depth": "{\"stream\":\"btcusd_perp@depth@100ms\",\"data\":{\"e\":\"depthUpdate\",\"E\":1672515782136,\"T\":1672515782135,\"s\":\"BTCUSD_PERP\",\"U\":201,\"u\":202,\"pu\":200,\"b\":[],\"a\":[],\"st\":2,\"ps\":\"BTCUSD\"}}",
+  "liquidation": "{\"stream\":\"btcusdt@forceOrder\",\"data\":{\"e\":\"forceOrder\",\"E\":1672515783000,\"o\":{\"s\":\"BTCUSDT\",\"S\":\"SELL\",\"o\":\"LIMIT\",\"f\":\"IOC\",\"q\":\"0.014\",\"p\":\"9910\",\"ap\":\"9910\",\"X\":\"FILLED\",\"l\":\"0.014\",\"z\":\"0.014\",\"T\":1672515782999},\"st\":1}}",
+  "contract_info": "{\"stream\":\"!contractInfo\",\"data\":{\"e\":\"contractInfo\",\"E\":1672515784000,\"s\":\"NEWUSDT\",\"ct\":\"PERPETUAL\",\"cs\":\"PENDING_TRADING\",\"st\":1,\"futureContractField\":\"kept\"}}",
+  "server_shutdown": "{\"stream\":\"!serverShutdown\",\"data\":{\"e\":\"serverShutdown\",\"E\":1770123456789}}",
+  "subscription_error": "{\"code\":2,\"msg\":\"Invalid request\",\"id\":\"bad1\",\"futureErrorField\":true}"
+}
