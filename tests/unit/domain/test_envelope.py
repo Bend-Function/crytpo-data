@@ -150,6 +150,31 @@ def test_declared_market_stream_may_omit_instrument_identity(
     assert draft.instrument_key is None
 
 
+def test_insurance_fund_remains_bound_to_its_selected_instrument() -> None:
+    draft = make_native_event_draft(
+        market=Market.PERPETUAL,
+        instrument_key="BTC-USDT-SWAP",
+        wire_symbol="BTC-USDT-SWAP",
+        logical_stream="insurance_fund",
+        native_channel="/api/v5/public/insurance-fund",
+        transport=Transport.REST,
+        rest_metadata=make_rest_metadata(),
+    )
+
+    assert draft.instrument_key == "BTC-USDT-SWAP"
+
+    with pytest.raises(ValidationError, match="instrument_key"):
+        make_native_event_draft(
+            market=Market.PERPETUAL,
+            instrument_key=None,
+            wire_symbol=None,
+            logical_stream="insurance_fund",
+            native_channel="/api/v5/public/insurance-fund",
+            transport=Transport.REST,
+            rest_metadata=make_rest_metadata(),
+        )
+
+
 def test_exchange_control_draft_uses_explicit_null_scope() -> None:
     draft = make_native_event_draft(
         market=None,

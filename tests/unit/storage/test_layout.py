@@ -118,6 +118,46 @@ def test_exchange_control_and_market_scope_use_distinct_reserved_layouts(
     )
 
 
+def test_insurance_fund_preserves_instrument_scope(tmp_path: Path) -> None:
+    insurance = make_envelope(
+        exchange=Exchange.OKX,
+        market=Market.PERPETUAL,
+        instrument_key="BTC-USDT-SWAP",
+        wire_symbol="BTC-USDT-SWAP",
+        logical_stream="insurance_fund",
+        native_channel="/api/v5/public/insurance-fund",
+        transport=Transport.REST,
+        connection_id=None,
+        connection_generation=None,
+        payload={"data": [{"instFamily": "BTC-USDT"}]},
+        rest_metadata={
+            "request_started_at_ns": 1,
+            "request_ended_at_ns": 2,
+            "method": "GET",
+            "path": "/api/v5/public/insurance-fund",
+            "params": {"instType": "SWAP", "instFamily": "BTC-USDT"},
+            "status": 200,
+            "attempt": 1,
+            "rate_limit_headers": {},
+        },
+    )
+
+    path = raw_partial_path(
+        tmp_path,
+        insurance,
+        part_start_ns=1_785_470_400_000_000_000,
+        sequence=0,
+    )
+
+    assert (
+        path.relative_to(tmp_path)
+        .as_posix()
+        .startswith(
+            "raw/okx/perpetual/BTC-USDT-SWAP/insurance_fund/2026/07/31/04/"
+        )
+    )
+
+
 def test_control_with_market_context_stays_in_exchange_control_namespace(
     tmp_path: Path,
 ) -> None:
