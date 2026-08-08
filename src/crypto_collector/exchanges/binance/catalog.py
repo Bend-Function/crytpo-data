@@ -102,10 +102,12 @@ def _observed_at(value: object) -> int:
 
 def _optional_milliseconds(item: Mapping[str, JsonPayload], field: str) -> int | None:
     value = item.get(field)
-    if value is None or value == 0:
+    if value is None:
         return None
     if type(value) is not int or value < 0:
         raise BinancePayloadError(f"Binance {field} must be Unix epoch milliseconds")
+    if value == 0:
+        return None
     nanoseconds = value * _MILLISECONDS_TO_NANOSECONDS
     if nanoseconds > _MAX_SIGNED_64:
         raise BinancePayloadError(

@@ -279,16 +279,42 @@ def test_candle_nested_identity_and_interval_must_match_subscription(
         parse_ws_message(raw, expected=spec)
 
 
-def test_index_info_event_type_must_match_composite_index_contract() -> None:
+def test_index_info_binds_independent_reference_identity_and_event_type() -> None:
     spec = stream_spec(
         Market.PERPETUAL,
         "index_info",
-        instrument_key="BTCUSDT",
-        wire_symbol="BTCUSDT",
+        index_symbol="SMALLUSDT",
     )
 
+    assert spec.instrument_key is None
+    assert spec.wire_symbol == "SMALLUSDT"
+    assert spec.stream_name == "smallusdt@compositeIndex"
     with pytest.raises(BinanceWsProtocolError, match="event type mismatch"):
-        parse_ws_message('{"e":"wrong","E":1,"s":"BTCUSDT"}', expected=spec)
+        parse_ws_message('{"e":"wrong","E":1,"s":"SMALLUSDT","st":1}', expected=spec)
+    with pytest.raises(BinanceWsProtocolError, match="symbol does not match"):
+        parse_ws_message(
+            '{"e":"compositeIndex","E":1,"s":"BTCUSDT","st":1}', expected=spec
+        )
+
+
+def test_index_info_rejects_contract_identity_and_other_streams_reject_index_symbol() -> (
+    None
+):
+    with pytest.raises(ValueError, match="explicit index symbol"):
+        stream_spec(
+            Market.PERPETUAL,
+            "index_info",
+            instrument_key="BTCUSDT",
+            wire_symbol="BTCUSDT",
+        )
+    with pytest.raises(ValueError, match="only for index_info"):
+        stream_spec(
+            Market.PERPETUAL,
+            "ticker",
+            instrument_key="BTCUSDT",
+            wire_symbol="BTCUSDT",
+            index_symbol="SMALLUSDT",
+        )
 
 
 def test_ticker_and_market_specific_bbo_shapes_fail_closed() -> None:

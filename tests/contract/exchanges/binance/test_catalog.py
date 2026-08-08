@@ -134,6 +134,20 @@ def test_optional_um_row_indicator_is_accepted_when_top_level_scope_is_usd_m() -
     assert "BTCUSDT" in {item.instrument_key for item in catalog.instruments}
 
 
+def test_boolean_onboard_date_is_rejected_instead_of_treated_as_zero() -> None:
+    payload = _json("futures-exchange-info.json")
+    first = _object(_array(_object(payload)["symbols"])[0])
+    assert isinstance(first, dict)
+    first["onboardDate"] = False
+
+    with pytest.raises(BinancePayloadError, match="onboardDate"):
+        parse_exchange_info(
+            payload,
+            Market.PERPETUAL,
+            observed_at_ns=_OBSERVED_NS,
+        )
+
+
 @pytest.mark.parametrize("futures_type", [None, "C_MARGINED", 1])
 def test_missing_wrong_or_malformed_top_level_futures_scope_fails_closed(
     futures_type: object,

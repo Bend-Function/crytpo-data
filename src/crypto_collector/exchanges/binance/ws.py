@@ -97,11 +97,16 @@ class BinanceStreamSpec:
             raise TypeError("route must be BinanceWsRoute")
         if not _valid_stream_token(self.stream_name):
             raise ValueError("stream_name contains unsupported URL characters")
-        if (self.instrument_key is None) != (self.wire_symbol is None):
+        if self.logical_stream == "index_info":
+            if self.instrument_key is not None or self.wire_symbol is None:
+                raise ValueError("index_info must bind an explicit index symbol")
+        elif (self.instrument_key is None) != (self.wire_symbol is None):
             raise ValueError("instrument_key and wire_symbol must be paired")
-        if self.instrument_key is not None:
-            if type(self.instrument_key) is not str or not self.instrument_key:
-                raise ValueError("instrument_key must be non-empty")
+        if self.instrument_key is not None and (
+            type(self.instrument_key) is not str or not self.instrument_key
+        ):
+            raise ValueError("instrument_key must be non-empty")
+        if self.wire_symbol is not None:
             wire_symbol = self.wire_symbol
             if (
                 type(wire_symbol) is not str
@@ -170,6 +175,7 @@ def stream_spec(
     *,
     instrument_key: str | None = None,
     wire_symbol: str | None = None,
+    index_symbol: str | None = None,
     update_speed_ms: int | None = None,
     all_market: bool = False,
 ) -> BinanceStreamSpec:
@@ -179,7 +185,10 @@ def stream_spec(
         raise ValueError("logical_stream must be non-empty")
     if type(all_market) is not bool:
         raise TypeError("all_market must be a boolean")
+    if index_symbol is not None and logical_stream != "index_info":
+        raise ValueError("index_symbol is valid only for index_info")
     symbol = None if wire_symbol is None else wire_symbol.lower()
+    bound_wire_symbol = wire_symbol
     coverage: CoverageMode | None = None
     if logical_stream == "instrument" and market is Market.PERPETUAL:
         if instrument_key is not None or wire_symbol is not None or not all_market:
@@ -195,6 +204,20 @@ def stream_spec(
             if symbol is None:
                 raise ValueError("symbol liquidation requires a wire symbol")
             name = f"{symbol}@forceOrder"
+    elif logical_stream == "index_info":
+        if market is not Market.PERPETUAL:
+            raise ValueError("index_info is available only for Binance Futures")
+        if instrument_key is not None or wire_symbol is not None or all_market:
+            raise ValueError("index_info requires an explicit index symbol")
+        if (
+            type(index_symbol) is not str
+            or not _valid_stream_token(index_symbol)
+            or "@" in index_symbol
+            or "!" in index_symbol
+        ):
+            raise ValueError("index_symbol contains unsupported stream delimiters")
+        bound_wire_symbol = index_symbol
+        name = f"{index_symbol.lower()}@compositeIndex"
     else:
         if all_market:
             raise ValueError("all_market is unsupported for this logical stream")
@@ -232,8 +255,6 @@ def stream_spec(
             if speed not in {1_000, 3_000}:
                 raise ValueError("mark-price speed must be 1000 or 3000ms")
             name = f"{symbol}@markPrice" + ("@1s" if speed == 1_000 else "")
-        elif logical_stream == "index_info" and market is Market.PERPETUAL:
-            name = f"{symbol}@compositeIndex"
         else:
             raise ValueError("unsupported Binance logical WebSocket stream")
     route = _route_for_stream(market, name)
@@ -243,7 +264,7 @@ def stream_spec(
         stream_name=name,
         route=route,
         instrument_key=instrument_key,
-        wire_symbol=wire_symbol,
+        wire_symbol=bound_wire_symbol,
         coverage=coverage,
     )
 
