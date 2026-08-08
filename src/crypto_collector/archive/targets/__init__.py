@@ -20,6 +20,19 @@ from crypto_collector.archive.targets.filesystem import (
     FilesystemNoReplaceCapability,
     FilesystemTarget,
 )
+from crypto_collector.archive.targets.s3 import (
+    S3AbortError,
+    S3CheckpointConflict,
+    S3CheckpointPersistenceError,
+    S3FatalAbortError,
+    S3FatalError,
+    S3ObjectConflict,
+    S3RetryableError,
+    S3StoredObjectMismatch,
+    S3Target,
+    build_s3_target,
+    classify_s3_error,
+)
 
 __all__ = [
     "ArchiveObjectSource",
@@ -31,11 +44,22 @@ __all__ = [
     "PutResult",
     "ReceiptLastCommit",
     "ResumeState",
+    "S3AbortError",
+    "S3CheckpointConflict",
+    "S3CheckpointPersistenceError",
+    "S3FatalAbortError",
+    "S3FatalError",
+    "S3ObjectConflict",
+    "S3RetryableError",
+    "S3StoredObjectMismatch",
+    "S3Target",
     "TargetClosed",
     "TargetProbe",
     "TargetUnavailable",
     "TargetVerificationError",
     "UnsafeObjectKey",
     "VerifyResult",
+    "build_s3_target",
+    "classify_s3_error",
     "publish_receipt_last",
 ]
