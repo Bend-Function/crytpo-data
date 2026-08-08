@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import json
+import pickle
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from crypto_collector.capabilities.registry import CapabilityRegistry
+from crypto_collector.config.fingerprint import config_sha256
+from crypto_collector.config.loader import rehydrate_bundle
+from crypto_collector.config.models import CollectorConfig
 from crypto_collector.runtime.reload import (
     ReferenceConfigSnapshot,
     ReferenceDocumentError,
+    encode_reference_config,
 )
 from crypto_collector.runtime.state_store import (
     AuditEvent,
@@ -204,6 +210,87 @@ def test_store_reopens_a_legacy_version_one_reference_snapshot(
         )
     assert persisted["schema_version"] == 2
     assert len(persisted["document_sha256"]) == 64
+
+
+def test_store_reopens_exact_limit_legacy_snapshot_without_oversized_rewrite(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reload.sqlite3"
+    with ReloadStateStore.open(path) as store:
+        store.commit_initial_epoch(
+            _snapshot(tmp_path, "a"),
+            supervisor_instance_id="supervisor-a",
+            request_id="startup-1",
+            committed_at_ns=10,
+        )
+
+    registry = CapabilityRegistry.load_builtin()
+    source_document = {
+        "data_root": str(tmp_path / "data"),
+        "state_root": str(tmp_path / "state"),
+        "exchanges": {
+            "okx": {
+                "endpoints": {"ws_public": "wss://ws.okx.com/"},
+                "markets": {"spot": {}},
+            }
+        },
+    }
+    legacy: dict[str, object] = {
+        "base_dir": str(tmp_path),
+        "capability_registry_sha256": registry.sha256,
+        "config_path": str(tmp_path / "collector.yaml"),
+        "config_sha256": "0" * 64,
+        "schema_version": 1,
+        "source_document": source_document,
+    }
+    encoded = json.dumps(legacy, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    source_document["exchanges"]["okx"]["endpoints"]["ws_public"] += "x" * (  # type: ignore[index,operator]
+        8 * 1024 * 1024 - len(encoded)
+    )
+    config = CollectorConfig.model_validate(
+        source_document,
+        context={"base_dir": tmp_path, "canonical_paths": True},
+    )
+    legacy["config_sha256"] = config_sha256(
+        config,
+        capability_registry_sha256=registry.sha256,
+    )
+    encoded = json.dumps(legacy, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    assert len(encoded) == 8 * 1024 * 1024
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE reload_epoch
+               SET config_sha256 = ?, config_snapshot = ?
+             WHERE epoch = 1
+            """,
+            (legacy["config_sha256"], encoded),
+        )
+
+    with ReloadStateStore.open(path) as reopened:
+        current = reopened.current_epoch()
+        assert current is not None
+        assert current.snapshot.schema_version == 2
+        assert current.snapshot.document_sha256 is not None
+        assert encode_reference_config(current.snapshot) == encoded
+        assert pickle.loads(pickle.dumps(current.snapshot)) == current.snapshot
+        rebuilt = rehydrate_bundle(current.snapshot)
+        assert rebuilt.config_sha256 == legacy["config_sha256"]
+        assert (
+            rebuilt.config.exchanges["okx"]
+            .endpoints["ws_public"]
+            .startswith("wss://ws.okx.com/")
+        )
+
+    with sqlite3.connect(path) as connection:
+        persisted = bytes(
+            connection.execute(
+                "SELECT config_snapshot FROM reload_epoch WHERE epoch = 1"
+            ).fetchone()[0]
+        )
+    assert persisted == encoded
+    assert json.loads(persisted)["schema_version"] == 1
 
 
 def test_ack_fence_rejects_stale_supervisor_request_worker_and_generation(

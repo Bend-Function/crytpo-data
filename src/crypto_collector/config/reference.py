@@ -105,9 +105,13 @@ def _secret_reference_error(path: tuple[str, ...]) -> ReferenceDocumentError:
 
 def _is_public_endpoint_path(path: tuple[str, ...]) -> bool:
     identities = tuple(_identifier(component) for component in path)
-    return bool(identities) and (
-        identities[-1] == "endpoint"
-        or ("exchanges" in identities and "endpoints" in identities[:-1])
+    return (
+        bool(identities)
+        and identities[0] == "sourcedocument"
+        and (
+            identities[-1] == "endpoint"
+            or ("exchanges" in identities and "endpoints" in identities[:-1])
+        )
     )
 
 
@@ -320,6 +324,12 @@ class ReferenceConfigSnapshot:
     source_document: Mapping[str, object] = field(repr=False)
     document_sha256: str | None = field(default=None, repr=False)
     schema_version: int = _SCHEMA_VERSION
+    _legacy_encoding: bytes | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -374,9 +384,13 @@ class ReferenceConfigSnapshot:
         return decode_reference_config, (encode_reference_config(self),)
 
 
-def encode_reference_payload(payload: Mapping[str, object]) -> bytes:
+def _encode_reference_payload_unbounded(payload: Mapping[str, object]) -> bytes:
     frozen = _freeze_reference_value(payload, path=("payload",))
-    encoded = _canonical_json_bytes(frozen)
+    return _canonical_json_bytes(frozen)
+
+
+def encode_reference_payload(payload: Mapping[str, object]) -> bytes:
+    encoded = _encode_reference_payload_unbounded(payload)
     if len(encoded) > _MAX_DOCUMENT_BYTES:
         raise ReferenceDocumentError("encoded payload exceeds 8 MiB")
     return encoded
@@ -418,12 +432,14 @@ def decode_reference_payload(encoded: bytes) -> Mapping[str, object]:
     return frozen
 
 
-def encode_reference_config(snapshot: ReferenceConfigSnapshot) -> bytes:
+def _validated_reference_config(
+    snapshot: ReferenceConfigSnapshot,
+) -> ReferenceConfigSnapshot:
     if not isinstance(snapshot, ReferenceConfigSnapshot):
         raise TypeError("snapshot must be ReferenceConfigSnapshot")
     if snapshot.document_sha256 is None:
         raise ReferenceDocumentError("reference config document digest is missing")
-    validated = ReferenceConfigSnapshot(
+    return ReferenceConfigSnapshot(
         schema_version=snapshot.schema_version,
         config_sha256=snapshot.config_sha256,
         capability_registry_sha256=snapshot.capability_registry_sha256,
@@ -432,21 +448,50 @@ def encode_reference_config(snapshot: ReferenceConfigSnapshot) -> bytes:
         source_document=snapshot.source_document,
         document_sha256=snapshot.document_sha256,
     )
-    return encode_reference_payload(
+
+
+def _encode_validated_reference_config_unbounded(
+    snapshot: ReferenceConfigSnapshot,
+) -> bytes:
+    return _encode_reference_payload_unbounded(
         {
-            "base_dir": validated.base_dir,
-            "capability_registry_sha256": validated.capability_registry_sha256,
-            "config_path": validated.config_path,
-            "config_sha256": validated.config_sha256,
-            "document_sha256": validated.document_sha256,
-            "schema_version": validated.schema_version,
-            "source_document": validated.source_document,
+            "base_dir": snapshot.base_dir,
+            "capability_registry_sha256": snapshot.capability_registry_sha256,
+            "config_path": snapshot.config_path,
+            "config_sha256": snapshot.config_sha256,
+            "document_sha256": snapshot.document_sha256,
+            "schema_version": snapshot.schema_version,
+            "source_document": snapshot.source_document,
         }
     )
 
 
-def decode_reference_config(encoded: bytes) -> ReferenceConfigSnapshot:
-    document = decode_reference_payload(encoded)
+def encode_reference_config(snapshot: ReferenceConfigSnapshot) -> bytes:
+    validated = _validated_reference_config(snapshot)
+    encoded = _encode_validated_reference_config_unbounded(validated)
+    if len(encoded) <= _MAX_DOCUMENT_BYTES:
+        return encoded
+
+    legacy_encoding = snapshot._legacy_encoding
+    if legacy_encoding is not None:
+        try:
+            legacy_snapshot, source_schema_version = (
+                _decode_reference_config_with_schema(legacy_encoding)
+            )
+        except ValueError:
+            pass
+        else:
+            if (
+                source_schema_version == _LEGACY_SCHEMA_VERSION
+                and legacy_snapshot == validated
+            ):
+                return legacy_encoding
+    raise ReferenceDocumentError("encoded payload exceeds 8 MiB")
+
+
+def _decode_reference_config_document(
+    document: Mapping[str, object],
+) -> tuple[ReferenceConfigSnapshot, int]:
     schema_version = document.get("schema_version")
     if type(schema_version) is not int:
         raise ReferenceDocumentError(
@@ -471,15 +516,43 @@ def decode_reference_config(encoded: bytes) -> ReferenceConfigSnapshot:
     source = document["source_document"]
     if not isinstance(source, Mapping):
         raise ReferenceDocumentError("source_document must be a JSON object")
-    return ReferenceConfigSnapshot(
-        schema_version=_SCHEMA_VERSION,
-        config_sha256=document["config_sha256"],  # type: ignore[arg-type]
-        capability_registry_sha256=document["capability_registry_sha256"],  # type: ignore[arg-type]
-        config_path=document["config_path"],  # type: ignore[arg-type]
-        base_dir=document["base_dir"],  # type: ignore[arg-type]
-        source_document=source,
-        document_sha256=document_sha256,  # type: ignore[arg-type]
+    return (
+        ReferenceConfigSnapshot(
+            schema_version=_SCHEMA_VERSION,
+            config_sha256=document["config_sha256"],  # type: ignore[arg-type]
+            capability_registry_sha256=document["capability_registry_sha256"],  # type: ignore[arg-type]
+            config_path=document["config_path"],  # type: ignore[arg-type]
+            base_dir=document["base_dir"],  # type: ignore[arg-type]
+            source_document=source,
+            document_sha256=document_sha256,  # type: ignore[arg-type]
+        ),
+        schema_version,
     )
+
+
+def _decode_reference_config_with_schema(
+    encoded: bytes,
+) -> tuple[ReferenceConfigSnapshot, int]:
+    snapshot, source_schema_version = _decode_reference_config_document(
+        decode_reference_payload(encoded)
+    )
+    if source_schema_version == _LEGACY_SCHEMA_VERSION:
+        object.__setattr__(snapshot, "_legacy_encoding", encoded)
+    return snapshot, source_schema_version
+
+
+def decode_reference_config(encoded: bytes) -> ReferenceConfigSnapshot:
+    snapshot, _ = _decode_reference_config_with_schema(encoded)
+    return snapshot
+
+
+def decode_stored_reference_config(
+    encoded: bytes,
+) -> tuple[ReferenceConfigSnapshot, bytes]:
+    """Decode a stored snapshot and return its migration rewrite when one fits."""
+
+    snapshot, _ = _decode_reference_config_with_schema(encoded)
+    return snapshot, encode_reference_config(snapshot)
 
 
 __all__ = [
@@ -487,6 +560,7 @@ __all__ = [
     "ReferenceDocumentError",
     "decode_reference_config",
     "decode_reference_payload",
+    "decode_stored_reference_config",
     "encode_reference_config",
     "encode_reference_payload",
     "freeze_reference_document",

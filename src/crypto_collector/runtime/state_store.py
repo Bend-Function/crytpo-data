@@ -11,6 +11,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Self
 
+from crypto_collector.config.reference import decode_stored_reference_config
 from crypto_collector.runtime.reload import (
     ReferenceConfigSnapshot,
     decode_reference_config,
@@ -538,7 +539,9 @@ def _validate_durable_epoch_rows(connection: sqlite3.Connection) -> None:
     for row in rows:
         encoded_snapshot = bytes(row["config_snapshot"])
         try:
-            snapshot = decode_reference_config(encoded_snapshot)
+            snapshot, canonical_snapshot = decode_stored_reference_config(
+                encoded_snapshot
+            )
         except ValueError:
             raise RuntimeError(
                 f"epoch {int(row['epoch'])} contains an invalid config snapshot"
@@ -547,7 +550,6 @@ def _validate_durable_epoch_rows(connection: sqlite3.Connection) -> None:
             raise RuntimeError(
                 f"epoch {int(row['epoch'])} config digest does not match its snapshot"
             )
-        canonical_snapshot = encode_reference_config(snapshot)
         if canonical_snapshot != encoded_snapshot:
             connection.execute(
                 "UPDATE reload_epoch SET config_snapshot = ? WHERE epoch = ?",

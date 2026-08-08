@@ -10,7 +10,9 @@ from crypto_collector.runtime.reload import (
     ReferenceDocumentError,
     classify_reload,
     decode_reference_config,
+    decode_reference_payload,
     encode_reference_config,
+    encode_reference_payload,
 )
 
 
@@ -58,6 +60,12 @@ def test_reference_config_codec_is_canonical_and_immutable(tmp_path: Path) -> No
 
     with pytest.raises(TypeError):
         first.source_document["data_root"] = "/tmp/other"  # type: ignore[index]
+
+
+def test_generic_audit_payload_endpoint_is_not_treated_as_config_uri() -> None:
+    encoded = encode_reference_payload({"endpoint": "logical-endpoint"})
+
+    assert decode_reference_payload(encoded)["endpoint"] == "logical-endpoint"
 
 
 @pytest.mark.parametrize(
