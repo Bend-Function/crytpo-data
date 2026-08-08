@@ -160,6 +160,28 @@ class ResumeState:
             raise ValueError("resume parts must be sorted and unique")
 
 
+@runtime_checkable
+class MultipartJournal(Protocol):
+    def load(self) -> ResumeState | None: ...
+
+    def save(
+        self,
+        state: ResumeState,
+        expected_upload_id: str | None,
+    ) -> None: ...
+
+    def clear(self, expected_upload_id: str) -> None: ...
+
+
+@runtime_checkable
+class MultipartJournalFactory(Protocol):
+    def __call__(
+        self,
+        source: ArchiveObjectSource,
+        key: str,
+    ) -> MultipartJournal: ...
+
+
 @dataclass(frozen=True, slots=True)
 class TargetProbe:
     target_id: str
@@ -175,10 +197,14 @@ class TargetProbe:
             raise ValueError("archive target probe ID is invalid")
         if self.target_type not in {"aliyun_oss", "s3", "filesystem"}:
             raise ValueError("archive target probe type is invalid")
-        _opaque_provider_value(
+        capability = _opaque_provider_value(
             self.no_replace_capability,
             field_name="no-replace capability",
         )
+        if capability is None or capability != capability.strip():
+            raise ValueError(
+                "no-replace capability must be a normalized non-empty string"
+            )
         _opaque_provider_value(self.mount_identity, field_name="mount identity")
         if (self.target_type == "filesystem") != (self.mount_identity is not None):
             raise ValueError("mount identity is inconsistent with target type")
@@ -425,8 +451,11 @@ def publish_receipt_last(
                 sha256=source.sha256,
             )
         )
-    for key in (data_key, source_manifest_key, receipt_key):
-        _object_key(key)
+    validated_keys = tuple(
+        _object_key(key) for key in (data_key, source_manifest_key, receipt_key)
+    )
+    if len({key.encode("utf-8") for key in validated_keys}) != len(validated_keys):
+        raise ValueError("receipt-last object keys must be pairwise distinct")
     validated_data, validated_manifest, validated_receipt = validated_sources
     data_result = _put_and_verify(target, validated_data, data_key)
     manifest_result = _put_and_verify(
@@ -445,6 +474,8 @@ def publish_receipt_last(
 __all__ = [
     "ArchiveObjectSource",
     "ArchiveTarget",
+    "MultipartJournal",
+    "MultipartJournalFactory",
     "PublishedObject",
     "PutResult",
     "ReceiptLastCommit",
