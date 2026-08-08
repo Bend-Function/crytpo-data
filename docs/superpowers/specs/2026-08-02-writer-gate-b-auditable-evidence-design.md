@@ -4,6 +4,13 @@ Date: 2026-08-02
 
 Status: approved design direction (option A); written specification awaiting user review
 
+> **Scope authority (2026-08-08):** This evidence design is retained, but the
+> [`functional-completion scope amendment`](2026-08-08-functional-completion-scope-amendment.md)
+> makes its `1s`, `10m@2x`, and target qualification predicates optional release
+> performance evidence. Functional conservation/recovery and bounded short multi-round
+> checks remain required. A qualification failure remains a failure and must not be
+> presented as `qualification_accepted` or `EVIDENCE_ACCEPTED`.
+
 ## 1. Purpose
 
 Writer Gate B proves that the production raw-writer path can accept and durably
@@ -1016,6 +1023,11 @@ say where authorized operators can resolve the private evidence. A redacted repo
 declaration must never be fed to the canonical verifier or described as the original.
 
 ## 10. Acceptance Predicates
+
+This section defines strict verdicts for the retained benchmark. Its functional
+predicates are required project evidence; its runtime/provenance qualification
+predicates are optional release performance evidence under the 2026-08-08 amendment.
+The verifier logic and negative verdicts remain unchanged.
 
 Functional acceptance proves eventual correctness, not target throughput. It requires
 exact scheduled, attempted, accepted, durable, sample, manifest, payload, identity,

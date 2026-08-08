@@ -18,7 +18,9 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveInt = Annotated[int, Field(gt=0)]
 ConfigSha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
-MARKET_SCOPED_STREAMS = frozenset({"instrument", "status", "insurance_fund"})
+MARKET_SCOPED_STREAMS = frozenset(
+    {"instrument", "status", "liquidation"}
+)
 BOOK_STREAMS = frozenset({"book_deep_snapshot", "book_live", "book_live_bootstrap"})
 
 

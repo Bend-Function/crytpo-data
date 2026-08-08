@@ -8,6 +8,14 @@
 
 **Tech Stack:** Prometheus client, JSON logging, local HTTP health server, Docker/Compose, pytest system tests, synthetic exchange servers, Linux performance benchmarks.
 
+> **Completion scope (2026-08-08):** Under the approved
+> [`functional-completion scope amendment`](../specs/2026-08-08-functional-completion-scope-amendment.md),
+> functional correctness, conservation/recovery, zero unrecorded loss, bounded
+> resources, and repeated short-run stability remain required. Task 6's fixed `1s`,
+> `10m@2x`, and `4h` evidence is optional release performance evidence. Keep its
+> modules and strict validators when implemented; a failure must remain visible and
+> must never be called PASS, but it does not block Task 7 functional acceptance.
+
 ---
 
 ### Task 1: Structured Logging, Metrics, and Status Snapshots
@@ -241,6 +249,7 @@ git commit -m "build: add isolated compose services"
 - Create: `tests/system/support/five_exchange_lab.py`
 - Create: `tests/system/test_data_lifecycle.py`
 - Create: `tests/system/test_consumer_isolation.py`
+- Create: `tests/system/test_short_run_stability.py`
 - Create: `tests/system/fixtures/lifecycle-config.yaml`
 
 - [ ] **Step 1: Write the failing raw-to-restore lifecycle test**
@@ -275,13 +284,58 @@ def test_slow_or_dead_consumers_do_not_change_collector(system) -> None:
     system.collect_for(seconds=20)
     after = system.collector_snapshot()
     assert after.connections_healthy
-    assert after.durability_lag_max_ns <= baseline.durability_slo_ns
     assert after.queue_overflow_count == baseline.queue_overflow_count
+    assert after.queue_depth <= after.queue_capacity
+    drained = system.stop_collector_and_drain()
+    assert drained.accepted_count == drained.durable_count
+    assert drained.unrecorded_loss_count == 0
+
+
+@pytest.mark.network
+def test_two_fresh_root_rounds_leave_no_owned_resource_residue(
+    tmp_path_factory, five_exchange_lab
+) -> None:
+    expected = five_exchange_lab.deterministic_stability_expectation()
+    rounds = []
+    for round_index in range(2):
+        root = tmp_path_factory.mktemp(f"stability-{round_index}")
+        system = five_exchange_lab.start(root, fixed_pairs_only=True,
+                                         rotate_interval="2s")
+        system.wait_for_writer_rotations(count=2)
+        system.force_one_reconnect()
+        system.restart_one_worker_and_wait_for_recovery()
+        drained = system.stop_and_collect_stability_report()
+        derived = system.materialize(intervals=["30s", "1m"])
+        rounds.append((drained, derived.canonical_hashes))
+
+    for report, _derived_hashes in rounds:
+        assert report.scheduled_count == expected.record_count
+        assert report.attempted_count == expected.record_count
+        assert report.accepted_count == report.durable_count
+        assert report.durable_count == report.manifest_row_count
+        assert report.manifest_row_count == expected.record_count
+        assert report.scheduled_event_ids_sha256 == expected.event_ids_sha256
+        assert report.attempted_event_ids_sha256 == expected.event_ids_sha256
+        assert report.accepted_event_ids_sha256 == expected.event_ids_sha256
+        assert report.durable_event_ids_sha256 == expected.event_ids_sha256
+        assert report.manifest_event_ids_sha256 == expected.event_ids_sha256
+        assert report.unrecorded_loss_count == 0
+        assert report.manifests_valid
+        assert report.worker_generation_transitions == expected.generation_transitions
+        assert report.recovery_outcomes == expected.recovery_outcomes
+        assert report.structural_caps_respected
+        assert report.final_owned_queue_depth == 0
+        assert report.final_owned_task_count == 0
+        assert report.final_active_generation_count == 0
+        assert report.final_retiring_generation_count == 0
+        assert report.final_owned_open_file_count == 0
+        assert report.final_recovery_residue_count == 0
+    assert rounds[0][1] == rounds[1][1]
 ```
 
 - [ ] **Step 2: Run and verify lifecycle fixtures are missing**
 
-Run: `.venv/bin/python -m pytest tests/system/test_data_lifecycle.py tests/system/test_consumer_isolation.py -q`
+Run: `.venv/bin/python -m pytest tests/system/test_data_lifecycle.py tests/system/test_consumer_isolation.py tests/system/test_short_run_stability.py -q`
 
 Expected: FAIL during fixture setup.
 
@@ -289,20 +343,22 @@ Expected: FAIL during fixture setup.
 
 Run local HTTP/WS scripted servers for all five adapters, one Spot and one perpetual fixed instrument each. Generate event times spanning 30s/1m boundaries, valid books, a silent expected stream, lossy liquidation silence, catalog changes, and late data. Start real supervisor workers and writer, then real materializer and filesystem archiver as separate subprocesses using the same config/data/state layout as Compose.
 
-Assert no process reaches into another process queue, `.partial` is ignored by consumers, manifest/receipt/ACK commit ordering holds, hashes validate, live/deep remain separate, and cleanup waits for the retention fence and exclusive lease.
+Assert no process reaches into another process queue, `.partial` is ignored by consumers, manifest/receipt/ACK commit ordering holds, hashes validate, live/deep remain separate, and cleanup waits for the retention fence and exclusive lease. The short-run stability test owns both fresh-root rounds in one assertion, exercises at least two writer rotations, one reconnect, and one worker restart/recovery per round, and validates both reports together. Structural queue/pending/sync/file/generation caps and terminal owned-resource cleanup are functional predicates; target-specific RSS/FD slopes remain optional performance predicates.
 
 - [ ] **Step 4: Run lifecycle twice from clean temporary roots**
 
-Run the following command twice, allowing each run to create a fresh pytest temporary root:
+Run the lifecycle/consumer command twice as an additional repeatability check, allowing each invocation to create a fresh pytest temporary root. Then run the two-round stability assertion once:
 
 `.venv/bin/python -m pytest tests/system/test_data_lifecycle.py tests/system/test_consumer_isolation.py -q`
 
-Expected: PASS with identical canonical derived hashes and no external network.
+`.venv/bin/python -m pytest tests/system/test_short_run_stability.py -q`
+
+Expected: the aggregate stability assertion binds every expected event identity through scheduled/attempted/accepted/durable/manifest evidence, both rounds PASS with identical canonical derived hashes and expected recovery outcomes, no external network is used, and neither round leaves queue, task, generation, owned-file, or recovery-state residue.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/system/support tests/system/fixtures tests/system/test_data_lifecycle.py tests/system/test_consumer_isolation.py
+git add tests/system/support tests/system/fixtures tests/system/test_data_lifecycle.py tests/system/test_consumer_isolation.py tests/system/test_short_run_stability.py
 git commit -m "test: exercise complete data lifecycle"
 ```
 
@@ -383,7 +439,7 @@ git add tests/system/test_fault_matrix.py tests/system/test_secret_canaries.py t
 git commit -m "test: cover operational fault matrix"
 ```
 
-### Task 6: Full Performance Gate and Long Soak
+### Task 6: Optional Full Performance Evidence and Long Soak
 
 **Files:**
 - Create: `src/crypto_collector/benchmarks/full.py`
@@ -391,6 +447,10 @@ git commit -m "test: cover operational fault matrix"
 - Create: `tests/performance/test_full_collector.py`
 - Create: `tests/performance/test_soak_report.py`
 - Create: `docs/operations/performance-acceptance.md`
+
+This task is optional for functional project completion. Its tests still define the
+strict meaning of a performance PASS; skipping the task records `NOT_RUN`, and any
+rejected predicate records `FAIL` rather than weakening the evaluator.
 
 - [ ] **Step 1: Write failing numerical acceptance tests**
 
@@ -476,7 +536,7 @@ git add src/crypto_collector/benchmarks/full.py src/crypto_collector/benchmarks/
 git commit -m "test: qualify collector performance and soak"
 ```
 
-If the writer stage fails its 1s gate, stop final acceptance and return to the storage design; do not hide the failure by reducing expected active files or stream coverage.
+If the writer stage fails its 1s gate, record optional performance `FAIL` and retain the evidence; do not hide the failure by reducing expected active files or stream coverage. Functional acceptance may continue on the independent required gates.
 
 ### Task 7: CI, Schemas, Runbooks, and Final Acceptance Record
 
@@ -533,7 +593,7 @@ Document install/locks, complete configuration precedence and secret refs, stati
 
 Offline CI installs `requirements/dev.lock` with hashes, runs Ruff, mypy, docs/schema checks, and `pytest -m "not live and not performance"` with sockets disabled. Live workflow stays manual/scheduled with environment secrets and preserves skips. Performance workflow is manual/self-hosted on the declared target storage and uploads redacted reports; it does not claim success on a generic hosted runner.
 
-Populate `final-acceptance.md` with each approved spec completion item, command, date, commit/image/config/capability/workload/lock hashes, result, evidence path, and explicit environmental skips. A skip is allowed only for external provider/environment availability, not a failing offline contract.
+Populate `final-acceptance.md` with each approved spec completion item, command, date, commit/image/config/capability/workload/lock hashes, result, evidence path, and explicit environmental skips. Record required functional completion as `PASS` or `FAIL` and optional performance evidence separately as `NOT_RUN`, `PASS`, or `FAIL`; a performance failure is not a skip and must remain visible even when functional completion passes. A skip is allowed only for external provider/environment availability, not a failing offline contract.
 
 - [ ] **Step 4: Run final verification from a clean environment**
 

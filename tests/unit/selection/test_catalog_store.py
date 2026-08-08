@@ -11,6 +11,7 @@ from crypto_collector.selection.catalog_store import (
     CatalogSnapshotConflictError,
     CatalogStore,
     StaleCatalogSnapshotError,
+    materialize_initial_catalog_instrument,
 )
 from crypto_collector.selection.models import (
     AnnouncementHint,
@@ -147,6 +148,60 @@ def test_first_catalog_is_baseline_not_mass_new_listing(tmp_path) -> None:
         persisted.instruments[0].tradable_at_source
         is TradableAtSource.FIRST_TRADABLE_SEEN
     )
+
+
+def test_pure_initial_materializer_applies_official_lookback_boundary() -> None:
+    recent = instrument(
+        "NEWUSDT",
+        tradable_at_ns=100,
+        tradable_at_source=TradableAtSource.EXCHANGE_LAUNCH,
+    )
+
+    included = materialize_initial_catalog_instrument(
+        recent,
+        observed_at_ns=100 + 72 * 60 * 60,
+        initial_lookback_ns=72 * 60 * 60,
+    )
+    excluded = materialize_initial_catalog_instrument(
+        recent,
+        observed_at_ns=101 + 72 * 60 * 60,
+        initial_lookback_ns=72 * 60 * 60,
+    )
+
+    assert included.listing_state.value == "active_new"
+    assert included.new_listing_started_at_ns == 100
+    assert excluded.listing_state.value == "baseline"
+    assert excluded.new_listing_eligible is False
+
+
+def test_pure_initial_materializer_preserves_preopen_and_delisted_states() -> None:
+    preopen = instrument(
+        "NEWUSDT",
+        status="prelaunch",
+        tradable=False,
+        tradable_at_ns=95,
+        tradable_at_source=TradableAtSource.EXCHANGE_LAUNCH,
+    )
+    delisted = replace(
+        instrument("OLDUSDT", status="delisted", tradable=False),
+        lifecycle_phase=LifecyclePhase.DELISTED,
+    )
+
+    pending = materialize_initial_catalog_instrument(
+        preopen,
+        observed_at_ns=100,
+        initial_lookback_ns=10,
+    )
+    terminal = materialize_initial_catalog_instrument(
+        delisted,
+        observed_at_ns=100,
+        initial_lookback_ns=10,
+    )
+
+    assert pending.listing_state.value == "pending_official"
+    assert pending.new_listing_eligible is False
+    assert terminal.listing_state.value == "relist_pending"
+    assert terminal.last_terminal_seen_ns == 100
 
 
 def test_recent_official_tradable_time_can_enter_on_first_baseline(tmp_path) -> None:

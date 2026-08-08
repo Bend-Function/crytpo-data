@@ -1,0 +1,33 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "details": [
+        {
+          "adlType": "",
+          "amt": "1343.1308",
+          "balance": "1369179138.7489",
+          "ccy": "USDT",
+          "maxBal": "",
+          "maxBalTs": "",
+          "ts": "1704883083000",
+          "type": "liquidation_balance_deposit"
+        },
+        {
+          "adlType": "",
+          "amt": "2.5",
+          "balance": "1369177795.6181",
+          "ccy": "USDT",
+          "maxBal": "",
+          "maxBalTs": "",
+          "ts": "1704796683000",
+          "type": "bankruptcy_loss"
+        }
+      ],
+      "instFamily": "BTC-USDT",
+      "instType": "SWAP",
+      "total": "1369179138.7489"
+    }
+  ]
+}

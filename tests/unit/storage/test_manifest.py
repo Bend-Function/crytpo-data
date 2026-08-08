@@ -310,6 +310,25 @@ def test_manifest_identity_and_hour_must_match_canonical_paths(
         RawManifestV1.model_validate(normal_manifest_values(**overrides))
 
 
+def test_insurance_fund_manifest_is_instrument_scoped() -> None:
+    data_path = DATA_RELATIVE_PATH.replace(
+        "spot/BTC-USDT/trade",
+        "perpetual/BTC-USDT-SWAP/insurance_fund",
+    )
+    manifest = RawManifestV1.model_validate(
+        normal_manifest_values(
+            market=Market.PERPETUAL,
+            instrument_key="BTC-USDT-SWAP",
+            logical_stream="insurance_fund",
+            wire_symbols=("BTC-USDT-SWAP",),
+            data_relative_path=data_path,
+            manifest_relative_path=manifest_path_for_data(data_path).as_posix(),
+        )
+    )
+
+    assert manifest.instrument_key == "BTC-USDT-SWAP"
+
+
 def test_manifest_rejects_noncanonical_part_numbers() -> None:
     data_path = DATA_RELATIVE_PATH.replace(
         "part-1785456000000000000-0", "part-01785456000000000000-00"

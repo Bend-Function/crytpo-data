@@ -7,12 +7,12 @@ substitute for checking the live OKX changelog.
 
 ## Source provenance
 
-Retrieved at `2026-07-31T03:54:53Z` from OKX-operated domains.
+Retrieved at `2026-08-03T12:32:17Z` from OKX-operated domains.
 
 | Local file | Official URL | SHA-256 |
 | --- | --- | --- |
-| [`sources/api-guide-en.html`](sources/api-guide-en.html) | <https://www.okx.com/docs-v5/en/> | `3ae05e29ea7e1fc4f8f288a8b2b300782e13154d3b118b5d6be691312faf2b88` |
-| [`sources/changelog-en.html`](sources/changelog-en.html) | <https://www.okx.com/docs-v5/log_en/> | `b9e693e355c1d1b100c03bd2e47c4e744cb3e002a308ae80f79f28e422e521c5` |
+| [`sources/api-guide-en.html`](sources/api-guide-en.html) | <https://www.okx.com/docs-v5/en/> | `7b7fa15a91e0f3a86ca81b76aa6fc9d0d114e3dd0ffe98575c24dc4d34bf7331` |
+| [`sources/changelog-en.html`](sources/changelog-en.html) | <https://www.okx.com/docs-v5/log_en/> | `a09a8c1fd241176196abec2e0fff1a560da77843194899e4718aafd9123d0295` |
 
 Verify the downloaded originals with:
 
@@ -34,7 +34,12 @@ available offline. Relevant anchors include:
 - `#public-data-websocket-funding-rate-channel`
 - `#public-data-websocket-liquidation-orders-channel`
 - `#status-ws-status-channel`
-- changelog `#2026-07-28` and `#2026-06-23`
+- changelog `#2026-08-03`, `#2026-07-28`, and `#2026-06-23`
+
+The 2026-08-03 changelog entry concerns authenticated affiliate endpoints and does
+not alter this collector's anonymous market-data contract. The refreshed guide also
+removes SWAP-only wording from some `rebase`/`post_only` instrument-state descriptions;
+parsers therefore retain those states without assuming they are venue-type exclusive.
 
 ## Service endpoints and regional routing
 

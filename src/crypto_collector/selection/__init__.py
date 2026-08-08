@@ -21,6 +21,7 @@ from crypto_collector.selection.catalog_store import (
     StaleCatalogSnapshotError,
     StaleTurnoverSnapshotError,
     TurnoverSnapshotConflictError,
+    materialize_initial_catalog_instrument,
 )
 from crypto_collector.selection.fixed import (
     FixedPairResolutionError,
@@ -112,6 +113,7 @@ __all__ = [
     "admit",
     "admit_exchange_capacity",
     "calculate_egress_capacity",
+    "materialize_initial_catalog_instrument",
     "resolve_fixed_requests",
     "select",
 ]

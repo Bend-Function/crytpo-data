@@ -1,0 +1,62 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "instType": "SWAP",
+      "instId": "BTC-USDT-SWAP",
+      "uly": "BTC-USDT",
+      "instFamily": "BTC-USDT",
+      "baseCcy": "",
+      "quoteCcy": "",
+      "settleCcy": "USDT",
+      "ctType": "linear",
+      "ctVal": "0.01",
+      "ctMult": "1",
+      "ctValCcy": "BTC",
+      "state": "live",
+      "listTime": "1700000000456",
+      "contTdSwTime": "",
+      "preMktSwTime": "",
+      "ruleType": "normal",
+      "tickSz": "0.1",
+      "lotSz": "1",
+      "schemaAddedLater": "kept"
+    },
+    {
+      "instType": "SWAP",
+      "instId": "NEW-USDT-SWAP",
+      "uly": "NEW-USDT",
+      "instFamily": "NEW-USDT",
+      "baseCcy": "",
+      "quoteCcy": "",
+      "settleCcy": "USDT",
+      "ctType": "linear",
+      "ctVal": "1",
+      "ctMult": "1",
+      "ctValCcy": "NEW",
+      "state": "preopen",
+      "listTime": "1761000000000",
+      "contTdSwTime": "",
+      "preMktSwTime": "1761003600000",
+      "ruleType": "pre_market",
+      "tickSz": "0.0001",
+      "lotSz": "1"
+    },
+    {
+      "instType": "SWAP",
+      "instId": "ETH-USD-SWAP",
+      "uly": "ETH-USD",
+      "instFamily": "ETH-USD",
+      "baseCcy": "",
+      "quoteCcy": "",
+      "settleCcy": "ETH",
+      "ctType": "inverse",
+      "ctVal": "10",
+      "ctMult": "1",
+      "ctValCcy": "USD",
+      "state": "live",
+      "listTime": "1700000000000"
+    }
+  ]
+}

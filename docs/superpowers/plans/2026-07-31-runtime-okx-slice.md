@@ -86,30 +86,15 @@ class ConnectionGeneration:
     egress_id: str
 
     def source_context(self) -> SourceContext:
-        return SourceContext(self.connection_id, self.generation, self.egress_id)
+        return SourceContext(
+            connection_id=self.connection_id,
+            connection_generation=self.generation,
+            egress_id=self.egress_id,
+        )
 
 
-@dataclass(frozen=True, slots=True)
-class Instrument:
-    exchange: Exchange
-    market: Market
-    instrument_key: str
-    canonical_pair: str
-    wire_symbols: Mapping[str, str]
-    base_asset: str
-    quote_asset: str
-    settlement_asset: str | None
-    tradable: bool
-    lifecycle: JsonPayload
-
-
-@dataclass(frozen=True, slots=True)
-class InstrumentCatalog:
-    exchange: Exchange
-    market: Market
-    observed_at_ns: int
-    instruments: tuple[Instrument, ...]
-    raw_event: NativeEventDraft
+Instrument = InstrumentRecord
+InstrumentCatalog = CompleteCatalogSnapshot
 
 
 class CollectionRequest(StrictModel):
@@ -124,36 +109,35 @@ class CollectionRequest(StrictModel):
 class AdapterPlan:
     exchange: Exchange
     ws: tuple[WebSocketSubscription, ...]
-    rest: tuple[RestJob, ...]
+    rest: tuple[RestPlanItem, ...]
     expectations: tuple[StreamExpectation, ...]
     disabled_optional_features: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class AdapterRuntime:
-    http: PublicHttpTransport
-    websocket: PublicWebSocketTransport
+    transports: Mapping[str, EgressTransport]
     scheduler: RestSchedulerPort
     clock: Clock
     stop: StopToken
 
 
 class EventSink(Protocol):
-    def try_emit(self, draft: NativeEventDraft, source: SourceContext,
-                 *, shard: str) -> EnqueueResult: ...
+    def try_emit(self, draft: NativeEventDraft, *, source: SourceContext,
+                 shard: str) -> EnqueueResult: ...
 
 
 class ExchangeAdapter(ProbeProvider, Protocol):
     exchange: Exchange
-    async def probe(self, runtime: AdapterRuntime) -> CapabilityProbe: ...
+    async def probe(self, request: ProbeRequest) -> CapabilityProbe: ...
     async def fetch_catalog(self, runtime: AdapterRuntime, market: Market) -> InstrumentCatalog: ...
     def plan(self, request: CollectionRequest) -> AdapterPlan: ...
     async def run(self, plan: AdapterPlan, runtime: AdapterRuntime, sink: EventSink) -> None: ...
 ```
 
-`CapabilityProbe`, `WebSocketSubscription`, `RestJob`, `StreamExpectation`, and `IntervalPlan` are frozen value objects in this module with explicit fields for feature/result evidence, market/instrument/channel/egress, endpoint/cost/priority/interval/generation affinity, storage shard ID, and expected raw stream scope respectively. `PublicHttpTransport` and `PublicWebSocketTransport` expose anonymous request/connect operations only; they have no arbitrary headers, credentials, or private-channel escape hatch. `StopToken` exposes cancellation state without owning tasks. Validate all collection/plan objects on construction: selected instruments must belong to the exchange/market, every request must be anonymous/public, each planned stream must map to an expectation, and every emitted event uses the shard ID assigned by that plan item.
+`InstrumentRecord` and `CompleteCatalogSnapshot`, established by Plan 03, are the single canonical owners of instrument identity/lifecycle and complete catalog provenance; this plan exports them as `Instrument` and `InstrumentCatalog` rather than creating lossy duplicates. `CapabilityProbe`, `WebSocketSubscription`, `RestPlanItem`, `StreamExpectation`, and `IntervalPlan` are frozen value objects with explicit fields for feature/result evidence, market/instrument/channel/egress, endpoint/cost/priority/interval/generation affinity, storage shard ID, expected raw stream scope, and expected coverage respectively. A `RestPlanItem` is a clock-free template: runtime calls its explicit `materialize(...)` boundary to create a scheduler `RestJob` occurrence after monotonic time and, for `LIVE_BOOTSTRAP` only, the exact connection generation are known. Independent deep snapshots reject generation affinity. `AdapterRuntime` exposes public transports through an egress-ID mapping because each SOCKS/direct egress owns distinct clients. `PublicHttpTransport` and `PublicWebSocketTransport` expose anonymous request/connect operations only; they have no arbitrary headers, credentials, or query-string escape hatch. Venue connectors must additionally allowlist their public REST paths and WS channels because the shared layer cannot identify venue-specific private names. `StopToken` exposes cancellation state without owning tasks. Validate all collection/plan objects on construction: selected instruments must belong to the exchange/market, every request must be anonymous/public, each planned stream must map to an expectation, and every emitted event uses the shard ID assigned by that plan item. Task 2 implements a plan-bound sink that validates the full event/expectation/shard tuple before delegating to `RawWriterService.try_accept`; the shared protocol alone is not treated as enforcement.
 
-Keep venue book state machines in venue packages. Shared code may carry generation-scoped inputs, integrity outcomes, control events, and recovery actions, but may not assume universal sequence/checksum behavior. `NativeEventDraft` and `SourceContext` are imported from the Plan 01 canonical module, never redefined here. `EventSink.try_emit(draft, source, shard=...)` returns the storage `EnqueueResult` and delegates to the same-signature `RawWriterService.try_accept`; adapters must invalidate a generation after market overflow.
+Keep venue book state machines in venue packages. Shared code may carry generation-scoped inputs, integrity outcomes, control events, and recovery actions, but may not assume universal sequence/checksum behavior. `NativeEventDraft` and `SourceContext` are imported from the Plan 01 canonical module, never redefined here. A plan-bound `EventSink.try_emit(draft, *, source, shard=...)` returns the storage `EnqueueResult`; its adapter validates the plan assignment before calling the similarly shaped, keyword-only `RawWriterService.try_accept`. Adapters must invalidate a generation after market overflow.
 
 Every fixture directory contains exact raw bytes plus `manifest.json` with official source URL, retrieval time, SHA-256, protocol, and expected parser action.
 
@@ -236,15 +220,6 @@ async def test_control_overflow_is_fatal_and_never_publishes_complete_part(tmp_p
     assert worker.active_part_is_marked_incomplete
 
 
-@pytest.mark.asyncio
-async def test_periodic_catalog_refresh_reselects_and_replans(fake_clock, tmp_path) -> None:
-    adapter = MutableCatalogAdapter(initial=["BTC-USDT"], next=["BTC-USDT", "NEW-USDT"])
-    worker = make_worker(tmp_path, adapter=adapter, selection_refresh_ns=minutes(5))
-    await worker.start()
-    fake_clock.advance(minutes(5))
-    await worker.wait_until_selected("NEW-USDT")
-    assert adapter.plan_calls == 2
-    assert any_control(worker.closed_manifests, event="selected_set_changed")
 ```
 
 - [ ] **Step 2: Run and verify runtime modules are missing**
@@ -266,13 +241,11 @@ class WorkerState(StrEnum):
     STOPPED = "stopped"
 ```
 
-The worker receives a reference-only `ConfigBundle` from the supervisor and resolves its exchange secret references exactly once into a worker-local snapshot. It then calls only Plan 02's `RawWriterService.open`, which owns lock acquisition, startup recovery, sequence allocation, ingress, coordinator, stream writers, rotation, incomplete marking, and close. A `RecoveryBlocked` result enters `PAUSED_WRITER` before creating network clients or issuing any adapter HTTP/WS action. After storage is accepting, construct all clients from the already resolved snapshot and load persisted catalog/network state. On first start execute adapter capability/time/catalog probes, resolve fixed requests, update catalog state, compute the fixed/Top-N/new-listing union, admit capacity, build the adapter plan, emit a `subscription_expectation` checkpoint, and only then start long-running adapter tasks. Unknown/ambiguous fixed requests, required probe failures, or fixed-only capacity failures reject worker prepare before subscriptions open.
+This task freezes the single-loop worker around an already prepared immutable `CollectionRequest` plus writer/runtime factories. It calls only Plan 02's `RawWriterService.open`, which owns lock acquisition, startup recovery, sequence allocation, ingress, coordinator, stream writers, rotation, incomplete marking, and close. A `RecoveryBlocked` result enters `PAUSED_WRITER` before invoking the runtime factory or issuing any adapter HTTP/WS action. Startup, fatal pause, and shutdown share one lifecycle mutex; a stop request is latched before waiting for that mutex so a writer factory that completes concurrently cannot revive a stopped worker or open later network resources. After storage is accepting, construct clients, build and validate the adapter plan, require a complete `_control` expectation, emit a `subscription_expectation` checkpoint, and only then start the long-running adapter task. Invalid plans reject prepare before subscriptions open. Task 6 owns `ConfigBundle`/secret resolution, initial probe/catalog/selection preparation, periodic catalog refresh, and transactional plan replacement once the OKX adapter surface exists; those concerns are not duplicated in this scripted lifecycle task.
 
-One worker-owned selection coordinator repeats catalog/turnover refresh at `selection.refresh_interval` (default five minutes), updates new-listing lifecycle, recomputes selection/admission/intervals, and transactionally applies a plan diff. It closes removed streams under their old expectation window before opening additions and emits catalog/selection/interval control records. This loop, startup, and reload all use the same pure plan builder; no one-shot CLI result is treated as runtime state.
+`EventSink.try_emit(draft, source=source, shard=plan_item.shard_id)` validates the event against the plan-bound expectation and then delegates immediately to `RawWriterService.try_accept(draft, source=source, shard=shard)`, which invokes the Plan 02 nonblocking ingress and adds receive time, worker/config identity, source connection/egress fields, and writer sequence. Queue overflow writes a reserved control event and requests that channel generation close/rebuild. `CONTROL_OVERFLOW` or writer failure always takes priority over an adapter failure, latches the sink closed, joins adapter cancellation, closes all exchange inputs, calls `RawWriterService.mark_incomplete`, and enters `PAUSED_WRITER`; that state remains alive but unready. An unexpected normal return or exception from the long-running adapter writes a generic control record, closes its expectation interval, terminalizes the writer as incomplete, and exposes exit code 1 in `DEGRADED` so Task 6 can restart the worker. A normal stop emits the expectation's `effective_end_ns`, joins adapter cleanup before closing network/writer resources, and only then publishes `STOPPED`; cancellation of the stop caller is deferred until this owned cleanup completes. Rotation, reload boundaries, sync, and shutdown call only the other frozen service methods; runtime never opens storage files or acquires writer locks itself.
 
-`EventSink.try_emit(draft, source, shard=plan_item.shard_id)` delegates immediately to `RawWriterService.try_accept`, which invokes the Plan 02 nonblocking ingress and adds receive time, worker/config identity, source connection/egress fields, and writer sequence. Queue overflow writes a reserved control event and requests that channel generation close/rebuild. `CONTROL_OVERFLOW` or writer failure closes all exchange inputs, calls `RawWriterService.mark_incomplete`, and enters `PAUSED_WRITER`; that state remains alive but unready. Rotation, reload boundaries, sync, and shutdown call only the other frozen service methods; runtime never opens storage files or acquires writer locks itself.
-
-Emit expectation checkpoints on config commit, selected-set change, and UTC hour boundary. The payload contains effective start, optional end, and sorted exchange/market/instrument/stream keys so completely silent quality windows remain discoverable.
+Emit expectation checkpoints on config commit, selected-set change, every UTC hour boundary, and interval close. The payload contains effective start, optional end, and sorted exchange/market/instrument/stream keys so completely silent quality windows remain discoverable.
 
 - [ ] **Step 4: Run worker tests**
 
@@ -472,7 +445,7 @@ def test_okx_plan_uses_one_live_book_and_independent_deep_jobs(resolved_okx_conf
     plan = OkxAdapter().plan(collection_request(resolved_okx_config, instruments=["BTC-USDT"]))
     assert plan.ws.count(channel="books", instrument_key="BTC-USDT") == 1
     assert plan.rest.count(stream="book_deep_snapshot", instrument_key="BTC-USDT") == 1
-    assert plan.rest.first(stream="book_deep_snapshot").bootstrap_generation is None
+    assert not plan.rest.first(stream="book_deep_snapshot").requires_generation
 
 
 def test_okx_research_default_plan_has_the_complete_declared_surface(resolved_okx_config) -> None:
@@ -516,7 +489,7 @@ Expected: FAIL.
 
 Build selected instrument/channel plans from capability and capacity outputs, assign egress before egress-local shard packing, schedule deep/reference REST by priority, and route all research-default streams to distinct logical stream names. Capability probes disable only explicitly optional features; required catalog/trade/book failures reject startup. OKX liquidation records carry top-level `coverage="lossy_window"` outside the native payload.
 
-Implement `OkxProbeProvider` over the same catalog/probe parsers and worker-local `SecretSnapshot` used by runtime. Register it with the Plan 03 `ProbeEngine` and add `collector config probe CONFIG_PATH [--json]`. At this stage it accepts OKX-only enabled configurations; an enabled unregistered venue fails with `provider_unavailable` instead of being omitted. The command reports `observed_at_ns`, endpoint/egress/quota-group evidence, resolved fixed/Top-N/new selection, shards, requested/effective intervals, disabled optional capabilities, and failures, and creates no raw/state files. A configured public-IP echo can warn when logical egress IDs with distinct quota groups share an address, but neither the address nor proxy value becomes a metric label or report secret.
+Implement `OkxAdapter.probe(ProbeRequest)` over the same catalog/probe parsers and worker-local public transports used by runtime, satisfying the existing Plan 03 `ProbeProvider` contract inherited by `ExchangeAdapter`. Register it with the Plan 03 `ProbeEngine` and add `collector config probe CONFIG_PATH [--json]`. At this stage it accepts OKX-only enabled configurations; an enabled unregistered venue fails with `provider_unavailable` instead of being omitted. The command reports `observed_at_ns`, endpoint/egress/quota-group evidence, resolved fixed/Top-N/new selection, shards, requested/effective intervals, disabled optional capabilities, and failures, and creates no raw/state files. A configured public-IP echo can warn when logical egress IDs with distinct quota groups share an address, but neither the address nor proxy value becomes a metric label or report secret.
 
 The scripted server returns every declared research-default route at least once, plus HTTP-200 `50011`, valid and invalid book sequences, heartbeat, disconnect, and schema-added payloads. Assert retry, reconnect, generation change, control records, every expected stream, and raw preservation without external network.
 

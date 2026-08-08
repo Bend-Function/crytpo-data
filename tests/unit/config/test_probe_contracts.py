@@ -23,6 +23,7 @@ from crypto_collector.config.probe_contracts import (
     ProbeReport,
     ProbeRequest,
     PublicTimeProbe,
+    TransportReachabilityProbe,
 )
 from crypto_collector.domain.types import Exchange, Market
 from crypto_collector.selection.models import (
@@ -76,6 +77,43 @@ class AdvancingProvider(FakeProvider):
         self.requests.append(request)
         self.clock.now = self.completed_at_ns
         return self.evidence
+
+
+def test_egress_reachability_separates_http_and_websocket_health() -> None:
+    legacy = EgressReachabilityProbe("legacy", True, 123, "raw/legacy")
+    assert legacy.http_reachable is True
+    assert legacy.websocket_reachable is True
+
+    transports = (
+        TransportReachabilityProbe(
+            "websocket", "business", False, 123, "raw/ws-business"
+        ),
+        TransportReachabilityProbe("http", "public_rest", True, 123, "raw/http"),
+        TransportReachabilityProbe("websocket", "public", True, 123, "raw/ws-public"),
+    )
+    separated = EgressReachabilityProbe(
+        "separated",
+        False,
+        123,
+        "raw/separated",
+        transports,
+    )
+
+    assert separated.http_reachable is True
+    assert separated.websocket_reachable is False
+    assert [(item.transport, item.endpoint_role) for item in separated.transports] == [
+        ("http", "public_rest"),
+        ("websocket", "business"),
+        ("websocket", "public"),
+    ]
+    with pytest.raises(ValueError, match="must equal all"):
+        EgressReachabilityProbe(
+            "invalid",
+            True,
+            123,
+            "raw/invalid",
+            transports,
+        )
 
 
 def instrument(
@@ -304,10 +342,76 @@ async def test_probe_engine_is_provider_neutral_and_timestamped(tmp_path) -> Non
             exchange=Exchange.OKX,
             markets=(CatalogScope("okx", "spot"),),
             egress_ids=("direct",),
+            initial_lookback_ns={(Market.SPOT, None): 259_200_000_000_000},
             config_sha256="c" * 64,
             observed_at_ns=123,
         )
     ]
+
+
+def test_probe_request_freezes_and_validates_initial_lookback_policy() -> None:
+    source = {
+        (Market.SPOT, "BTC-USDT"): 3_600_000_000_000,
+        (Market.SPOT, None): 259_200_000_000_000,
+    }
+    request = ProbeRequest(
+        exchange=Exchange.OKX,
+        markets=(CatalogScope("okx", "spot"),),
+        egress_ids=("direct",),
+        initial_lookback_ns=source,
+        config_sha256="c" * 64,
+        observed_at_ns=123,
+    )
+
+    source[(Market.SPOT, None)] = 0
+    assert request.initial_lookback_for(Market.SPOT, "ETH-USDT") == (
+        259_200_000_000_000
+    )
+    assert request.initial_lookback_for(Market.SPOT, "BTC-USDT") == (3_600_000_000_000)
+    with pytest.raises(TypeError):
+        request.initial_lookback_ns[(Market.SPOT, None)] = 0  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="market-level fallback"):
+        ProbeRequest(
+            exchange=Exchange.OKX,
+            markets=(CatalogScope("okx", "spot"),),
+            egress_ids=("direct",),
+            initial_lookback_ns={(Market.SPOT, "BTC-USDT"): 1},
+            config_sha256="c" * 64,
+            observed_at_ns=123,
+        )
+    with pytest.raises(TypeError, match="value must be an integer"):
+        ProbeRequest(
+            exchange=Exchange.OKX,
+            markets=(CatalogScope("okx", "spot"),),
+            egress_ids=("direct",),
+            initial_lookback_ns={(Market.SPOT, None): True},  # type: ignore[dict-item]
+            config_sha256="c" * 64,
+            observed_at_ns=123,
+        )
+
+
+@pytest.mark.asyncio
+async def test_probe_request_resolves_market_and_symbol_lookbacks(tmp_path) -> None:
+    provider = FakeProvider(evidence(catalog(instrument("BTC-USDT"))))
+    configured = bundle(
+        tmp_path,
+        market_symbols={
+            "spot": {
+                "BTC-USDT": {"selection": {"new_listings": {"initial_lookback": "1h"}}}
+            }
+        },
+    )
+
+    await ProbeEngine(clock=FakeClock()).run(
+        configured,
+        providers={"okx": provider},
+    )
+
+    assert dict(provider.requests[0].initial_lookback_ns) == {
+        (Market.SPOT, None): 259_200_000_000_000,
+        (Market.SPOT, "BTC-USDT"): 3_600_000_000_000,
+    }
 
 
 @pytest.mark.asyncio
@@ -1329,12 +1433,39 @@ async def test_symbol_interval_overrides_form_distinct_auditable_cohorts(
 async def test_deep_workload_must_match_effective_symbol_depth(tmp_path) -> None:
     provider = FakeProvider(evidence(catalog(instrument("BTC-USDT"))))
 
-    failed = await ProbeEngine(clock=FakeClock()).run(
+    supported = await ProbeEngine(clock=FakeClock()).run(
         bundle(
             tmp_path,
             symbols={"BTC-USDT": {"books": {"deep_snapshot": {"depth": 1000}}}},
         ),
         providers={"okx": provider},
+    )
+
+    cohort = supported.exchanges["okx"].markets["spot"].interval_cohorts[0]
+    assert cohort.depth == 1000
+    assert cohort.instrument_keys == ("BTC-USDT",)
+
+    wrong_depth_work = EndpointWork(
+        "deep_snapshot",
+        Decimal(1),
+        jobs_per_instrument=1,
+        depth=500,
+        observed_at_ns=123,
+        raw_reference="raw/okx/work/depth-500",
+    )
+    failed = await ProbeEngine(clock=FakeClock()).run(
+        bundle(
+            tmp_path,
+            symbols={"BTC-USDT": {"books": {"deep_snapshot": {"depth": 1000}}}},
+        ),
+        providers={
+            "okx": FakeProvider(
+                evidence(
+                    catalog(instrument("BTC-USDT")),
+                    endpoint_work=(wrong_depth_work,),
+                )
+            )
+        },
     )
 
     assert [(item.market, item.code) for item in failed.failures] == [
@@ -1843,6 +1974,73 @@ def test_endpoint_work_rejects_unknown_kind_and_zero_jobs() -> None:
             observed_at_ns=123,
             raw_reference="",
         )
+
+
+@pytest.mark.asyncio
+async def test_periodic_reference_work_is_capacity_planned_and_stretched(
+    tmp_path,
+) -> None:
+    periodic_work = (
+        EndpointWork(
+            "candles",
+            Decimal(1),
+            kind="periodic_reference",
+            jobs_per_instrument=1,
+            requested_interval_ns=1_000_000_000,
+            observed_at_ns=123,
+            raw_reference="raw/okx/work/candles",
+        ),
+        EndpointWork(
+            "instruments",
+            Decimal(1),
+            kind="periodic_reference",
+            jobs_per_instrument=0,
+            jobs_per_market=1,
+            requested_interval_ns=300_000_000_000,
+            observed_at_ns=123,
+            raw_reference="raw/okx/work/instruments",
+        ),
+    )
+    budgets = tuple(
+        EndpointBudgetProbe(
+            "direct",
+            endpoint,
+            Decimal(rate),
+            observed_at_ns=123,
+            raw_reference=f"raw/okx/rate-limit/{endpoint}",
+        )
+        for endpoint, rate in (("candles", 1), ("instruments", 10))
+    )
+    provider = FakeProvider(
+        evidence(
+            catalog(
+                instrument("BTC-USDT", "2"),
+                instrument("ETH-USDT", "1"),
+            ),
+            endpoint_work=periodic_work,
+            endpoint_budgets=budgets,
+        )
+    )
+
+    report = await ProbeEngine(clock=FakeClock()).run(
+        bundle(
+            tmp_path,
+            top_n=2,
+            fixed_pairs=(),
+            deep_enabled=False,
+        ),
+        providers={"okx": provider},
+    )
+
+    assert report.success is True
+    market = report.exchanges["okx"].markets["spot"]
+    assert market.intervals["candles"].requested_ns == 1_000_000_000
+    assert market.intervals["candles"].effective_ns == 2_000_000_000
+    assert market.intervals["candles"].warning is not None
+    cohorts = {item.logical_endpoint: item for item in market.interval_cohorts}
+    assert cohorts["candles"].depth is None
+    assert cohorts["candles"].instrument_keys == ("BTC-USDT", "ETH-USDT")
+    assert cohorts["instruments"].instrument_keys == ()
 
 
 def test_date_gate_without_archived_date_has_no_date_constraint() -> None:

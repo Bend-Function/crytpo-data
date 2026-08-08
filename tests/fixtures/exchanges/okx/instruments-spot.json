@@ -1,0 +1,40 @@
+{
+  "code": "0",
+  "msg": "",
+  "data": [
+    {
+      "instType": "SPOT",
+      "instId": "BTC-USDT",
+      "baseCcy": "BTC",
+      "quoteCcy": "USDT",
+      "settleCcy": "",
+      "state": "live",
+      "listTime": "1700000000123",
+      "contTdSwTime": "",
+      "preMktSwTime": "",
+      "openType": "fix_price",
+      "ruleType": "normal",
+      "tickSz": "0.1",
+      "lotSz": "0.00000001",
+      "futureSchemaField": {
+        "mode": "preserve-me",
+        "ratio": 0.1234567890123456789
+      }
+    },
+    {
+      "instType": "SPOT",
+      "instId": "NEW-USDT",
+      "baseCcy": "NEW",
+      "quoteCcy": "USDT",
+      "settleCcy": "",
+      "state": "preopen",
+      "listTime": "1760000000000",
+      "contTdSwTime": "1760003600000",
+      "preMktSwTime": "",
+      "openType": "call_auction",
+      "ruleType": "normal",
+      "tickSz": "0.0001",
+      "lotSz": "1"
+    }
+  ]
+}

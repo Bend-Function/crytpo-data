@@ -1,0 +1,1 @@
+"""OKX adapter contract tests."""

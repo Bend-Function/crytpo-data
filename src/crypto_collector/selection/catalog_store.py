@@ -1281,6 +1281,67 @@ def _materialize_record(
     )
 
 
+def materialize_initial_catalog_instrument(
+    record: InstrumentRecord,
+    *,
+    observed_at_ns: int,
+    initial_lookback_ns: int,
+) -> CatalogInstrument:
+    """Materialize one record using CatalogStore's initial-baseline semantics."""
+
+    if type(record) is not InstrumentRecord:
+        raise TypeError("record must be an exact InstrumentRecord")
+    observed_at = _nonnegative_int(observed_at_ns, field="observed_at_ns")
+    lookback = _nonnegative_int(
+        initial_lookback_ns,
+        field="initial_lookback_ns",
+    )
+    if record.tradable_at_source is TradableAtSource.FIRST_TRADABLE_SEEN:
+        raise ValueError("first_tradable_seen time is owned by CatalogStore")
+    if (
+        record.turnover is not None
+        and record.turnover.observed_at_ns is not None
+        and record.turnover.observed_at_ns > observed_at
+    ):
+        raise ValueError(
+            "turnover observed_at_ns must not be after catalog observation"
+        )
+
+    item = _materialize_record(
+        record,
+        prior=None,
+        observed_at_ns=observed_at,
+    )
+    official_recent = (
+        lookback > 0
+        and item.tradable_at_source is not None
+        and item.tradable_at_source.is_official
+        and item.tradable_at_ns is not None
+        and item.tradable_at_ns <= observed_at
+        and observed_at - item.tradable_at_ns <= lookback
+    )
+    if item.tradable and official_recent:
+        return replace(
+            item,
+            listing_state=ListingState.ACTIVE_NEW,
+            listing_generation=1,
+            first_tradable_seen_ns=observed_at,
+            last_terminal_seen_ns=None,
+            new_listing_started_at_ns=item.tradable_at_ns,
+            new_listing_source=item.tradable_at_source,
+            new_listing_eligible=True,
+        )
+    if item.lifecycle_phase is LifecyclePhase.PREOPEN:
+        listing_state = (
+            ListingState.PENDING_OFFICIAL if official_recent else ListingState.PENDING
+        )
+    elif item.lifecycle_phase is LifecyclePhase.DELISTED:
+        listing_state = ListingState.RELIST_PENDING
+    else:
+        listing_state = ListingState.BASELINE
+    return _with_listing_state(item, listing_state)
+
+
 def _provider_fields(record: CatalogInstrument) -> tuple[object, ...]:
     return (
         record.canonical_pair,
@@ -1588,42 +1649,31 @@ class CatalogStore:
 
             for record in ordered:
                 old = prior.get(record.instrument_key)
-                item = _materialize_record(
-                    record,
-                    prior=None if old is None else old.instrument,
-                    observed_at_ns=observed_at,
+                item = (
+                    materialize_initial_catalog_instrument(
+                        record,
+                        observed_at_ns=observed_at,
+                        initial_lookback_ns=lookback,
+                    )
+                    if is_initial and old is None
+                    else _materialize_record(
+                        record,
+                        prior=None if old is None else old.instrument,
+                        observed_at_ns=observed_at,
+                    )
                 )
                 is_new_listing = False
                 relisting_terminal_seen_ns: int | None = None
                 if old is None:
-                    official_recent = (
-                        lookback > 0
-                        and item.tradable_at_source is not None
-                        and item.tradable_at_source.is_official
-                        and item.tradable_at_ns is not None
-                        and item.tradable_at_ns <= observed_at
-                        and observed_at - item.tradable_at_ns <= lookback
-                    )
                     has_observed_official_time = (
                         item.tradable_at_source is not None
                         and item.tradable_at_source.is_official
                         and item.tradable_at_ns is not None
                         and item.tradable_at_ns <= observed_at
                     )
-                    if is_initial and item.tradable and official_recent:
-                        listing_state = ListingState.ACTIVE_NEW
-                        is_new_listing = True
-                    elif is_initial:
-                        if item.lifecycle_phase is LifecyclePhase.PREOPEN:
-                            listing_state = (
-                                ListingState.PENDING_OFFICIAL
-                                if official_recent
-                                else ListingState.PENDING
-                            )
-                        elif item.lifecycle_phase is LifecyclePhase.DELISTED:
-                            listing_state = ListingState.RELIST_PENDING
-                        else:
-                            listing_state = ListingState.BASELINE
+                    if is_initial:
+                        listing_state = item.listing_state
+                        is_new_listing = listing_state is ListingState.ACTIVE_NEW
                     elif item.tradable:
                         if (
                             item.tradable_at_ns is not None
@@ -1707,7 +1757,7 @@ class CatalogStore:
                     if is_pending_activation or is_relisting:
                         listing_state = ListingState.ACTIVE_NEW
                         is_new_listing = True
-                if is_new_listing:
+                if is_new_listing and not is_initial:
                     item = replace(
                         item,
                         listing_state=listing_state,
@@ -1720,7 +1770,7 @@ class CatalogStore:
                         new_listing_source=item.tradable_at_source,
                         new_listing_eligible=True,
                     )
-                else:
+                elif not is_new_listing:
                     item = _with_listing_state(item, listing_state)
                 current[item.instrument_key] = item
 

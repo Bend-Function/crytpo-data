@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-04",
+  "source_document": "docs/exchanges/okx/sources/api-guide-en.html",
+  "source_document_sha256": "7b7fa15a91e0f3a86ca81b76aa6fc9d0d114e3dd0ffe98575c24dc4d34bf7331",
+  "entries": [
+    {
+      "file": "books-full.json",
+      "sha256": "e9846c837cd6ae055bcaaaf400d7fed23a2d4f2f2861ca2982075e271d2ab9cd",
+      "source_anchor": "#order-book-trading-market-data-get-full-order-book",
+      "adaptation": "Official response shape with exact decimal strings and an unknown forward-compatible field."
+    },
+    {
+      "file": "error-50011.json",
+      "sha256": "d5d97e34748868486d2aa654f1773fb5c135d14e2c1e92b0b8b1ef631dfa8d43",
+      "source_anchor": "#error-code-rest-api",
+      "adaptation": "Official business error code with an unknown forward-compatible field."
+    },
+    {
+      "file": "index-ticker.json",
+      "sha256": "6c5d9439e8a5439a712e027ffbecf954081b227293c889950958bef3555bdd27",
+      "source_anchor": "#public-data-rest-api-get-index-tickers",
+      "adaptation": "Official index ticker response example retained with its index instId and exact decimal strings."
+    },
+    {
+      "file": "insurance-fund.json",
+      "sha256": "c4bf5a903b03c4fb4716acf588aa972145834af42dc7b8c833ce38c6f26dab3e",
+      "source_anchor": "#public-data-rest-api-get-security-fund",
+      "adaptation": "Official security-fund response shape adapted to a USDT SWAP family with multiple independently timestamped details."
+    },
+    {
+      "file": "instruments-spot.json",
+      "sha256": "c65c3024ef174aa632fff9e169868ddb65126d036393617e7d910d31d6b8a29b",
+      "source_anchor": "#public-data-rest-api-get-instruments",
+      "adaptation": "Official SPOT fields covering live and preopen lifecycle semantics."
+    },
+    {
+      "file": "instruments-swap.json",
+      "sha256": "8111ac0256961d552e18f6ac5cdca87a2bd612fe102d7dd435427f9a49996be3",
+      "source_anchor": "#public-data-rest-api-get-instruments",
+      "adaptation": "Official SWAP fields covering linear USDT and filtered inverse identities."
+    },
+    {
+      "file": "tickers.json",
+      "sha256": "3d222466fb683cc4632ef4f391ae23e95e43a49b65dc90ae3d444561c9e1000a",
+      "source_anchor": "#order-book-trading-market-data-get-tickers",
+      "adaptation": "Official SWAP volume units, missing optional turnover inputs, and an unknown field."
+    },
+    {
+      "file": "ws-session.jsonl",
+      "sha256": "40fd3285199b59c6ca4f8dc6435faa02c35d8f2c4d4e86468c200bd9acbc3ca2",
+      "source_anchor": "#overview-websocket",
+      "adaptation": "Official public books, application pong, subscription acknowledgement/error, and 64008 service-upgrade shapes with forward-compatible fields."
+    }
+  ]
+}

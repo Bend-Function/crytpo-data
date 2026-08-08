@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from copy import deepcopy
 from importlib import resources
 from pathlib import Path
 
@@ -373,6 +374,47 @@ def test_registry_pickle_round_trip_preserves_lookup_and_digest() -> None:
     assert restored.records == registry.records
     assert restored.sha256 == registry.sha256
     assert restored.for_market("okx", "spot") == registry.for_market("okx", "spot")
+
+
+def test_public_registry_document_round_trip_is_canonical_and_digest_bound() -> None:
+    registry = CapabilityRegistry.load_builtin()
+
+    document = registry.to_public_document()
+    restored = CapabilityRegistry.from_public_document(document)
+
+    assert restored == registry
+    assert restored.to_public_document() == document
+    assert json.loads(json.dumps(document)) == document
+
+    tampered = deepcopy(document)
+    tampered["records"][0]["anonymous_only"] = False  # type: ignore[index]
+    assert CapabilityRegistry.from_public_document(tampered).sha256 != registry.sha256
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"schema_version": 99, "records": []},
+        {"schema_version": 1, "records": [], "unexpected": True},
+        {"schema_version": 1, "records": []},
+    ],
+)
+def test_public_registry_document_rejects_unknown_or_noncanonical_schema(
+    mutation: dict[str, object],
+) -> None:
+    with pytest.raises(CapabilityError):
+        CapabilityRegistry.from_public_document(mutation)
+
+
+def test_public_registry_document_has_an_independent_eight_mib_limit() -> None:
+    oversized = {
+        "schema_version": 1,
+        "records": [],
+        "padding": "x" * (8 * 1024 * 1024),
+    }
+
+    with pytest.raises(CapabilityError, match="exceeds 8 MiB"):
+        CapabilityRegistry.from_public_document(oversized)
 
 
 def test_builtin_yaml_records_are_package_resources() -> None:

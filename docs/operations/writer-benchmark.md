@@ -1,16 +1,27 @@
-# Writer Gate B Operations
+# Writer Gate B Optional Performance Evidence Operations
 
 This runbook qualifies one exact collector implementation on one declared production
 Linux storage target. A passing functional run is an implementation check, not storage
 qualification. Docker Desktop bind mounts on macOS are never qualification evidence.
 
+Project completion follows the approved
+[`functional-completion scope amendment`](../superpowers/specs/2026-08-08-functional-completion-scope-amendment.md):
+the short functional implementation gate is required, while target qualification,
+fixed `1s`, and `10m@2x` results are optional release performance evidence. The
+benchmark, lag samples, watchdogs, and strict verifier remain intact. Record optional
+performance as `NOT_RUN`, `PASS`, or `FAIL`; a failed run never becomes PASS and never
+produces `EVIDENCE_ACCEPTED`.
+
 ## Gate States
 
-Record exactly one current state and its supporting artifact hashes in the operator
-log. A later state never rewrites evidence from an earlier attempt.
+The operator log records `functional_result` and `performance_result` separately.
+For the optional qualification workflow, record exactly one current detail state and
+its supporting artifact hashes; before it starts, use `NOT_RUN`. A later state never
+rewrites evidence from an earlier attempt.
 
 | State | Meaning |
 | --- | --- |
+| `NOT_RUN` | Optional target performance qualification has not been attempted. |
 | `IMPLEMENTATION_PASS` | Offline tests, static checks, and the 10-second functional candidate plus its runtime receipt pass. This does not qualify a target. |
 | `DOCKER_REPRODUCIBILITY_PASS` | Two clean `git archive` builds of the same commit produce the same wheel SHA-256 and immutable image ID, and image inspection passes. |
 | `TARGET_PENDING` | Implementation and reproducibility pass, but no suitable real Linux target or immutable archive backend is available. |
@@ -19,10 +30,18 @@ log. A later state never rewrites evidence from an earlier attempt.
 | `IMMUTABLE_ARCHIVE_FAILURE` | The private inventory, upload, object version, retention, or read-back attestation is missing or invalid. |
 | `EVIDENCE_ACCEPTED` | The acceptance receipt alone says `qualification_accepted=true`, after runtime, archive, and provenance verification. |
 
-Only `EVIDENCE_ACCEPTED` is qualification. Candidate reports and runtime receipts do
-not make that claim.
+Only `EVIDENCE_ACCEPTED` is optional performance qualification. Candidate reports and
+runtime receipts do not make that claim. `IMPLEMENTATION_PASS` is the required writer
+functional result; project-level records keep it separate from the optional
+performance status. Each failure detail maps to `performance_result=FAIL`; it cannot
+coexist with `performance_result=PASS` for the same attempt.
 
-## Prerequisites
+## Optional Qualification Prerequisites
+
+This entire prerequisite section applies only to Sections 2 through 10. It is not a
+prerequisite for Section 1 or for functional project completion. The functional gate
+needs only the hash-locked development environment, a clean working tree when evidence
+is recorded, and writable fresh temporary roots.
 
 - Use a clean checkout of the exact implementation commit. Do not build from a working
   directory, ignored file, untracked file, or retained failure-evidence directory.
@@ -96,13 +115,15 @@ stay disabled, and live/performance cases are excluded from the offline suite.
 ```bash
 .venv/bin/python -m pytest tests/unit/benchmarks \
   tests/integration/benchmarks tests/performance -q
-GATE_FUNCTIONAL_ROOT="$(mktemp -d /tmp/writer-gate-functional.XXXXXX)"
-.venv/bin/python -m crypto_collector.benchmarks.writer \
-  --workload benchmarks/workloads/research-default-v1.yaml \
-  --multiplier 2 --duration 10s \
-  --evidence-root "$GATE_FUNCTIONAL_ROOT/evidence" \
-  --report "$GATE_FUNCTIONAL_ROOT/writer-short.json" --functional-only
-test -f "$GATE_FUNCTIONAL_ROOT/writer-short.json"
+for GATE_FUNCTIONAL_ROUND in 1 2; do
+  GATE_FUNCTIONAL_ROOT="$(mktemp -d "/tmp/writer-gate-functional-${GATE_FUNCTIONAL_ROUND}.XXXXXX")"
+  .venv/bin/python -m crypto_collector.benchmarks.writer \
+    --workload benchmarks/workloads/research-default-v1.yaml \
+    --multiplier 2 --duration 10s \
+    --evidence-root "$GATE_FUNCTIONAL_ROOT/evidence" \
+    --report "$GATE_FUNCTIONAL_ROOT/writer-short.json" --functional-only
+  test -f "$GATE_FUNCTIONAL_ROOT/writer-short.json"
+done
 .venv/bin/python -m pytest -q -m "not live and not performance" --ignore=tests/smoke
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
@@ -110,16 +131,26 @@ test -f "$GATE_FUNCTIONAL_ROOT/writer-short.json"
 git diff --check
 ```
 
-The candidate report and fresh-process runtime receipt must pass, while
+Both fresh-root candidate reports and fresh-process runtime receipts must pass, while
 `qualification_runtime_accepted` remains false and no acceptance receipt exists.
 The functional pass is independent of completion latency: late/out-of-window counts,
-SLO breaches, sampled resource limits, sampling gaps, and active/retiring generation
-peaks are diagnostic facts. Exact record, byte, identity, raw-file and manifest
-conservation plus healthy workers and zero loss/write/sync/publication errors remain
-mandatory. The 24-hour functional watchdog exists only to stop a deadlocked run.
+SLO breaches, target-specific numerical RSS/FD thresholds and growth slopes, sampling
+gaps, and within-cap active/retiring generation peaks are diagnostic facts. Configured
+structural queue/pending/sync/file/generation caps and terminal owned-resource cleanup
+remain mandatory functional predicates. Exact record, byte, identity, raw-file and
+manifest conservation plus healthy workers and zero loss/write/sync/publication errors
+remain mandatory. The 24-hour functional watchdog exists only to stop a deadlocked run.
 Record `IMPLEMENTATION_PASS` only after every command exits zero.
 
-## 2. Reproduce The Collector Image
+These two writer-only rounds prove per-round writer conservation; they do not by
+themselves prove project-wide cross-round resource stability. Final functional
+acceptance also requires Plan 08's two-round `test_short_run_stability.py`, which owns
+and compares both reports in one assertion.
+
+## 2. Optional: Reproduce The Collector Image
+
+Sections 2 through 10 form the optional release-performance qualification workflow.
+They are required only when claiming `performance_result=PASS`.
 
 Run this step only inside the disposable Linux build VM. The reproduction script
 creates two temporary source contexts with `git archive`, uses the commit timestamp as
@@ -178,7 +209,7 @@ Reject a non-Linux target, symlink, reused raw/recovery subtree, root alias, wro
 mount, insufficient free space, or failed file sync, directory sync, or hard-link
 no-replace probe. Record `RUNTIME_FAILURE` and stop on any rejection.
 
-## 4. Run The Qualification Writer
+## 4. Optional: Run The Qualification Writer
 
 Start early enough that the entire ten-minute admission window plus drain stays inside
 one UTC hour. Use the immutable image ID, a fixed container name, no network, and fresh

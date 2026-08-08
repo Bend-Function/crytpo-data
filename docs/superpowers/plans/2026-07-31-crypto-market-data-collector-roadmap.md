@@ -12,7 +12,7 @@
 
 ## Approved Input
 
-The normative design is [`docs/superpowers/specs/2026-07-31-crypto-market-data-collector-design.md`](../specs/2026-07-31-crypto-market-data-collector-design.md). Exchange protocol evidence is versioned under `docs/exchanges/`. When a plan and the design disagree, stop and resolve the design rather than silently choosing one.
+The normative design is [`docs/superpowers/specs/2026-07-31-crypto-market-data-collector-design.md`](../specs/2026-07-31-crypto-market-data-collector-design.md), as amended by the approved [`2026-08-08 functional-completion scope amendment`](../specs/2026-08-08-functional-completion-scope-amendment.md). Exchange protocol evidence is versioned under `docs/exchanges/`. When a plan and the design disagree, stop and resolve the design rather than silently choosing one. For completion gates, the amendment takes precedence: fixed `1s`, `10m@2x`, and `4h` soak evidence is optional and its status is recorded separately from required functional completion.
 
 ## Delivery Graph
 
@@ -121,13 +121,12 @@ The connector returns a `NativeEventDraft` plus runtime-issued `SourceContext` a
 - [ ] Two config resolutions with identical references produce the same SHA-256 even when secret values change.
 - [ ] Percent encoding round-trips every non-empty UTF-8 instrument key accepted by the path policy and cannot collide with `_market` or `_control`.
 
-### Gate B: Raw durability before connector fan-out
+### Gate B: Required raw-writer correctness before connector fan-out
 
-- [ ] The target host and filesystem are recorded in the benchmark report.
-- [ ] The benchmark runs by immutable container image ID, and the injected runtime/expected IDs match that recorded ID.
-- [ ] The per-instrument/per-stream writer is exercised for at least 10 minutes at twice the versioned workload's record rate and active-file count.
-- [ ] Every accepted record has `durability_lag <= 1.000s`, memory remains bounded, and no queue loss lacks a control record.
-- [ ] If the gate fails, stop connector expansion and write a design amendment for a journal/group-commit layout. Do not relax the SLO or silently reduce the tested stream count.
+- [ ] At least two short functional runs from fresh roots complete clean drain/recovery, with `accepted_count == durable_count`, empty unpersisted state, valid manifests, and zero unrecorded loss.
+- [ ] Queue, pending-work, sync concurrency, active/retiring generations, owned open files, and service-owned tasks stay within structural caps and reach their required terminal state without growing residue across rounds. Target-specific process RSS/FD thresholds and slopes belong to the optional performance result.
+- [ ] Slow/sync-error fault cases exercise lag observation, watchdogs, control evidence, and the scoped `PAUSED_WRITER` transition; these safety paths are not removed.
+- [ ] Optional release performance evidence, when requested, retains the strict declared-target/image checks, `10m@2x` workload, and `durability_lag <= 1.000s` predicate. A failed run remains performance `FAIL` and is never written as `PASS` or `EVIDENCE_ACCEPTED`, but it does not stop connector expansion.
 
 ### Gate C: Connector correctness
 
@@ -170,7 +169,7 @@ Run live exchange checks only at an explicit checkpoint:
 RUN_LIVE_API_TESTS=1 .venv/bin/python -m pytest -q -m live
 ```
 
-Run the storage gate only on the declared target data volume:
+Run the optional storage performance qualification only on the declared target data volume. This command is not a prerequisite for required functional completion:
 
 ```bash
 install -d -m 0750 /declared/target/data /declared/target/state/reports
@@ -191,4 +190,4 @@ docker run --rm \
   --report /state/reports/writer-durability.json
 ```
 
-Expected result: exit code `0`, runtime/expected image IDs exactly match the immutable ID used by `docker run`, exact 2x workload/cardinality conformance, continuously healthy storage samples, `accepted_count == durable_count`, `durability_lag_max_ns <= 1000000000`, and `unrecorded_loss_count == 0`.
+Optional performance PASS requires exit code `0`, runtime/expected image IDs exactly matching the immutable ID used by `docker run`, exact 2x workload/cardinality conformance, continuously healthy storage samples, `accepted_count == durable_count`, `durability_lag_max_ns <= 1000000000`, and `unrecorded_loss_count == 0`. A missing run is `NOT_RUN`; any rejected predicate is `FAIL`, never PASS. Required functional acceptance proceeds on its independent gates.

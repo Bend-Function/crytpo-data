@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -27,6 +27,10 @@ class CapabilityError(ValueError):
     pass
 
 
+_MAX_PUBLIC_DOCUMENT_BYTES = 8 * 1024 * 1024
+_PUBLIC_DOCUMENT_KEYS = frozenset({"records", "schema_version"})
+
+
 def _canonicalize(value: object) -> Any:
     if isinstance(value, BaseModel):
         return {
@@ -46,20 +50,44 @@ def _canonicalize(value: object) -> Any:
     raise TypeError(f"unsupported canonical capability value: {type(value).__name__}")
 
 
-def _registry_sha256(records: tuple[ExchangeCapability, ...]) -> str:
-    canonical = {
+def _mutable_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _mutable_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable_json_value(item) for item in value]
+    return value
+
+
+def _public_document(records: tuple[ExchangeCapability, ...]) -> dict[str, object]:
+    return {
         "schema_version": REGISTRY_SCHEMA_VERSION,
-        "records": [_canonicalize(record) for record in records],
+        "records": [record.model_dump(mode="json") for record in records],
     }
-    encoded = simplejson.dumps(
-        canonical,
-        use_decimal=True,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+
+
+def _public_document_bytes(document: object) -> bytes:
+    encoded: bytes | None
+    try:
+        canonical = _canonicalize(document)
+        encoded = simplejson.dumps(
+            canonical,
+            use_decimal=True,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        encoded = None
+    if encoded is None:
+        raise CapabilityError("public capability registry document must be strict JSON")
+    if len(encoded) > _MAX_PUBLIC_DOCUMENT_BYTES:
+        raise CapabilityError("public capability registry document exceeds 8 MiB")
+    return encoded
+
+
+def _registry_sha256(records: tuple[ExchangeCapability, ...]) -> str:
+    return hashlib.sha256(_public_document_bytes(_public_document(records))).hexdigest()
 
 
 def _load_yaml_record(source: str, text: str) -> ExchangeCapability:
@@ -106,10 +134,11 @@ class CapabilityRegistry:
     sha256: str
 
     @classmethod
-    def _from_sources(cls, sources: Iterable[tuple[str, str]]) -> CapabilityRegistry:
-        records = tuple(_load_yaml_record(source, text) for source, text in sources)
+    def _from_records(
+        cls, records: tuple[ExchangeCapability, ...]
+    ) -> CapabilityRegistry:
         if not records:
-            raise CapabilityError("capability registry contains no YAML records")
+            raise CapabilityError("capability registry contains no records")
 
         ordered = tuple(sorted(records, key=lambda record: record.exchange))
         duplicate_ids = sorted(
@@ -128,6 +157,74 @@ class CapabilityRegistry:
             records=ordered,
             sha256=_registry_sha256(ordered),
         )
+
+    @classmethod
+    def _from_sources(cls, sources: Iterable[tuple[str, str]]) -> CapabilityRegistry:
+        records = tuple(_load_yaml_record(source, text) for source, text in sources)
+        if not records:
+            raise CapabilityError("capability registry contains no YAML records")
+        return cls._from_records(records)
+
+    @classmethod
+    def from_public_document(cls, document: Mapping[str, object]) -> CapabilityRegistry:
+        """Rebuild a registry from its canonical, public durable document."""
+
+        encoded = _public_document_bytes(document)
+        if not isinstance(document, Mapping):
+            raise CapabilityError(
+                "public capability registry document must be an object"
+            )
+        if frozenset(document) != _PUBLIC_DOCUMENT_KEYS:
+            raise CapabilityError(
+                "public capability registry document must contain exactly "
+                "records and schema_version"
+            )
+        schema_version = document["schema_version"]
+        if type(schema_version) is not int:
+            raise CapabilityError(
+                "public capability registry schema_version must be an integer"
+            )
+        if schema_version != REGISTRY_SCHEMA_VERSION:
+            raise CapabilityError(
+                "unsupported public capability registry schema_version"
+            )
+        raw_records = document["records"]
+        if not isinstance(raw_records, Sequence) or isinstance(
+            raw_records, (str, bytes, bytearray)
+        ):
+            raise CapabilityError("public capability registry records must be an array")
+
+        records: list[ExchangeCapability] = []
+        for raw_record in raw_records:
+            if not isinstance(raw_record, Mapping):
+                raise CapabilityError(
+                    "public capability registry records must contain objects"
+                )
+            record: ExchangeCapability | None
+            try:
+                record = ExchangeCapability.model_validate(
+                    _mutable_json_value(raw_record)
+                )
+            except ValidationError:
+                record = None
+            if record is None:
+                raise CapabilityError("invalid public capability registry record")
+            records.append(record)
+        registry = cls._from_records(tuple(records))
+        if encoded != _public_document_bytes(_public_document(registry.records)):
+            raise CapabilityError(
+                "public capability registry document is not canonical"
+            )
+        return registry
+
+    def to_public_document(self) -> dict[str, object]:
+        """Return the canonical public document bound by ``sha256``."""
+
+        document = _public_document(self.records)
+        digest = hashlib.sha256(_public_document_bytes(document)).hexdigest()
+        if digest != self.sha256:
+            raise CapabilityError("capability registry digest does not match records")
+        return document
 
     @classmethod
     def from_directory(cls, path: str | Path) -> CapabilityRegistry:
