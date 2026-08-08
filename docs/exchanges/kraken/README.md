@@ -1,8 +1,8 @@
 # Kraken 公开市场 API 调研快照
 
 - 范围：Kraken Spot + Kraken Derivatives/Futures，仅匿名公开市场数据。
-- 抓取时间：`2026-07-31T03:58:34Z`（live JSON 在同一调研时段内抓取）。
-- 官方来源：仅 `docs.kraken.com`、`api.kraken.com`、`futures.kraken.com`。
+- 抓取时间：截至 `2026-08-08T14:56:28Z`（live JSON 在同一调研时段内抓取）。
+- 官方来源：仅 `docs.kraken.com`、`support.kraken.com`、`api.kraken.com`、`futures.kraken.com`。
 - 本地 HTML 是官方页面的原始 HTTP 响应；页面引用的 CSS/JS/图片等外链资产没有继续镜像。
 
 ## 基址与协议
@@ -52,6 +52,7 @@ Futures Charts 已通过匿名 `open-interest` 实测。它能补足仅保存实
 - Spot WS v2 使用 `BTC/USDT`；官方说明 v2 用 `BTC` 替代 `XBT`。
 - Futures 主力 BTC 永续是 `PF_XBTUSD`，ticker 的 pair 是 `XBT:USD`，而当前 instruments 响应的 base 可能是 `BTC`。
 - Futures WS ticker 字段命名混合 snake_case 与 camelCase，例如 `funding_rate`、`markPrice`、`openInterest`；raw 层不得改名。
+- 当前 Futures `instruments` 还包含 `Forex`、`xStocks`、`Commodities` 和 `Pre-IPO` 类别；其中部分非加密合约的 `tradfi` 仍为 `false`。加密采集范围必须同时按原生 `category` 排除这些类别，不能只依赖 `tradfi` 或猜测 symbol 后缀。
 
 默认只允许 USDT 报价时，Kraken Spot 的 `BTC/USDT` 可正常入选，但旗舰 Futures `PF_XBTUSD` 会被过滤。配置中应通过固定对绕过默认报价币过滤，或为 Kraken Futures 单独增加 `USD`。
 
@@ -86,7 +87,7 @@ raw 采集器即使暂不重建 order book，也应记录 snapshot/delta、连�
 | --- | --- | --- |
 | Spot WS | 单 IP 约 150 次连接/重连尝试每滚动 10 分钟；超限会封 10 分钟。约 1 分钟无活动时服务端可关闭连接。 | 指数退避；维护/长停机后最多每 5 秒重连一次。使用 ping，并把自动 status/heartbeat 作为 liveness 信号。 |
 | Spot heartbeat | 订阅任意频道后自动生成；没有其他频道更新时约每秒一次。 | 若超过可配置阈值没有任何消息，主动重连并重取 snapshot。 |
-| Spot REST | 官方账户级 call counter 为 Starter 15、Intermediate/Pro 20，并按等级衰减；没有给匿名市场请求单独的稳定配额。 | 对 429、`EAPI:Rate limit exceeded`、`EService: Throttled` 自适应退避，目录轮询避免高频。 |
+| Spot REST | 官方账户级 call counter 为 Starter 15、Intermediate/Pro 20，并按等级衰减；没有给匿名市场请求单独的稳定配额。 | 对 429、`EAPI:Rate limit exceeded`、`EService: Throttled` 自适应退避；对 `EService:Unavailable`、`EService:Busy` 和 `EGeneral:Internal error` 做临时故障 backoff。 |
 | Futures REST | 公开端点 cost 为 0；`/derivatives` 受计费调用预算 500/10 秒约束。 | 即使公开请求不计 cost，也要限制并发、处理 429/5xx。 |
 | Futures WS | 每客户端最多 100 个并发连接；每连接请求额度 100，每秒补充。 | 批量订阅、限制请求突发，不为每个 symbol 建独立连接。 |
 | Futures liveness | 至少每 60 秒发送一次 ping；`heartbeat` feed 的具体发送周期未在当前页面量化。 | 建议约 30 秒主动 ping，并单独设置消息陈旧阈值。 |
@@ -106,6 +107,7 @@ Spot/Futures 当前文档都没有声明固定的强制连接寿命。采集器�
 
 - Spot WS v2 是官方推荐的新集成版本；v1 当前仍维护，但后续增强以 v2 为主。
 - Futures WS 的路径仍名为 `/ws/v1`，官方没有把它标为弃用。
+- 2026-08-08 匿名负向订阅实测中，无效 Futures product 返回 `event: alert` 和 `message`，而不是文档示例中的 `event: error`；connector 将两者都作为原生订阅错误保留。
 - Futures OpenAPI 标注 fee schedule 端点自 `2026-06-22` 起不再反映实际成交费率；这不影响本调研选择的匿名市场数据端点。
 - 当前选用的匿名端点没有发现已公告的退役日期。订阅确认中的 `warnings` 仍应原样存储，以捕捉未来变更。
 
@@ -115,34 +117,38 @@ Spot/Futures 当前文档都没有声明固定的强制连接寿命。采集器�
 
 | 文件 | 官方 URL | SHA-256 |
 | --- | --- | --- |
-| `futures-analytics-open-interest-live.json` | `https://futures.kraken.com/api/charts/v1/analytics/PF_XBTUSD/open-interest?since=1785466800&interval=300` | `53e78906877424a7ca1d19360f708421011691ed142b7d6c8ddf21e0b62f0c1d` |
+| `futures-analytics-open-interest-live.json` | `https://futures.kraken.com/api/charts/v1/analytics/PF_XBTUSD/open-interest?since=1785466800&interval=300` | `138d05036c8b70c88eaaf58cc3505f96ed6a333b66af823cf90fa68b18ed29b8` |
 | `futures-charts-rest-openapi.yaml` | `https://docs.kraken.com/openapi/futures-charts-rest.yaml` | `26f2888fb2d26edb472381c3b22ba903450106cb0d34744dc71102d4403b3415` |
-| `futures-instruments-live.json` | `https://futures.kraken.com/derivatives/api/v3/instruments` | `1ac4adcfd6c4138ff8aa934c984fc89608b832a8f5d1279aa8a8c9c667ca6895` |
-| `futures-introduction.html` | `https://docs.kraken.com/exchange/guides/futures/introduction` | `fd553a79dcdf06d1259b8319983bf04d3c2018f645d5c3af60f1f5096b76745e` |
-| `futures-rate-limits.html` | `https://docs.kraken.com/exchange/guides/futures/ratelimits` | `8f78987b15476c5f8f4cbe053e11fc61f534fa9040c90f60d22df8d7ff1001e8` |
-| `futures-rest-instruments.html` | `https://docs.kraken.com/api-reference/instrument-details/get-instruments` | `f2818f330e1729c1f11eeb391696a3169a58c54c660b9581f962f85ab4a70936` |
-| `futures-rest-market-analytics.html` | `https://docs.kraken.com/api-reference/analytics/market-analytics` | `83b14715660fb1c412054d451d2d3bebaa6ad23712629f12f9065eac68a592d3` |
-| `futures-rest-market-candles.html` | `https://docs.kraken.com/api-reference/candles/market-candles` | `311fbb73086adafa364320d15ce7e23e1c7bf0c2502a64e05cc7f0c0e6ed54da` |
+| `futures-instruments-live.json` | `https://futures.kraken.com/derivatives/api/v3/instruments` | `da52e638cc5c6431212f55640128f974efb1b154720420d19ff896a54e152d41` |
+| `futures-instruments-status-live.json` | `https://futures.kraken.com/derivatives/api/v3/instruments/status` | `26061faa1c2fb358992773405b58afb925e7b2154996cab46eaecbb80e264003` |
+| `futures-introduction.html` | `https://docs.kraken.com/exchange/guides/futures/introduction` | `24a0c592e47a76e90d26e6b497aef5850587182b690f509f41f33a5290071cac` |
+| `futures-rate-limits.html` | `https://docs.kraken.com/exchange/guides/futures/ratelimits` | `c3812f916f642236093a8cb6f2489481eec608082e3aa4a586d05e526daf4596` |
+| `futures-rest-instruments.html` | `https://docs.kraken.com/api-reference/instrument-details/get-instruments` | `9aeb10854a717ba9f31c263c4950afc3811d5edd10632758bffcb499ff217a2b` |
+| `futures-rest-market-analytics.html` | `https://docs.kraken.com/api-reference/analytics/market-analytics` | `72d99be2133d1b9ab6a05585f63297d4544212fee9d0a5cb5b4783ac584e5ea8` |
+| `futures-rest-market-candles.html` | `https://docs.kraken.com/api-reference/candles/market-candles` | `c9fe03f15e5b88b9d84085c73c76884b7ac36fdf92dec468e68424d90e84a737` |
 | `futures-rest-openapi.yaml` | `https://docs.kraken.com/openapi/futures-rest.yaml` | `ac060965738052420a9e2d3f2110d30ac13530578534c4491d537b4a0a17f25d` |
-| `futures-ticker-pf_xbtusd.json` | `https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD` | `0475f4b3b75be7985b60de470d479908bbe12458c44e46552037b486783c5858` |
-| `futures-ws-book.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/book` | `dac8890525f7e2582af499fb6b8182b6d2d49e8ce82c16aa8b6d94a3847387e4` |
-| `futures-ws-guide.html` | `https://docs.kraken.com/exchange/guides/futures/websockets` | `02e1e197d148c2344012efe2d8f9e190575425e2c1e2425bdb4a356e84a5ec60` |
-| `futures-ws-heartbeat.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/heartbeat` | `d871252b7c92cfb854842505ca3036b8409f784bd3e00438878d328a301bf5c5` |
-| `futures-ws-ticker.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker` | `d5cec3a8bf17e278546ae41f622bdb084393559cf055a2afa9adf00c76f0409c` |
-| `futures-ws-trade.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/trade` | `3b3d91d944fef9c3ac2993a2530318ec9733e1bc4e27698e43e566c0c209adcf` |
+| `futures-ticker-pf_xbtusd.json` | `https://futures.kraken.com/derivatives/api/v3/tickers?symbol=PF_XBTUSD` | `6804669c3503872fe97eadd9d2c01d7c757de4491935845ec814dac1c4067a19` |
+| `futures-tickers-live.json` | `https://futures.kraken.com/derivatives/api/v3/tickers` | `5acdd87856f53cce2ca9a6cf743530487007b15d423496072029ba2602da917c` |
+| `futures-ws-book.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/book` | `18d9e4d2189af4be9ca1326b00aa13771e3c2bc713e4be25960e582cc25d743d` |
+| `futures-ws-guide.html` | `https://docs.kraken.com/exchange/guides/futures/websockets` | `9e68b93a2bfef453328a0e185dd804cb5a10cb6417f3e8400644ed907ee770d5` |
+| `futures-ws-heartbeat.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/heartbeat` | `1ec93f66d73bb6689c5e8c68dbf017cfd4f30a594d05ce9f61a3fde757b1941b` |
+| `futures-ws-ticker.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker` | `25b7fd5f4aa697e4ce7ff87f2d5f89d7cb9b8c3b131031d82bdcdadb2e6f87a2` |
+| `futures-ws-trade.html` | `https://docs.kraken.com/exchange/api-reference/futures-websocket/trade` | `504195cf92da93f143c8f73b3f723d9e43e2353770ebe6f8fbe98e3563f87367` |
+| `spot-api-error-messages.html` | `https://support.kraken.com/hc/articles/360001491786-api-error-messages` | `f883ad512106d9e21b61b3e4202391da797c955b4e5f12a877f97aec70afe992` |
 | `spot-assetpairs-btcusdt.json` | `https://api.kraken.com/0/public/AssetPairs?pair=BTCUSDT` | `e8d7bbde82050fade08fb26cb6949bff90ce1ed95dea4fc1b276c4d2dcfdca1e` |
-| `spot-rest-openapi.yaml` | `https://docs.kraken.com/openapi/spot-rest.yaml` | `c670c25a2f6564b388d7397d81d13598d87ce37ef275e8c6bfa996c5e5d4f231` |
-| `spot-rest-rate-limits.html` | `https://docs.kraken.com/exchange/guides/rest/ratelimits` | `a2e3d472f3efa794d1440abe1a138da8a07e99f6dd5a62b066d122196c9ac760` |
-| `spot-ws-book-checksum-v2.html` | `https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2` | `88ddb2e1217fc826c55a61055a5efa4fb1fc163449fbd575ab431a41d3b6302a` |
-| `spot-ws-introduction.html` | `https://docs.kraken.com/exchange/guides/websockets/introduction` | `84534270a8b36e9f620ca469195cfcf6fa202a94df6142a65c41c24e0033df38` |
-| `spot-ws-v2-book.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/book` | `702940d09c545bd5f090c0681c076b7d85be4e1bb399058a17ecb3b6bd1d6f4e` |
-| `spot-ws-v2-heartbeat.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/heartbeat` | `648d12ccd8737725403112d2bd08bb4c48d3d44f8cc8eb4d526247e33fcff4a4` |
-| `spot-ws-v2-instrument.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument` | `725b48acd6a759c567b53d6fc36d15dca929f7cacd9df6ebfa73e1edadff358c` |
-| `spot-ws-v2-level3.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/level3` | `6b152d49e0abb289d1c1072339c36047d411efd8fc383d9161eab7522fb28968` |
-| `spot-ws-v2-ohlc.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc` | `c4664437565491542298caf2ff8431cb49caad5471bc433846e0f9e34b805cf9` |
-| `spot-ws-v2-status.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/status` | `7308da678ca65e8bd7aa39adaab6d3cc35e7c6b39848d500dcb528fbe8ec3864` |
-| `spot-ws-v2-ticker.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker` | `b7508f959032677e7049777cb85fbbf1ac4ceb4e265de28a4764aaee111c6b0c` |
-| `spot-ws-v2-trade.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade` | `cceef0584bdb8a4a8ea2e720a9aa54b2e64189be6074a95cefa71a474e904241` |
+| `spot-assetpairs-live.json` | `https://api.kraken.com/0/public/AssetPairs` | `2198a59e9a255153b69bf77d4a0e7b54f1db588cf047262404a1bdb924daab03` |
+| `spot-rest-openapi.yaml` | `https://docs.kraken.com/openapi/spot-rest.yaml` | `7f5f7a8328843757adee3bb3b27840134b9edf1c3b282c20b11bae7f87c25a02` |
+| `spot-rest-rate-limits.html` | `https://docs.kraken.com/exchange/guides/rest/ratelimits` | `4feb64d200903458f29b4522be7ed0338be47c3185470ef5af79d02a3dff9580` |
+| `spot-ws-book-checksum-v2.html` | `https://docs.kraken.com/exchange/guides/websockets/book-checksum-v2` | `c0c9028c20c27bfd68e07c000a6c38a3b38b6f95b75ce14c48dcf873a43d32fd` |
+| `spot-ws-introduction.html` | `https://docs.kraken.com/exchange/guides/websockets/introduction` | `0d6e86dc7973dd05cbda0a6cb620eabe69be3898c9a67b1acfd8074d219cbbdd` |
+| `spot-ws-v2-book.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/book` | `3c93af27374d175a30e35252e29afc000acc2e977611d13889be5b4f958e5d0e` |
+| `spot-ws-v2-heartbeat.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/heartbeat` | `7aaff9fddefdbc8f0419fd222b14d60fec05944f0166d3c6c2556050363f0f02` |
+| `spot-ws-v2-instrument.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/instrument` | `a3d6d3efece0692276762960b8a348d8e87a3524920ceae384f8dd0bf9fcfe71` |
+| `spot-ws-v2-level3.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/level3` | `d4d0d7c5d72cfbb172c7b76aaccf9120d2ea8c7f97c93e75646f04033a6b8882` |
+| `spot-ws-v2-ohlc.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc` | `f8cd53405e0174d878b563e1619cda7fc95ca0ffc42e415034d4909555ae1986` |
+| `spot-ws-v2-status.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/status` | `fd982ef8baaf0c9df7e5a51b1b52f578eeff91213b7cff0ea48a08fdc0419944` |
+| `spot-ws-v2-ticker.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker` | `8373d589ed96b6e09b299b97559a50c8185973fae5b6f8b3a191be7d91a19c3f` |
+| `spot-ws-v2-trade.html` | `https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade` | `91c9099ad0f3f315e9182b90e0108b186e37940d15b762758eb56b6d5f3d6990` |
 
 ## Smoke 测试
 

@@ -1512,8 +1512,8 @@ paths:
     post:
       summary: Get Trades History
       description: >
-        Retrieve information about trades/fills. 50 results are returned at a
-        time, the most recent by default.
+        Retrieve information about trades/fills. By default, the most recent
+        trades are returned.
 
         * Unless otherwise stated, costs, fees, prices, and volumes are
         specified with the precision for the asset pair (`pair_decimals` and
@@ -8475,11 +8475,36 @@ components:
                 default: false
               rebase_multiplier:
                 $ref: '#/components/schemas/rebase_multiplier'
+              aclass:
+                description: Asset class of the `pair` filter.
+                type: string
+                default: forex
+                enum:
+                  - forex
+                  - equity_pair
+                  - futures_contract
+                  - synthetic_pair
+                  - external_pair
+              pair:
+                description: >-
+                  Filter results to a single trading pair. An unrecognized pair
+                  returns `EQuery:Unknown asset pair`.
+                type: string
+              limit:
+                description: >-
+                  Number of trades returned per page (1–100). Values above 100
+                  get clamped to 100.
+                type: integer
+                default: 50
+                minimum: 1
+                maximum: 100
             example:
               nonce: 1695828490
               type: all
               trades: false
               consolidate_taker: true
+              pair: BTC/USD
+              limit: 75
     query:
       required: true
       content:
