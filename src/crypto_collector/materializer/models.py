@@ -45,6 +45,26 @@ class SourceLocator:
             raise ValueError("zero_based_record_index must be a non-negative integer")
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class DerivedSourceLocator:
+    """Stable identity for one native item expanded from a raw record."""
+
+    source: SourceLocator
+    item_ordinal: int
+
+    def __post_init__(self) -> None:
+        if type(self.source) is not SourceLocator:
+            raise TypeError("source must be SourceLocator")
+        if (
+            type(self.item_ordinal) is not int
+            or self.item_ordinal < 0
+            or self.item_ordinal > _MAX_SIGNED_INT64
+        ):
+            raise ValueError(
+                "item_ordinal must be a non-negative signed 64-bit integer"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class SourceRecord:
     envelope: RawEnvelope
@@ -301,6 +321,7 @@ class DiscoveryReport:
 
 __all__ = [
     "ConnectionGenerationScope",
+    "DerivedSourceLocator",
     "DiscoveredRawInput",
     "DiscoveryDiagnostic",
     "DiscoveryIssueCode",

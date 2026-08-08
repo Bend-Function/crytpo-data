@@ -1,6 +1,7 @@
 from crypto_collector.materializer.discovery import discover_raw_inputs
 from crypto_collector.materializer.models import (
     ConnectionGenerationScope,
+    DerivedSourceLocator,
     DiscoveredRawInput,
     DiscoveryDiagnostic,
     DiscoveryIssueCode,
@@ -26,6 +27,7 @@ from crypto_collector.materializer.windows import Window, window_for
 __all__ = [
     "ChosenTime",
     "ConnectionGenerationScope",
+    "DerivedSourceLocator",
     "DiscoveredRawInput",
     "DiscoveryDiagnostic",
     "DiscoveryIssueCode",
