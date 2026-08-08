@@ -192,6 +192,35 @@ def test_invalid_literal_secret_is_not_echoed(tmp_path: Path) -> None:
     assert "plaintext-must-not-leak" not in result.stdout
 
 
+def test_archive_endpoint_credentials_are_rejected_without_echo(tmp_path: Path) -> None:
+    config_tree = _config_tree(tmp_path, socks=False)
+    canary = "archive-endpoint-plaintext-canary"
+    root = config_tree / "config.yaml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + f"""\
+archive:
+  targets:
+    - id: s3-primary
+      type: s3
+      bucket: market-data
+      endpoint: https://user:{canary}@example.test
+      credentials:
+        access_key_id: env:S3_ACCESS_KEY_ID
+        secret_access_key: env:S3_SECRET_ACCESS_KEY
+""",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, ["config", "check", str(config_tree), "--json"])
+
+    assert result.exit_code == 2
+    assert "archive endpoint" in result.stdout
+    assert canary not in result.stdout
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "state").exists()
+
+
 def test_committed_config_check_reports_all_five_exchanges() -> None:
     repository = Path(__file__).parents[2]
 

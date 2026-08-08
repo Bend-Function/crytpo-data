@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from crypto_collector.config.models import (
     validate_secret_snapshot,
 )
 from crypto_collector.config.primitives import SecretSnapshot
+from crypto_collector.config.report import format_validation_error
 
 BASE: dict[str, Any] = {
     "data_root": "./data",
@@ -522,6 +524,50 @@ def test_s3_addressing_style_rejects_unknown_value() -> None:
         ArchiveConfig.model_validate(
             {"targets": [_s3_archive_target(addressing_style="dns-magic")]}
         )
+
+
+def test_archive_retry_base_backoff_must_not_exceed_max_backoff() -> None:
+    with pytest.raises(ValidationError, match="base_backoff.*max_backoff"):
+        ArchiveConfig.model_validate(
+            {
+                "targets": [
+                    _s3_archive_target(
+                        retry={
+                            "base_backoff": "60s",
+                            "max_backoff": "1s",
+                        }
+                    )
+                ]
+            }
+        )
+
+
+@pytest.mark.parametrize("target_factory", [_s3_archive_target, _oss_archive_target])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://user:plaintext-canary@example.test",
+        "https://example.test?token=plaintext-canary",
+        "https://example.test/#plaintext-canary",
+        "https://example.test/base-path",
+        "ftp://example.test",
+        "https://example.test:99999",
+        "not-a-url",
+    ],
+)
+def test_archive_endpoint_rejects_unsafe_or_noncanonical_urls(
+    target_factory: Callable[..., dict[str, object]],
+    endpoint: str,
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        ArchiveConfig.model_validate({"targets": [target_factory(endpoint=endpoint)]})
+
+    assert "plaintext-canary" not in format_validation_error(captured.value)
+
+
+@pytest.mark.parametrize("endpoint", ["https://example.test", "http://127.0.0.1:9000/"])
+def test_archive_endpoint_accepts_root_http_urls(endpoint: str) -> None:
+    ArchiveConfig.model_validate({"targets": [_s3_archive_target(endpoint=endpoint)]})
 
 
 @pytest.mark.parametrize("multipart_size", ["5MiB", "5GiB"])

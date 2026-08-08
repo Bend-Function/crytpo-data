@@ -118,6 +118,33 @@ def _validate_multipart_size(
         )
 
 
+def _archive_endpoint(value: object) -> str:
+    if type(value) is not str or not value:
+        raise ValueError("archive endpoint must be a non-empty HTTP(S) URL")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        _parsed_port = parsed.port
+    except ValueError:
+        raise ValueError("archive endpoint must be a valid HTTP(S) URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or any(character.isspace() or ord(character) < 0x20 for character in hostname)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError(
+            "archive endpoint must be a root HTTP(S) URL without credentials, "
+            "query, or fragment"
+        )
+    return value
+
+
 NonEmptyString = Annotated[str, StringConstraints(min_length=1)]
 ArchiveTargetId = Annotated[
     str,
@@ -129,6 +156,7 @@ SizeBytes = Annotated[int, BeforeValidator(_size_bytes), Field(ge=0)]
 PositiveSizeBytes = Annotated[int, BeforeValidator(_size_bytes), Field(gt=0)]
 ResolvedPath = Annotated[Path, BeforeValidator(_resolved_path)]
 SecretReference = Annotated[SecretRef, BeforeValidator(_secret_ref)]
+ArchiveEndpoint = Annotated[str, BeforeValidator(_archive_endpoint)]
 StringTuple = Annotated[tuple[NonEmptyString, ...], BeforeValidator(_tuple)]
 DurationTuple = Annotated[tuple[PositiveDurationNs, ...], BeforeValidator(_tuple)]
 
@@ -456,6 +484,12 @@ class ArchiveRetryConfig(StrictModel):
     base_backoff_ns: PositiveDurationNs = Field(1_000_000_000, alias="base_backoff")
     max_backoff_ns: PositiveDurationNs = Field(60_000_000_000, alias="max_backoff")
 
+    @model_validator(mode="after")
+    def validate_backoff(self) -> Self:
+        if self.base_backoff_ns > self.max_backoff_ns:
+            raise ValueError("archive retry base_backoff must not exceed max_backoff")
+        return self
+
 
 class CompressionConfig(StrictModel):
     enabled: bool = False
@@ -514,7 +548,7 @@ class ArchiveTargetBase(StrictModel):
 class AliyunOssTargetConfig(ArchiveTargetBase):
     type: Literal["aliyun_oss"]
     bucket: NonEmptyString
-    endpoint: NonEmptyString
+    endpoint: ArchiveEndpoint
     region: NonEmptyString | None = None
     storage_class: NonEmptyString | None = None
     credentials: AliyunCredentials
@@ -532,7 +566,7 @@ class AliyunOssTargetConfig(ArchiveTargetBase):
 class S3TargetConfig(ArchiveTargetBase):
     type: Literal["s3"]
     bucket: NonEmptyString
-    endpoint: NonEmptyString | None = None
+    endpoint: ArchiveEndpoint | None = None
     region: NonEmptyString | None = None
     storage_class: NonEmptyString | None = None
     addressing_style: Literal["auto", "path", "virtual"] = "auto"
