@@ -1,0 +1,6 @@
+[
+  {"label":"snapshot","action":"snapshot","seq_id":10,"prev_seq_id":-1,"bids":[["10","2","0","1"]],"asks":[["11","3","0","1"]],"event_time_ns":1000000000,"writer_sequence":1},
+  {"label":"update","action":"update","seq_id":11,"prev_seq_id":10,"bids":[["10","4","0","2"]],"asks":[],"event_time_ns":20000000000,"writer_sequence":2},
+  {"label":"gap","action":"update","seq_id":14,"prev_seq_id":13,"bids":[["9","1","0","1"]],"asks":[],"event_time_ns":35000000000,"writer_sequence":3},
+  {"label":"recovery","action":"snapshot","seq_id":20,"prev_seq_id":-1,"bids":[["20","1","0","1"]],"asks":[["21","1","0","1"]],"event_time_ns":50000000000,"writer_sequence":4}
+]
