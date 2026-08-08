@@ -536,8 +536,9 @@ def _validate_durable_epoch_rows(connection: sqlite3.Connection) -> None:
         "SELECT epoch, config_sha256, config_snapshot FROM reload_epoch ORDER BY epoch"
     ).fetchall()
     for row in rows:
+        encoded_snapshot = bytes(row["config_snapshot"])
         try:
-            snapshot = decode_reference_config(bytes(row["config_snapshot"]))
+            snapshot = decode_reference_config(encoded_snapshot)
         except ValueError:
             raise RuntimeError(
                 f"epoch {int(row['epoch'])} contains an invalid config snapshot"
@@ -545,6 +546,12 @@ def _validate_durable_epoch_rows(connection: sqlite3.Connection) -> None:
         if str(row["config_sha256"]) != snapshot.config_sha256:
             raise RuntimeError(
                 f"epoch {int(row['epoch'])} config digest does not match its snapshot"
+            )
+        canonical_snapshot = encode_reference_config(snapshot)
+        if canonical_snapshot != encoded_snapshot:
+            connection.execute(
+                "UPDATE reload_epoch SET config_snapshot = ? WHERE epoch = ?",
+                (canonical_snapshot, int(row["epoch"])),
             )
     current = connection.execute(
         """

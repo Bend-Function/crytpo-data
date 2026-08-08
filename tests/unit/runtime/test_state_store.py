@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -157,6 +158,52 @@ def test_initial_epoch_and_atomic_commit_survive_reopen(tmp_path: Path) -> None:
         assert reopened.current_epoch().epoch == 2  # type: ignore[union-attr]
         assert reopened.epoch(2).snapshot == _snapshot(tmp_path, "b")  # type: ignore[union-attr]
         assert reopened.epoch_converged(2) is True
+
+
+def test_store_reopens_a_legacy_version_one_reference_snapshot(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reload.sqlite3"
+    with ReloadStateStore.open(path) as store:
+        store.commit_initial_epoch(
+            _snapshot(tmp_path, "a"),
+            supervisor_instance_id="supervisor-a",
+            request_id="startup-1",
+            committed_at_ns=10,
+        )
+
+    with sqlite3.connect(path) as connection:
+        encoded = connection.execute(
+            "SELECT config_snapshot FROM reload_epoch WHERE epoch = 1"
+        ).fetchone()[0]
+        legacy = json.loads(bytes(encoded))
+        legacy["schema_version"] = 1
+        del legacy["document_sha256"]
+        connection.execute(
+            "UPDATE reload_epoch SET config_snapshot = ? WHERE epoch = 1",
+            (
+                json.dumps(legacy, separators=(",", ":"), sort_keys=True).encode(
+                    "utf-8"
+                ),
+            ),
+        )
+
+    with ReloadStateStore.open(path) as reopened:
+        current = reopened.current_epoch()
+        assert current is not None
+        assert current.snapshot.schema_version == 2
+        assert current.snapshot.document_sha256 is not None
+
+    with sqlite3.connect(path) as connection:
+        persisted = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT config_snapshot FROM reload_epoch WHERE epoch = 1"
+                ).fetchone()[0]
+            )
+        )
+    assert persisted["schema_version"] == 2
+    assert len(persisted["document_sha256"]) == 64
 
 
 def test_ack_fence_rejects_stale_supervisor_request_worker_and_generation(

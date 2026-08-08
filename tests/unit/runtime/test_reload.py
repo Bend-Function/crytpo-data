@@ -78,6 +78,8 @@ def test_reference_config_codec_is_canonical_and_immutable(tmp_path: Path) -> No
             }
         },
         {"archive": {"targets": [{"mount_guard": {"expected": "literal"}}]}},
+        {"Archive": {"Targets": [{"MountGuard": {"Expected": "literal"}}]}},
+        {"Network": {"EgressPool": [{"Url": "literal"}]}},
         {"proxy": {"url": "socks5://alice:plaintext@127.0.0.1:1080"}},
         {"ratio": float("nan")},
         {"bad": object()},
@@ -141,6 +143,55 @@ def test_reference_config_decoder_rejects_duplicate_and_unknown_fields(
         decode_reference_config(duplicate)
 
 
+def test_reference_config_decoder_migrates_legacy_version_one(
+    tmp_path: Path,
+) -> None:
+    encoded = encode_reference_config(_snapshot(tmp_path, {"enabled": True}))
+    legacy = json.loads(encoded)
+    legacy["schema_version"] = 1
+    del legacy["document_sha256"]
+
+    migrated = decode_reference_config(
+        json.dumps(legacy, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+
+    assert migrated.schema_version == 2
+    assert migrated.document_sha256 is not None
+    assert b'"schema_version":2' in encode_reference_config(migrated)
+
+
+def test_reference_config_rejects_future_schema_and_noncanonical_paths(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ReferenceDocumentError, match="schema_version"):
+        ReferenceConfigSnapshot(
+            schema_version=3,
+            config_sha256="a" * 64,
+            capability_registry_sha256="b" * 64,
+            config_path=str(tmp_path / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+    with pytest.raises(ReferenceDocumentError, match="normalized absolute path"):
+        ReferenceConfigSnapshot(
+            config_sha256="a" * 64,
+            capability_registry_sha256="b" * 64,
+            config_path=str(tmp_path / "nested" / ".." / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+    with pytest.raises(ReferenceDocumentError, match="directly inside"):
+        ReferenceConfigSnapshot(
+            config_sha256="a" * 64,
+            capability_registry_sha256="b" * 64,
+            config_path=str(tmp_path / "nested" / "collector.yaml"),
+            base_dir=str(tmp_path),
+            source_document={"enabled": True},
+        )
+
+
 def test_reference_codec_rejects_oversized_documents_before_persistence(
     tmp_path: Path,
 ) -> None:
@@ -148,6 +199,33 @@ def test_reference_codec_rejects_oversized_documents_before_persistence(
 
     with pytest.raises(ReferenceDocumentError, match="exceeds 8 MiB"):
         encode_reference_config(snapshot)
+
+
+def test_reference_encoder_revalidates_a_force_mutated_snapshot(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path, {"enabled": True})
+    canary = "plaintext-canary"
+    object.__setattr__(snapshot, "source_document", {"password": canary})
+
+    with pytest.raises(ReferenceDocumentError) as captured:
+        encode_reference_config(snapshot)
+
+    assert canary not in str(captured.value)
+
+
+def test_case_variant_sensitive_paths_reject_without_echoing_canary(
+    tmp_path: Path,
+) -> None:
+    canary = "plaintext-canary"
+
+    with pytest.raises(ReferenceDocumentError) as captured:
+        _snapshot(
+            tmp_path,
+            {"Archive": {"Targets": [{"MountGuard": {"Expected": canary}}]}},
+        )
+
+    assert canary not in str(captured.value)
 
 
 def test_malformed_url_error_never_echoes_the_input_secret(tmp_path: Path) -> None:

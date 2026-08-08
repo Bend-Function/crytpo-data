@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -46,13 +47,26 @@ def _size_bytes(value: object) -> int:
 def _resolved_path(value: object, info: ValidationInfo) -> Path:
     if type(value) is not str:
         raise ValueError("path must be a string")
+    if "\x00" in value:
+        raise ValueError("path could not be normalized")
     candidate = Path(value).expanduser()
+    if (
+        isinstance(info.context, Mapping)
+        and info.context.get("canonical_paths") is True
+    ):
+        raw = str(candidate)
+        if not candidate.is_absolute() or os.path.abspath(raw) != raw:
+            raise ValueError("snapshot path must be a normalized absolute path")
+        return candidate
     if not candidate.is_absolute():
         base_dir = Path.cwd()
         if isinstance(info.context, Mapping) and "base_dir" in info.context:
             base_dir = Path(info.context["base_dir"])
         candidate = base_dir / candidate
-    return candidate.resolve(strict=False)
+    try:
+        return candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("path could not be normalized") from None
 
 
 def _secret_ref(value: object) -> SecretRef:
@@ -61,6 +75,40 @@ def _secret_ref(value: object) -> SecretRef:
     if type(value) is not str:
         raise ValueError("secret must be an env: or file: reference")
     return SecretRef.parse(value)
+
+
+def _public_root_http_endpoint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        raise ValueError("endpoint must be an anonymous root HTTP URL") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path.rstrip("/")
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+        or "?" in value
+        or "#" in value
+        or "\\" in value
+        or "@" in parsed.netloc
+        or "%" in parsed.netloc
+        or parsed.netloc.endswith(":")
+        or (port is not None and not 1 <= port <= 65_535)
+        or any(
+            character.isspace()
+            or ord(character) < 0x20
+            or 0x7F <= ord(character) <= 0x9F
+            for character in value
+        )
+    ):
+        raise ValueError("endpoint must be an anonymous root HTTP URL")
+    return value.rstrip("/")
 
 
 def _tuple(value: object) -> object:
@@ -469,6 +517,13 @@ class AliyunOssTargetConfig(ArchiveTargetBase):
     storage_class: NonEmptyString | None = None
     credentials: AliyunCredentials
 
+    @field_validator("endpoint", mode="after")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        validated = _public_root_http_endpoint(value)
+        assert validated is not None
+        return validated
+
 
 class S3TargetConfig(ArchiveTargetBase):
     type: Literal["s3"]
@@ -477,6 +532,11 @@ class S3TargetConfig(ArchiveTargetBase):
     region: NonEmptyString | None = None
     storage_class: NonEmptyString | None = None
     credentials: S3Credentials
+
+    @field_validator("endpoint", mode="after")
+    @classmethod
+    def validate_endpoint(cls, value: str | None) -> str | None:
+        return _public_root_http_endpoint(value)
 
 
 class FilesystemTargetConfig(ArchiveTargetBase):

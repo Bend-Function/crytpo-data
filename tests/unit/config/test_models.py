@@ -386,3 +386,24 @@ def test_filesystem_archive_must_not_be_inside_data_root(tmp_path) -> None:
 
     with pytest.raises(ValidationError, match="data_root"):
         CollectorConfig.model_validate(invalid)
+
+
+def test_object_store_endpoint_must_be_an_anonymous_root_http_url() -> None:
+    invalid = deepcopy(BASE)
+    invalid["archive"] = {
+        "targets": [
+            {
+                "id": "bad-s3",
+                "type": "s3",
+                "bucket": "market-data",
+                "endpoint": "https://s3.example.test/private/path",
+                "credentials": {
+                    "access_key_id": "env:S3_ACCESS_KEY_ID",
+                    "secret_access_key": "env:S3_SECRET_ACCESS_KEY",
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(ValidationError, match="root HTTP URL"):
+        CollectorConfig.model_validate(invalid)
