@@ -16,6 +16,7 @@ from crypto_collector.exchanges.binance.catalog import (
 from crypto_collector.exchanges.binance.ws import (
     DEFAULT_ROTATION_LEAD_NS,
     MAX_CONNECTION_LIFETIME_NS,
+    BinanceStreamSpec,
     BinanceWsMessageKind,
     BinanceWsProtocolError,
     BinanceWsRoute,
@@ -287,13 +288,54 @@ def test_index_info_binds_independent_reference_identity_and_event_type() -> Non
     )
 
     assert spec.instrument_key is None
-    assert spec.wire_symbol == "SMALLUSDT"
+    assert spec.wire_symbol is None
+    assert spec.index_symbol == "SMALLUSDT"
+    assert spec.identity_symbol == "SMALLUSDT"
     assert spec.stream_name == "smallusdt@compositeIndex"
+    assert combined_stream_url("wss://fstream.binance.com", [spec]) == (
+        "wss://fstream.binance.com/market/stream?streams=smallusdt@compositeIndex"
+    )
+    assert decode_json(build_subscribe_message([spec], request_id=7)) == {
+        "method": "SUBSCRIBE",
+        "params": ["smallusdt@compositeIndex"],
+        "id": 7,
+    }
+    parsed = parse_ws_message(
+        (
+            '{"e":"compositeIndex","E":1,"s":"SMALLUSDT",'
+            '"p":"1.1","C":"baseAsset","c":[]}'
+        ),
+        expected=spec,
+    )
+    assert parsed.kind is BinanceWsMessageKind.DATA
     with pytest.raises(BinanceWsProtocolError, match="event type mismatch"):
         parse_ws_message('{"e":"wrong","E":1,"s":"SMALLUSDT","st":1}', expected=spec)
     with pytest.raises(BinanceWsProtocolError, match="symbol does not match"):
         parse_ws_message(
             '{"e":"compositeIndex","E":1,"s":"BTCUSDT","st":1}', expected=spec
+        )
+
+
+def test_index_info_spec_freezes_exact_composite_index_wire_stream() -> None:
+    with pytest.raises(ValueError, match="exact composite-index stream"):
+        BinanceStreamSpec(
+            market=Market.PERPETUAL,
+            logical_stream="index_info",
+            stream_name="smallusdt@ticker",
+            route=BinanceWsRoute.MARKET,
+            instrument_key=None,
+            wire_symbol=None,
+            index_symbol="SMALLUSDT",
+        )
+
+    with pytest.raises(ValueError, match="reserved for index_info"):
+        BinanceStreamSpec(
+            market=Market.PERPETUAL,
+            logical_stream="ticker",
+            stream_name="smallusdt@compositeIndex",
+            route=BinanceWsRoute.MARKET,
+            instrument_key="SMALLUSDT",
+            wire_symbol="SMALLUSDT",
         )
 
 

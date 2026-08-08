@@ -87,6 +87,7 @@ class BinanceStreamSpec:
     instrument_key: str | None
     wire_symbol: str | None
     coverage: CoverageMode | None = None
+    index_symbol: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.market) is not Market:
@@ -98,10 +99,26 @@ class BinanceStreamSpec:
         if not _valid_stream_token(self.stream_name):
             raise ValueError("stream_name contains unsupported URL characters")
         if self.logical_stream == "index_info":
-            if self.instrument_key is not None or self.wire_symbol is None:
+            if self.market is not Market.PERPETUAL:
+                raise ValueError("index_info is available only for Binance Futures")
+            if self.instrument_key is not None or self.wire_symbol is not None:
                 raise ValueError("index_info must bind an explicit index symbol")
-        elif (self.instrument_key is None) != (self.wire_symbol is None):
-            raise ValueError("instrument_key and wire_symbol must be paired")
+            if (
+                type(self.index_symbol) is not str
+                or not _valid_stream_token(self.index_symbol)
+                or any(marker in self.index_symbol for marker in "@!")
+            ):
+                raise ValueError("index_symbol contains unsupported stream delimiters")
+            expected_stream = f"{self.index_symbol.lower()}@compositeIndex"
+            if self.stream_name != expected_stream:
+                raise ValueError("index_info must use its exact composite-index stream")
+        else:
+            if self.index_symbol is not None:
+                raise ValueError("index_symbol is valid only for index_info")
+            if self.stream_name.endswith("@compositeIndex"):
+                raise ValueError("composite-index streams are reserved for index_info")
+            if (self.instrument_key is None) != (self.wire_symbol is None):
+                raise ValueError("instrument_key and wire_symbol must be paired")
         if self.instrument_key is not None and (
             type(self.instrument_key) is not str or not self.instrument_key
         ):
@@ -132,6 +149,10 @@ class BinanceStreamSpec:
                 )
         elif self.coverage is not None:
             raise ValueError("coverage is defined only for Binance liquidation streams")
+
+    @property
+    def identity_symbol(self) -> str | None:
+        return self.index_symbol if self.index_symbol is not None else self.wire_symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +209,6 @@ def stream_spec(
     if index_symbol is not None and logical_stream != "index_info":
         raise ValueError("index_symbol is valid only for index_info")
     symbol = None if wire_symbol is None else wire_symbol.lower()
-    bound_wire_symbol = wire_symbol
     coverage: CoverageMode | None = None
     if logical_stream == "instrument" and market is Market.PERPETUAL:
         if instrument_key is not None or wire_symbol is not None or not all_market:
@@ -216,7 +236,6 @@ def stream_spec(
             or "!" in index_symbol
         ):
             raise ValueError("index_symbol contains unsupported stream delimiters")
-        bound_wire_symbol = index_symbol
         name = f"{index_symbol.lower()}@compositeIndex"
     else:
         if all_market:
@@ -264,7 +283,8 @@ def stream_spec(
         stream_name=name,
         route=route,
         instrument_key=instrument_key,
-        wire_symbol=bound_wire_symbol,
+        wire_symbol=wire_symbol,
+        index_symbol=index_symbol,
         coverage=coverage,
     )
 
@@ -400,9 +420,8 @@ def _data_rows(
 def _validate_usd_m(
     data: JsonPayload, spec: BinanceStreamSpec, *, raw_text: str
 ) -> None:
-    requires_indicator = (
-        spec.logical_stream in _FUTURES_ST_REQUIRED_STREAMS
-        or spec.instrument_key is None
+    requires_indicator = spec.logical_stream in _FUTURES_ST_REQUIRED_STREAMS or (
+        spec.instrument_key is None and spec.logical_stream != "index_info"
     )
     for row in _data_rows(data, raw_text=raw_text):
         indicator = row.get("st")
@@ -528,13 +547,14 @@ def _validate_shape(
             raise BinanceWsProtocolError(
                 "unsupported Binance stream shape", raw_text=raw_text
             )
-        if spec.wire_symbol is not None:
+        expected_symbol = spec.identity_symbol
+        if expected_symbol is not None:
             symbol = row.get("s")
             if symbol is None and isinstance(row.get("o"), Mapping):
                 symbol = cast(Mapping[str, JsonPayload], row["o"]).get("s")
             if (
                 type(symbol) is not str
-                or symbol.casefold() != spec.wire_symbol.casefold()
+                or symbol.casefold() != expected_symbol.casefold()
             ):
                 raise BinanceWsProtocolError(
                     "payload symbol does not match subscription", raw_text=raw_text
