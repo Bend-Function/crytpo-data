@@ -4,6 +4,8 @@ import asyncio
 import math
 import random
 import re
+from base64 import b64decode, b64encode
+from binascii import Error as Base64Error
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -11,6 +13,7 @@ from types import TracebackType
 from typing import Protocol, Self, cast
 from urllib.parse import urlsplit
 
+from crypto_collector.domain import Market
 from crypto_collector.domain.json_codec import (
     JsonPayload,
     decode_json,
@@ -100,9 +103,18 @@ _SUPPORTED_INSTRUMENT_TYPES = frozenset({"SPOT", "SWAP"})
 
 
 class OkxWsProtocolError(ValueError):
-    def __init__(self, message: str, *, raw_text: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str | None = None,
+        raw_binary_base64: str | None = None,
+        raw_binary_length: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.raw_text = raw_text
+        self.raw_binary_base64 = raw_binary_base64
+        self.raw_binary_length = raw_binary_length
 
 
 class OkxWsMessageKind(StrEnum):
@@ -165,13 +177,24 @@ class OkxWsSessionEvent:
     message: OkxWsMessage | None = None
     reconnect_reason: OkxWsReconnectReason | None = None
     raw_text: str | None = None
+    raw_binary_base64: str | None = None
+    raw_binary_length: int | None = None
     error_type: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.action) is not OkxWsSessionAction:
             raise TypeError("action must be OkxWsSessionAction")
         if self.action is OkxWsSessionAction.MESSAGE:
-            if self.message is None or self.reconnect_reason is not None:
+            if self.message is None or any(
+                value is not None
+                for value in (
+                    self.reconnect_reason,
+                    self.raw_text,
+                    self.raw_binary_base64,
+                    self.raw_binary_length,
+                    self.error_type,
+                )
+            ):
                 raise ValueError("message events require only a parsed message")
         elif self.action is OkxWsSessionAction.PING_SENT:
             if any(
@@ -180,12 +203,39 @@ class OkxWsSessionEvent:
                     self.message,
                     self.reconnect_reason,
                     self.raw_text,
+                    self.raw_binary_base64,
+                    self.raw_binary_length,
                     self.error_type,
                 )
             ):
                 raise ValueError("ping events must not contain message or error state")
         elif self.reconnect_reason is None:
             raise ValueError("reconnect events require a reconnect reason")
+        binary_values = (self.raw_binary_base64, self.raw_binary_length)
+        if (binary_values[0] is None) != (binary_values[1] is None):
+            raise ValueError("binary frame evidence must contain base64 and length")
+        if self.raw_binary_base64 is not None:
+            if self.message is not None or self.raw_text is not None:
+                raise ValueError(
+                    "binary frame evidence cannot conflict with frame text"
+                )
+            if (
+                type(self.raw_binary_base64) is not str
+                or not self.raw_binary_base64.isascii()
+                or type(self.raw_binary_length) is not int
+                or self.raw_binary_length < 0
+            ):
+                raise ValueError("binary frame evidence is invalid")
+            try:
+                decoded = b64decode(self.raw_binary_base64, validate=True)
+            except (Base64Error, ValueError) as error:
+                raise ValueError(
+                    "binary frame evidence is not strict base64"
+                ) from error
+            if len(decoded) != self.raw_binary_length:
+                raise ValueError("binary frame evidence length does not match")
+        elif self.message is not None and self.raw_text is not None:
+            raise ValueError("parsed and raw reconnect frames cannot conflict")
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +325,11 @@ def _text_frame(raw: object) -> str:
         try:
             return raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
-            raise OkxWsProtocolError("WebSocket bytes must be UTF-8 text") from error
+            raise OkxWsProtocolError(
+                "WebSocket bytes must be UTF-8 text",
+                raw_binary_base64=b64encode(raw).decode("ascii"),
+                raw_binary_length=len(raw),
+            ) from error
     raise OkxWsProtocolError("WebSocket frame must be text or UTF-8 bytes")
 
 
@@ -418,6 +472,12 @@ def _inst_type_argument(
     if inst_type not in allowed:
         expected = " or ".join(sorted(allowed))
         raise ValueError(f"{subscription.channel} instType must be {expected}")
+    expected_for_market = "SPOT" if subscription.market is Market.SPOT else "SWAP"
+    if inst_type != expected_for_market:
+        raise ValueError(
+            f"{subscription.channel} instType must match "
+            f"{subscription.market.value} market"
+        )
     return {"channel": subscription.channel, "instType": inst_type}
 
 
@@ -431,8 +491,8 @@ def _adl_warning_argument(
     inst_type = subscription.params["instType"]
     if type(inst_type) is not str:
         raise TypeError("adl-warning instType must be a string")
-    if inst_type != "SWAP":
-        raise ValueError("adl-warning instType must be SWAP")
+    if subscription.market is not Market.PERPETUAL or inst_type != "SWAP":
+        raise ValueError("adl-warning requires perpetual market and SWAP instType")
     argument: dict[str, JsonPayload] = {
         "channel": subscription.channel,
         "instType": inst_type,
@@ -620,8 +680,12 @@ class OkxWsSession:
         if not callable(getattr(connection, "send", None)) or not callable(
             getattr(connection, "recv", None)
         ):
-            await context.__aexit__(None, None, None)
-            raise TypeError("WebSocket connection must provide send() and recv()")
+            error = TypeError("WebSocket connection must provide send() and recv()")
+            try:
+                await context.__aexit__(type(error), error, error.__traceback__)
+            except BaseException:  # noqa: BLE001 - preserve validation cause.
+                error.add_note("websocket context cleanup also failed")
+            raise error
         self._context = context
         self._connection = connection
         try:
@@ -632,7 +696,10 @@ class OkxWsSession:
         except BaseException as error:
             self._connection = None
             self._context = None
-            await context.__aexit__(type(error), error, error.__traceback__)
+            try:
+                await context.__aexit__(type(error), error, error.__traceback__)
+            except BaseException:  # noqa: BLE001 - preserve subscribe failure.
+                error.add_note("websocket context cleanup also failed")
             raise
         now = asyncio.get_running_loop().time()
         self._idle_deadline = now + self._idle_timeout
@@ -650,7 +717,12 @@ class OkxWsSession:
         self._connection = None
         self._terminal = True
         if context is not None:
-            await context.__aexit__(exc_type, exc, traceback)
+            try:
+                await context.__aexit__(exc_type, exc, traceback)
+            except BaseException:
+                if exc is None:
+                    raise
+                exc.add_note("websocket context cleanup also failed")
 
     def _reconnect(
         self,
@@ -658,6 +730,8 @@ class OkxWsSession:
         *,
         message: OkxWsMessage | None = None,
         raw_text: str | None = None,
+        raw_binary_base64: str | None = None,
+        raw_binary_length: int | None = None,
         error_type: str | None = None,
     ) -> OkxWsSessionEvent:
         self._terminal = True
@@ -666,6 +740,8 @@ class OkxWsSession:
             message=message,
             reconnect_reason=reason,
             raw_text=raw_text,
+            raw_binary_base64=raw_binary_base64,
+            raw_binary_length=raw_binary_length,
             error_type=error_type,
         )
 
@@ -781,6 +857,8 @@ class OkxWsSession:
             return self._reconnect(
                 OkxWsReconnectReason.PROTOCOL_ERROR,
                 raw_text=error.raw_text,
+                raw_binary_base64=error.raw_binary_base64,
+                raw_binary_length=error.raw_binary_length,
                 error_type=type(error).__name__,
             )
         if message.kind is OkxWsMessageKind.PONG:

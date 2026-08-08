@@ -85,6 +85,25 @@ def budgets(
     return registry
 
 
+@pytest.mark.asyncio
+async def test_submit_is_cancellation_atomic_around_commit() -> None:
+    clock = FakeClock()
+    scheduler = RestScheduler(budgets(clock), clock=clock)
+
+    cancelled_before_start = asyncio.create_task(
+        scheduler.submit(job("cancelled-before-start"))
+    )
+    cancelled_before_start.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_before_start
+    assert scheduler.pending_ids() == ()
+
+    committed = asyncio.create_task(scheduler.submit(job("committed")))
+    asyncio.get_running_loop().call_soon(committed.cancel)
+    assert await committed is SubmitResult.ENQUEUED
+    assert scheduler.pending_ids() == ("committed",)
+
+
 def job(
     job_id: str,
     *,

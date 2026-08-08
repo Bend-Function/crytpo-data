@@ -27,10 +27,31 @@ from crypto_collector.exchanges import (
 from crypto_collector.runtime.state import WorkerState
 from crypto_collector.runtime.worker import ExchangeWorker
 from crypto_collector.scheduler import IntervalPlan
+from crypto_collector.selection import InstrumentRecord
 from crypto_collector.storage import EnqueueStatus, RawManifestV1, RawWriterService
 from crypto_collector.storage.serialize import decode_envelope_jsonl
 
 FIXTURE = Path(__file__).parents[2] / "fixtures/exchanges/scripted/session.jsonl"
+
+
+def instrument() -> InstrumentRecord:
+    return InstrumentRecord(
+        exchange=Exchange.OKX,
+        market=Market.SPOT,
+        instrument_key="BTC-USDT",
+        canonical_pair="BTC/USDT",
+        wire_symbols={"rest": "BTC-USDT", "websocket": "BTC-USDT"},
+        base_asset="BTC",
+        quote_asset="USDT",
+        settlement_asset=None,
+        status="live",
+        tradable=True,
+        lifecycle={"state": "live"},
+        tradable_at_ns=None,
+        tradable_at_source=None,
+        turnover=None,
+        raw_catalog_reference="raw/okx/spot/BTC-USDT",
+    )
 
 
 class ScriptedAdapter:
@@ -53,6 +74,7 @@ class ScriptedAdapter:
                     channel="trades",
                     endpoint="wss://ws.okx.test/ws/v5/public",
                     egress_id="direct-primary",
+                    quota_group="direct",
                     shard_id="spot-0",
                     logical_stream="trade",
                 ),
@@ -73,6 +95,8 @@ class ScriptedAdapter:
                 ),
             ),
             disabled_optional_features=(),
+            instruments=(instrument(),),
+            egress_quota_groups={"direct-primary": "direct"},
         )
 
     async def run(self, plan: AdapterPlan, runtime: Any, sink: Any) -> None:
@@ -116,7 +140,7 @@ def request() -> CollectionRequest:
     return CollectionRequest.model_validate(
         {
             "exchange": Exchange.OKX,
-            "selected": {Market.SPOT: ()},
+            "selected": {Market.SPOT: (instrument(),)},
             "enabled_streams": {Market.SPOT: frozenset({"trade"})},
             "interval_plans": {"book_deep_snapshot": IntervalPlan(30, 30, None)},
             "config_sha256": "a" * 64,

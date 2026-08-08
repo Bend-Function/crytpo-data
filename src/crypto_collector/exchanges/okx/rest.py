@@ -533,7 +533,9 @@ def _okx_instrument(
         raise ValueError("instrument does not belong to the required market")
 
 
-def _rate_limit_headers(headers: httpx.Headers) -> dict[str, str]:
+def okx_rate_limit_headers(headers: httpx.Headers) -> dict[str, str]:
+    """Keep only public rate-limit evidence from an OKX response."""
+
     return {
         name: value
         for name, value in headers.items()
@@ -566,7 +568,7 @@ def capture_okx_response(
         path=request.path,
         params=cast(Mapping[str, ValidatedJsonPayload], request.params),
         status=response.status_code,
-        rate_limit_headers=_rate_limit_headers(response.headers),
+        rate_limit_headers=okx_rate_limit_headers(response.headers),
     )
     inspection = inspect_okx_response(response)
     if inspection.error is not None:
@@ -849,6 +851,7 @@ __all__ = [
     "deep_book_request",
     "derivative_reference_request",
     "instruments_request",
+    "okx_rate_limit_headers",
     "parse_candles",
     "parse_deep_book",
     "parse_derivative_reference",

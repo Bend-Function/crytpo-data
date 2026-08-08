@@ -378,6 +378,8 @@ class RetryConfig(StrictModel):
     def validate_backoff(self) -> Self:
         if self.base_backoff_ns > self.max_backoff_ns:
             raise ValueError("REST base_backoff must not exceed max_backoff")
+        if self.base_backoff_ns > self.ws_reconnect_max_backoff_ns:
+            raise ValueError("base_backoff must not exceed ws_reconnect_max_backoff")
         return self
 
 

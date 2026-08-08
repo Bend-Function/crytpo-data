@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from base64 import b64decode
 from collections.abc import Mapping
 from decimal import Decimal
 from hashlib import sha256
@@ -230,6 +231,19 @@ def test_http_200_missing_code_and_invalid_json_are_not_success() -> None:
     assert missing.retry_action is RetryAction.DO_NOT_RETRY
     assert invalid is not None
     assert invalid.exchange_code == "invalid_json"
+
+
+def test_invalid_json_preserves_exact_binary_body_as_base64() -> None:
+    error = classify_okx_response(httpx.Response(200, content=b"\xff"))
+
+    assert error is not None
+    evidence = _object(error.raw_payload)
+    assert evidence == {
+        "body_encoding": "base64",
+        "body_base64": "/w==",
+        "body_byte_length": 1,
+    }
+    assert b64decode(cast(str, evidence["body_base64"]), validate=True) == b"\xff"
 
 
 def test_numeric_zero_code_is_an_intentional_compatibility_success() -> None:

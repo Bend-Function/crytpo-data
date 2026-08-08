@@ -138,10 +138,29 @@ def test_runtime_safety_defaults_are_explicit() -> None:
     assert runtime.shutdown_deadline_ns == 30_000_000_000
     assert runtime.worker_restart.max_attempts == 10
     assert config.network.retry.rest_max_attempts == 5
+    assert config.network.retry.base_backoff_ns == 250_000_000
+    assert config.network.retry.max_backoff_ns == 30_000_000_000
+    assert config.network.retry.ws_reconnect_max_backoff_ns == 60_000_000_000
     assert config.network.scheduler.deep_snapshot_max_interval_ns == 900_000_000_000
     assert config.network.scheduler.max_pending_jobs == 10_000
     assert config.network.scheduler.event_history_limit == 1_024
     assert config.selection.turnover_max_age_ns == 900_000_000_000
+
+
+def test_shared_retry_base_must_fit_rest_and_websocket_caps() -> None:
+    invalid = deepcopy(BASE)
+    invalid["network"]["retry"] = {
+        "rest_max_attempts": 3,
+        "base_backoff": "2s",
+        "max_backoff": "3s",
+        "ws_reconnect_max_backoff": "1s",
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="base_backoff must not exceed ws_reconnect_max_backoff",
+    ):
+        CollectorConfig.model_validate(invalid)
 
 
 def test_date_gated_feature_policy_is_explicit_and_strict() -> None:

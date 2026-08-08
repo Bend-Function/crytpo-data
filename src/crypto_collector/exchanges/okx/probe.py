@@ -630,6 +630,7 @@ class OkxProbeProvider:
                 channel=channel,
                 endpoint=endpoint,
                 egress_id=egress_id,
+                quota_group=self._quota_groups[egress_id],
                 shard_id=f"probe-{endpoint_role}",
                 logical_stream=logical_stream,
             )

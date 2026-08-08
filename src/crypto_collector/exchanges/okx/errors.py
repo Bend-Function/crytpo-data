@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from base64 import b64encode
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -107,6 +108,19 @@ def _decode_payload(response: _ResponseLike) -> JsonPayload:
     raise OkxPayloadError("OKX response body contains an unsupported JSON value")
 
 
+def okx_response_body_evidence(response: _ResponseLike) -> JsonPayload:
+    """Return an exact JSON-safe representation of an OKX response body."""
+
+    try:
+        return _decode_payload(response)
+    except OkxPayloadError:
+        return {
+            "body_encoding": "base64",
+            "body_base64": b64encode(response.content).decode("ascii"),
+            "body_byte_length": len(response.content),
+        }
+
+
 def _code(value: object) -> str | None:
     if type(value) is str:
         return value
@@ -144,7 +158,7 @@ def inspect_okx_response(response: _ResponseLike) -> OkxResponseInspection:
     try:
         raw_payload = _decode_payload(response)
     except OkxPayloadError:
-        raw_text = response.content.decode("utf-8", errors="replace")
+        raw_body = okx_response_body_evidence(response)
         classification = classify_http(status, _retry_after(response.headers))
         return OkxResponseInspection(
             payload=None,
@@ -153,7 +167,7 @@ def inspect_okx_response(response: _ResponseLike) -> OkxResponseInspection:
                 code="invalid_json",
                 message="response body is not finite valid JSON",
                 action=classification.action,
-                payload=raw_text,
+                payload=raw_body,
             ),
         )
 
@@ -218,5 +232,6 @@ __all__ = [
     "OkxResponseInspection",
     "classify_okx_response",
     "inspect_okx_response",
+    "okx_response_body_evidence",
     "require_okx_success",
 ]

@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import asyncio
+import traceback
 from decimal import Decimal
+from functools import partial
 from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
 
 from crypto_collector.domain.envelope import SourceContext
-from crypto_collector.domain.types import CoverageMode, Exchange, IntegrityMode, Market
+from crypto_collector.domain.types import (
+    CoverageMode,
+    Exchange,
+    IntegrityMode,
+    Market,
+    Transport,
+)
 from crypto_collector.exchanges.contracts import (
     AdapterPlan,
+    AdapterRetrySettings,
     AdapterRuntime,
     BookIntegrity,
     CollectionRequest,
     ConnectionGeneration,
     EgressTransport,
     Instrument,
+    NetworkAdmissionLease,
+    NetworkAdmissionReleaseDisposition,
+    NetworkAdmissionReleaseError,
     RestPlanItem,
     StreamExpectation,
     WebSocketSubscription,
@@ -23,6 +36,7 @@ from crypto_collector.exchanges.contracts import (
 from crypto_collector.exchanges.registry import AdapterRegistry
 from crypto_collector.scheduler import (
     IntervalPlan,
+    RestBudgetRoute,
     RestJob,
     RestPriority,
 )
@@ -63,6 +77,25 @@ def _instrument(
     )
 
 
+def test_adapter_retry_settings_match_network_defaults_and_validate_bounds() -> None:
+    settings = AdapterRetrySettings()
+
+    assert settings.rest_max_attempts == 5
+    assert settings.base_backoff_ns == 250_000_000
+    assert settings.max_backoff_ns == 30_000_000_000
+    assert settings.ws_reconnect_max_backoff_ns == 60_000_000_000
+
+    with pytest.raises(ValueError, match="positive integer"):
+        AdapterRetrySettings(rest_max_attempts=0)
+    with pytest.raises(ValueError, match="max_backoff_ns"):
+        AdapterRetrySettings(base_backoff_ns=2, max_backoff_ns=1)
+    with pytest.raises(ValueError, match="ws_reconnect_max_backoff_ns"):
+        AdapterRetrySettings(
+            base_backoff_ns=2,
+            ws_reconnect_max_backoff_ns=1,
+        )
+
+
 def _rest_plan_item(
     *,
     exchange: Exchange = Exchange.OKX,
@@ -71,6 +104,7 @@ def _rest_plan_item(
     priority: RestPriority = RestPriority.DEEP_SNAPSHOT,
     requires_generation: bool = False,
     replaceable: bool = True,
+    routes: tuple[RestBudgetRoute, ...] = (),
 ) -> RestPlanItem:
     return RestPlanItem(
         id="okx:spot:btc:book",
@@ -91,6 +125,7 @@ def _rest_plan_item(
         interval_plan=None if requires_generation else IntervalPlan(30, 30, None),
         requires_generation=requires_generation,
         replaceable=replaceable,
+        routes=routes,
     )
 
 
@@ -214,6 +249,7 @@ def test_adapter_plan_requires_an_expectation_for_every_planned_stream() -> None
         channel="trades",
         endpoint="wss://ws.okx.test/ws/v5/public",
         egress_id="direct-primary",
+        quota_group="direct",
         shard_id="spot-0",
         logical_stream="trade",
     )
@@ -225,6 +261,7 @@ def test_adapter_plan_requires_an_expectation_for_every_planned_stream() -> None
             rest=(),
             expectations=(),
             disabled_optional_features=(),
+            egress_quota_groups={"direct-primary": "direct"},
         )
 
     expectation = StreamExpectation(
@@ -239,8 +276,45 @@ def test_adapter_plan_requires_an_expectation_for_every_planned_stream() -> None
         rest=(),
         expectations=(expectation,),
         disabled_optional_features=(),
+        instruments=(_instrument(exchange=Exchange.OKX, instrument_key="BTC-USDT"),),
+        egress_quota_groups={"direct-primary": "direct"},
     )
     assert plan.expected_logical_streams() == frozenset({"trade"})
+
+
+def test_market_plan_item_requires_an_exact_market_expectation() -> None:
+    subscription = WebSocketSubscription(
+        id="okx:spot:_market:status",
+        market=Market.SPOT,
+        instrument_key=None,
+        wire_symbol=None,
+        channel="status",
+        endpoint="wss://ws.okx.test/ws/v5/public",
+        egress_id="direct-primary",
+        quota_group="direct",
+        shard_id="spot-0",
+        logical_stream="status",
+    )
+
+    with pytest.raises(ValueError, match="missing stream expectation"):
+        AdapterPlan(
+            exchange=Exchange.OKX,
+            ws=(subscription,),
+            rest=(),
+            expectations=(
+                StreamExpectation(
+                    market=Market.SPOT,
+                    instrument_key="BTC-USDT",
+                    logical_stream="status",
+                    shard_id="spot-0",
+                ),
+            ),
+            disabled_optional_features=(),
+            instruments=(
+                _instrument(exchange=Exchange.OKX, instrument_key="BTC-USDT"),
+            ),
+            egress_quota_groups={"direct-primary": "direct"},
+        )
 
 
 def test_rest_plan_item_requires_matching_expectation() -> None:
@@ -253,6 +327,10 @@ def test_rest_plan_item_requires_matching_expectation() -> None:
             rest=(rest,),
             expectations=(),
             disabled_optional_features=(),
+            instruments=(
+                _instrument(exchange=Exchange.OKX, instrument_key="BTC-USDT"),
+            ),
+            egress_quota_groups={"direct-primary": "direct"},
         )
 
 
@@ -265,6 +343,12 @@ def test_rest_plan_item_freezes_params_and_materializes_one_exact_route() -> Non
     )
     sizes.append("1000")
     assert item.params["sz"] == ("100", "400")
+    assert item.routes == (
+        RestBudgetRoute(
+            egress_id="direct-primary",
+            budget_key=("okx", "direct", "books"),
+        ),
+    )
     assert job.eligible_egress_ids == ("direct-primary",)
     assert job.routes[0].budget_key == ("okx", "direct", "books")
     assert job.generation_source is None
@@ -278,6 +362,78 @@ def test_rest_plan_item_freezes_params_and_materializes_one_exact_route() -> Non
         )
 
 
+def test_independent_rest_plan_item_materializes_ordered_candidate_routes() -> None:
+    routes = (
+        RestBudgetRoute(
+            egress_id="direct-primary",
+            budget_key=("okx", "direct", "books"),
+        ),
+        RestBudgetRoute(
+            egress_id="socks-secondary",
+            budget_key=("okx", "proxy-secondary", "books"),
+        ),
+    )
+    item = _rest_plan_item(routes=routes)
+
+    job = item.materialize(ready_monotonic_ns=10, scheduled_ns=20)
+
+    assert item.routes == routes
+    assert job.routes == routes
+    assert job.eligible_egress_ids == ("direct-primary", "socks-secondary")
+
+
+@pytest.mark.parametrize(
+    ("routes", "message"),
+    [
+        (
+            (
+                RestBudgetRoute(
+                    "another-primary",
+                    ("okx", "direct", "books"),
+                ),
+            ),
+            "routes\\[0\\] must match",
+        ),
+        (
+            (
+                RestBudgetRoute(
+                    "direct-primary",
+                    ("okx", "another-quota", "books"),
+                ),
+            ),
+            "routes\\[0\\] must match",
+        ),
+        (
+            (
+                RestBudgetRoute("direct-primary", ("okx", "direct", "books")),
+                RestBudgetRoute("direct-primary", ("okx", "proxy", "books")),
+            ),
+            "must not repeat an egress_id",
+        ),
+        (
+            (
+                RestBudgetRoute("direct-primary", ("okx", "direct", "books")),
+                RestBudgetRoute("socks-secondary", ("okx", "proxy", "candles")),
+            ),
+            "exchange and logical_endpoint",
+        ),
+        (
+            (
+                RestBudgetRoute("direct-primary", ("okx", "direct", "books")),
+                RestBudgetRoute("socks-secondary", ("binance", "proxy", "books")),
+            ),
+            "exchange and logical_endpoint",
+        ),
+    ],
+)
+def test_rest_plan_item_rejects_invalid_candidate_routes(
+    routes: tuple[RestBudgetRoute, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _rest_plan_item(routes=routes)
+
+
 def test_rest_bootstrap_materializes_only_after_generation_exists() -> None:
     item = _rest_plan_item(
         priority=RestPriority.LIVE_BOOTSTRAP,
@@ -286,6 +442,12 @@ def test_rest_bootstrap_materializes_only_after_generation_exists() -> None:
     )
     with pytest.raises(ValueError, match="requires a connection generation"):
         item.materialize(ready_monotonic_ns=10, scheduled_ns=20)
+    with pytest.raises(ValueError, match="planned egress"):
+        item.materialize(
+            ready_monotonic_ns=10,
+            scheduled_ns=20,
+            generation=ConnectionGeneration("okx-public-0", 1, "socks-secondary"),
+        )
 
     generation = ConnectionGeneration("okx-public-0", 1, "direct-primary")
     job = item.materialize(
@@ -294,7 +456,28 @@ def test_rest_bootstrap_materializes_only_after_generation_exists() -> None:
         generation=generation,
     )
     assert job.generation_source == generation.source_context()
+    assert job.routes == (
+        RestBudgetRoute(
+            egress_id="direct-primary",
+            budget_key=("okx", "direct", "books"),
+        ),
+    )
     assert job.priority is RestPriority.LIVE_BOOTSTRAP
+
+
+def test_rest_bootstrap_rejects_candidate_failover_routes() -> None:
+    routes = (
+        RestBudgetRoute("direct-primary", ("okx", "direct", "books")),
+        RestBudgetRoute("socks-secondary", ("okx", "proxy", "books")),
+    )
+
+    with pytest.raises(ValueError, match="require exactly one route"):
+        _rest_plan_item(
+            priority=RestPriority.LIVE_BOOTSTRAP,
+            requires_generation=True,
+            replaceable=False,
+            routes=routes,
+        )
 
 
 def test_adapter_plan_rejects_cross_exchange_rest_budget() -> None:
@@ -312,6 +495,7 @@ def test_adapter_plan_rejects_cross_exchange_rest_budget() -> None:
             rest=(rest,),
             expectations=(expectation,),
             disabled_optional_features=(),
+            egress_quota_groups={"direct-primary": "direct"},
         )
 
 
@@ -340,6 +524,7 @@ def test_public_endpoints_reject_credentials_and_query_strings() -> None:
         "wire_symbol": "BTC-USDT",
         "channel": "trades",
         "egress_id": "direct-primary",
+        "quota_group": "direct",
         "shard_id": "spot-0",
         "logical_stream": "trade",
     }
@@ -375,12 +560,13 @@ def test_public_endpoints_reject_ambiguous_uris(endpoint: str) -> None:
             channel="trades",
             endpoint=endpoint,
             egress_id="direct-primary",
+            quota_group="direct",
             shard_id="spot-0",
             logical_stream="trade",
         )
 
 
-def test_market_wide_subscription_can_cover_instrument_expectations() -> None:
+def test_market_wide_liquidation_subscription_keeps_one_market_expectation() -> None:
     params = {"instType": "SWAP"}
     subscription = WebSocketSubscription(
         id="okx:swap:liquidations",
@@ -388,8 +574,9 @@ def test_market_wide_subscription_can_cover_instrument_expectations() -> None:
         instrument_key=None,
         wire_symbol=None,
         channel="liquidation-orders",
-        endpoint="wss://ws.okx.test/ws/v5/business",
+        endpoint="wss://ws.okx.test/ws/v5/public",
         egress_id="direct-primary",
+        quota_group="direct",
         shard_id="swap-0",
         logical_stream="liquidation",
         params=params,
@@ -402,20 +589,14 @@ def test_market_wide_subscription_can_cover_instrument_expectations() -> None:
         expectations=(
             StreamExpectation(
                 market=Market.PERPETUAL,
-                instrument_key="BTC-USDT-SWAP",
-                logical_stream="liquidation",
-                shard_id="swap-0",
-                coverage=CoverageMode.LOSSY_WINDOW,
-            ),
-            StreamExpectation(
-                market=Market.PERPETUAL,
-                instrument_key="ETH-USDT-SWAP",
+                instrument_key=None,
                 logical_stream="liquidation",
                 shard_id="swap-0",
                 coverage=CoverageMode.LOSSY_WINDOW,
             ),
         ),
         disabled_optional_features=(),
+        egress_quota_groups={"direct-primary": "direct"},
     )
     assert subscription.params["instType"] == "SWAP"
     assert plan.expected_logical_streams() == frozenset({"liquidation"})
@@ -426,6 +607,9 @@ async def test_adapter_runtime_freezes_egress_lookup_and_closes_http() -> None:
     class Scheduler:
         async def submit(self, job: RestJob) -> object:
             del job
+            return object()
+
+        async def next_ready(self) -> object:
             return object()
 
     class Clock:
@@ -457,6 +641,8 @@ async def test_adapter_runtime_freezes_egress_lookup_and_closes_http() -> None:
     )
     transports.clear()
 
+    runtime.ensure_run_not_claimed()
+    runtime.ensure_run_not_claimed()
     assert runtime.transport_for("direct-primary") is transport
     with pytest.raises(LookupError, match="not available"):
         runtime.transport_for("missing")
@@ -467,8 +653,146 @@ async def test_adapter_runtime_freezes_egress_lookup_and_closes_http() -> None:
             clock=Clock(),
             stop=Stop(),
         )
+    runtime.poison()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        runtime.ensure_run_not_claimed()
+    with pytest.raises(RuntimeError, match="single-use"):
+        runtime.claim_run()
     await runtime.aclose()
     assert http.closed
+
+
+@pytest.mark.asyncio
+async def test_network_admission_release_failure_is_sanitized_and_memoized() -> None:
+    canary = "socks5://user:secret@127.0.0.1:1080"
+    calls: list[NetworkAdmissionReleaseDisposition] = []
+
+    async def release(
+        secret: str,
+        disposition: NetworkAdmissionReleaseDisposition,
+    ) -> None:
+        calls.append(disposition)
+        raise RuntimeError(secret)
+
+    lease = NetworkAdmissionLease(
+        exchange=Exchange.OKX,
+        transport=Transport.REST,
+        egress_id="direct-primary",
+        quota_group="direct",
+        _release=partial(release, canary),
+    )
+
+    with pytest.raises(NetworkAdmissionReleaseError) as first:
+        await lease.fail_closed()
+    with pytest.raises(NetworkAdmissionReleaseError) as second:
+        await lease.aclose()
+
+    assert calls == [NetworkAdmissionReleaseDisposition.FAIL_CLOSED]
+    assert lease.release_disposition is NetworkAdmissionReleaseDisposition.FAIL_CLOSED
+    for error in (first.value, second.value):
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        rendered = "".join(
+            traceback.StackSummary.extract(
+                (
+                    (frame, line)
+                    for frame, line in traceback.walk_tb(error.__traceback__)
+                    if "/src/crypto_collector/" in frame.f_code.co_filename
+                ),
+                capture_locals=True,
+            ).format()
+        )
+        assert canary not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_fails", [False, True])
+async def test_network_admission_release_preserves_external_cancel(
+    release_fails: bool,
+) -> None:
+    canary = "release-provider-private"
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    observed: list[asyncio.CancelledError] = []
+
+    async def release(disposition: NetworkAdmissionReleaseDisposition) -> None:
+        assert disposition is NetworkAdmissionReleaseDisposition.FAIL_CLOSED
+        started.set()
+        await gate.wait()
+        if release_fails:
+            raise RuntimeError(canary)
+
+    lease = NetworkAdmissionLease(
+        exchange=Exchange.OKX,
+        transport=Transport.REST,
+        egress_id="direct-primary",
+        quota_group="direct",
+        _release=release,
+    )
+
+    async def close() -> None:
+        try:
+            await lease.fail_closed()
+        except asyncio.CancelledError as cancellation:
+            observed.append(cancellation)
+            raise
+
+    task = asyncio.create_task(close())
+    await started.wait()
+    task.cancel("caller-cancel-first")
+    asyncio.get_running_loop().call_soon(task.cancel, "caller-cancel-second")
+    gate.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert observed == [caught.value]
+    assert caught.value.args == ("caller-cancel-first",)
+    notes = getattr(caught.value, "__notes__", ())
+    assert ("network admission release also failed" in notes) is release_fails
+    assert canary not in " ".join(notes)
+    assert lease.release_disposition is NetworkAdmissionReleaseDisposition.FAIL_CLOSED
+
+
+@pytest.mark.asyncio
+async def test_network_admission_release_factory_failure_is_memoized() -> None:
+    canary = "release-task-factory-private"
+    calls: list[NetworkAdmissionReleaseDisposition] = []
+
+    async def release(disposition: NetworkAdmissionReleaseDisposition) -> None:
+        calls.append(disposition)
+
+    lease = NetworkAdmissionLease(
+        exchange=Exchange.OKX,
+        transport=Transport.REST,
+        egress_id="direct-primary",
+        quota_group="direct",
+        _release=release,
+    )
+    loop = asyncio.get_running_loop()
+    original_factory = loop.get_task_factory()
+
+    def reject_task(
+        _loop: asyncio.AbstractEventLoop,
+        _coroutine: object,
+        **_kwargs: object,
+    ) -> asyncio.Task[object]:
+        raise RuntimeError(canary)
+
+    loop.set_task_factory(reject_task)
+    try:
+        with pytest.raises(NetworkAdmissionReleaseError) as first:
+            await lease.fail_closed()
+    finally:
+        loop.set_task_factory(original_factory)
+
+    with pytest.raises(NetworkAdmissionReleaseError) as second:
+        await lease.aclose()
+    assert calls == []
+    assert lease.release_disposition is NetworkAdmissionReleaseDisposition.FAIL_CLOSED
+    for error in (first.value, second.value):
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert canary not in str(error)
 
 
 @pytest.mark.asyncio
@@ -476,6 +800,9 @@ async def test_adapter_runtime_closes_all_unique_http_clients_after_failure() ->
     class Scheduler:
         async def submit(self, job: RestJob) -> object:
             del job
+            return object()
+
+        async def next_ready(self) -> object:
             return object()
 
     class Clock:
@@ -566,6 +893,15 @@ def test_stream_expectation_distinguishes_control_market_and_instrument_scope() 
 def test_registry_rejects_duplicate_exchange_and_unknown_lookup() -> None:
     class Adapter:
         exchange = Exchange.OKX
+
+        async def fetch_catalog(self, runtime, market):  # type: ignore[no-untyped-def]
+            raise AssertionError("not called")
+
+        def plan(self, request):  # type: ignore[no-untyped-def]
+            raise AssertionError("not called")
+
+        async def run(self, plan, runtime, sink):  # type: ignore[no-untyped-def]
+            raise AssertionError("not called")
 
     registry = AdapterRegistry()
     registry.register(Adapter())

@@ -396,6 +396,19 @@ class ExchangeWorker:
         if control_expectation.coverage is not CoverageMode.COMPLETE:
             await self._fail_prepare("control_expectation_invalid")
             return
+        requested_instruments = tuple(
+            sorted(
+                (
+                    instrument
+                    for instruments in self._request.selected.values()
+                    for instrument in instruments
+                ),
+                key=lambda item: (item.market.value, item.instrument_key),
+            )
+        )
+        if plan.instruments != requested_instruments:
+            await self._fail_prepare("adapter_plan_instruments_mismatch")
+            return
         self._plan = plan
         sink = PlanBoundEventSink(
             plan,

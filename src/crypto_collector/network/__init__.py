@@ -35,6 +35,7 @@ from crypto_collector.network.retry import (
     parse_retry_after_ns,
     retry_policy,
 )
+from crypto_collector.network.retry_effects import RestRetryEffects
 from crypto_collector.network.state_store import EgressStateStore, StaleProbeError
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "NetworkClients",
     "NoAvailableEgressError",
     "QuotaProbeAdmission",
+    "RestRetryEffects",
     "RetryAction",
     "RetryClassification",
     "RetryDecision",

@@ -42,6 +42,7 @@ from crypto_collector.exchanges.okx.probe import (
 from crypto_collector.network import BudgetRegistry
 from crypto_collector.scheduler import RestScheduler
 from crypto_collector.selection import CatalogScope, ListingState
+from tests.support.okx_session import AllowAllNetworkAdmission, NoopRetryEffects
 
 _FIXTURES = Path(__file__).resolve().parents[3] / "fixtures" / "exchanges" / "okx"
 _HOUR_NS = 3_600_000_000_000
@@ -568,6 +569,8 @@ async def test_probe_budget_registry_covers_adapter_catalog_fetch() -> None:
         scheduler=RestScheduler(budgets, clock=runtime_clock),
         clock=runtime_clock,
         stop=NeverStop(),
+        retry_effects=NoopRetryEffects(),
+        network_admission=AllowAllNetworkAdmission(),
     )
     adapter = OkxAdapter(
         routes={

@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Mapping, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from decimal import Decimal
+from enum import Enum
 from math import isfinite
-from types import MappingProxyType
+from threading import Lock
+from types import MappingProxyType, TracebackType
 from typing import Any, Protocol, Self, TypeAlias
 from urllib.parse import urlsplit
 
 import httpx
 from pydantic import ConfigDict, model_validator
 
-from crypto_collector.config.probe_contracts import (
-    ExchangeProbeEvidence,
-    ProbeProvider,
-)
+from crypto_collector.config.probe_contracts import ExchangeProbeEvidence
 from crypto_collector.domain import (
     CoverageMode,
     Exchange,
@@ -23,12 +23,15 @@ from crypto_collector.domain import (
     Market,
     NativeEventDraft,
     SourceContext,
+    Transport,
 )
 from crypto_collector.domain.clock import Clock
 from crypto_collector.domain.envelope import MARKET_SCOPED_STREAMS, FrozenStrictModel
+from crypto_collector.network import RetryDecision
 from crypto_collector.scheduler import (
     IntervalPlan,
     RestBudgetRoute,
+    RestDispatch,
     RestIntervalContext,
     RestPriority,
     SubmitResult,
@@ -264,6 +267,7 @@ class WebSocketSubscription:
     channel: str
     endpoint: str
     egress_id: str
+    quota_group: str
     shard_id: str
     logical_stream: str
     params: Mapping[str, PublicQueryValue | Sequence[PublicQueryValue]] = (
@@ -275,6 +279,7 @@ class WebSocketSubscription:
             "id",
             "channel",
             "egress_id",
+            "quota_group",
             "shard_id",
             "logical_stream",
         ):
@@ -329,6 +334,7 @@ class RestPlanItem:
     interval_plan: IntervalPlan | None
     requires_generation: bool
     replaceable: bool
+    routes: tuple[RestBudgetRoute, ...] = ()
 
     def __post_init__(self) -> None:
         for field in (
@@ -381,6 +387,35 @@ class RestPlanItem:
             raise TypeError("endpoint_cost must be Decimal")
         if not self.endpoint_cost.is_finite() or self.endpoint_cost <= 0:
             raise ValueError("endpoint_cost must be finite and positive")
+        primary_route = RestBudgetRoute(
+            egress_id=self.egress_id,
+            budget_key=(
+                self.exchange.value,
+                self.quota_group,
+                self.logical_endpoint,
+            ),
+        )
+        if type(self.routes) is not tuple:
+            raise TypeError("routes must be a tuple of RestBudgetRoute values")
+        routes = self.routes or (primary_route,)
+        if any(type(route) is not RestBudgetRoute for route in routes):
+            raise TypeError("routes must contain RestBudgetRoute values")
+        if routes[0] != primary_route:
+            raise ValueError(
+                "routes[0] must match the primary egress_id, quota_group, "
+                "and logical_endpoint"
+            )
+        if len({route.egress_id for route in routes}) != len(routes):
+            raise ValueError("routes must not repeat an egress_id")
+        if any(
+            route.budget_key[0] != self.exchange.value
+            or route.budget_key[2] != self.logical_endpoint
+            for route in routes
+        ):
+            raise ValueError(
+                "all routes must use the plan item exchange and logical_endpoint"
+            )
+        object.__setattr__(self, "routes", routes)
         if self.interval_plan is not None:
             if type(self.interval_plan) is not IntervalPlan:
                 raise TypeError("interval_plan must be IntervalPlan or None")
@@ -393,6 +428,8 @@ class RestPlanItem:
             )
         if self.requires_generation and self.interval_plan is not None:
             raise ValueError("REST bootstrap plan items must be one-shot")
+        if self.requires_generation and len(self.routes) != 1:
+            raise ValueError("REST bootstrap plan items require exactly one route")
         if type(self.replaceable) is not bool:
             raise TypeError("replaceable must be a bool")
         if self.replaceable and self.priority not in {
@@ -461,16 +498,7 @@ class RestPlanItem:
         return ScheduledRestJob(
             id=f"{self.id}:{scheduled_ns}:{attempt}",
             priority=self.priority,
-            routes=(
-                RestBudgetRoute(
-                    egress_id=self.egress_id,
-                    budget_key=(
-                        self.exchange.value,
-                        self.quota_group,
-                        self.logical_endpoint,
-                    ),
-                ),
-            ),
+            routes=self.routes,
             endpoint_cost=self.endpoint_cost,
             ready_monotonic_ns=ready_monotonic_ns,
             deadline_ns=deadline_ns,
@@ -550,16 +578,38 @@ class AdapterPlan:
     rest: tuple[RestPlanItem, ...]
     expectations: tuple[StreamExpectation, ...]
     disabled_optional_features: tuple[str, ...]
+    catalog: tuple[RestPlanItem, ...] = ()
+    instruments: tuple[InstrumentRecord, ...] = ()
+    egress_quota_groups: Mapping[str, str] = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _enum_member(self.exchange, Exchange, field="exchange")
         self._validate_tuple(self.ws, WebSocketSubscription, field="ws")
         self._validate_tuple(self.rest, RestPlanItem, field="rest")
+        self._validate_tuple(self.catalog, RestPlanItem, field="catalog")
         self._validate_tuple(
             self.expectations,
             StreamExpectation,
             field="expectations",
         )
+        if type(self.instruments) is not tuple or any(
+            not isinstance(item, InstrumentRecord) for item in self.instruments
+        ):
+            raise TypeError("instruments must be a tuple of InstrumentRecord values")
+        instruments = tuple(
+            sorted(
+                self.instruments,
+                key=lambda item: (item.market.value, item.instrument_key),
+            )
+        )
+        instrument_keys = tuple(
+            (item.market, item.instrument_key) for item in instruments
+        )
+        if len(set(instrument_keys)) != len(instrument_keys):
+            raise ValueError("plan instruments must be unique per market")
+        if any(item.exchange is not self.exchange for item in instruments):
+            raise ValueError("plan instruments must belong to the plan exchange")
+        object.__setattr__(self, "instruments", instruments)
         if type(self.disabled_optional_features) is not tuple or any(
             type(item) is not str or not item
             for item in self.disabled_optional_features
@@ -569,7 +619,23 @@ class AdapterPlan:
             self.disabled_optional_features
         ):
             raise ValueError("disabled_optional_features must be unique")
-        ids = tuple(item.id for item in self.ws) + tuple(item.id for item in self.rest)
+        if not isinstance(self.egress_quota_groups, Mapping):
+            raise TypeError("egress_quota_groups must be a mapping")
+        egress_quota_groups: dict[str, str] = {}
+        for egress_id, quota_group in self.egress_quota_groups.items():
+            normalized_egress = _nonempty_string(egress_id, field="egress ID")
+            normalized_quota = _nonempty_string(quota_group, field="quota group")
+            egress_quota_groups[normalized_egress] = normalized_quota
+        object.__setattr__(
+            self,
+            "egress_quota_groups",
+            MappingProxyType(dict(sorted(egress_quota_groups.items()))),
+        )
+        ids = (
+            tuple(item.id for item in self.ws)
+            + tuple(item.id for item in self.rest)
+            + tuple(item.id for item in self.catalog)
+        )
         if len(set(ids)) != len(ids):
             raise ValueError("plan item IDs must be unique")
         expectation_keys = tuple(item.key for item in self.expectations)
@@ -577,6 +643,10 @@ class AdapterPlan:
             raise ValueError("stream expectations must be unique")
         expected = set(expectation_keys)
         for ws_item in self.ws:
+            if egress_quota_groups.get(ws_item.egress_id) != ws_item.quota_group:
+                raise ValueError(
+                    f"WebSocket item {ws_item.id!r} has no exact egress quota mapping"
+                )
             if not self._has_expectation(
                 expected,
                 market=ws_item.market,
@@ -587,9 +657,14 @@ class AdapterPlan:
                 raise ValueError(
                     f"missing stream expectation for plan item {ws_item.id!r}"
                 )
-        for rest_item in self.rest:
+        for rest_item in (*self.rest, *self.catalog):
             if rest_item.exchange is not self.exchange:
                 raise ValueError("REST item exchange does not match plan")
+            for route in rest_item.routes:
+                if egress_quota_groups.get(route.egress_id) != route.budget_key[1]:
+                    raise ValueError(
+                        f"REST item {rest_item.id!r} has no exact egress quota mapping"
+                    )
             if not self._has_expectation(
                 expected,
                 market=rest_item.market,
@@ -600,6 +675,39 @@ class AdapterPlan:
                 raise ValueError(
                     f"missing stream expectation for plan item {rest_item.id!r}"
                 )
+        indexed = set(instrument_keys)
+        referenced = (
+            {
+                (item.market, item.instrument_key)
+                for item in self.ws
+                if item.instrument_key is not None
+            }
+            | {
+                (item.market, item.instrument_key)
+                for item in self.rest
+                if item.instrument_key is not None
+            }
+            | {
+                (item.market, item.instrument_key)
+                for item in self.catalog
+                if item.instrument_key is not None
+            }
+            | {
+                (item.market, item.instrument_key)
+                for item in self.expectations
+                if item.market is not None and item.instrument_key is not None
+            }
+        )
+        missing = referenced - indexed
+        if missing:
+            detail = ", ".join(
+                f"{market.value}/{instrument_key}"
+                for market, instrument_key in sorted(
+                    missing,
+                    key=lambda item: (item[0].value, item[1]),
+                )
+            )
+            raise ValueError(f"plan instruments do not cover {detail}")
 
     @staticmethod
     def _validate_tuple(value: object, expected: type[Any], *, field: str) -> None:
@@ -617,19 +725,7 @@ class AdapterPlan:
         logical_stream: str,
         shard_id: str,
     ) -> bool:
-        if instrument_key is not None:
-            return (market, instrument_key, logical_stream, shard_id) in expectations
-        return any(
-            expected_market is market
-            and expected_stream == logical_stream
-            and expected_shard == shard_id
-            for (
-                expected_market,
-                _expected_instrument,
-                expected_stream,
-                expected_shard,
-            ) in expectations
-        )
+        return (market, instrument_key, logical_stream, shard_id) in expectations
 
     def expected_logical_streams(self) -> frozenset[str]:
         return frozenset(item.logical_stream for item in self.expectations)
@@ -642,7 +738,10 @@ class PublicHttpTransport(Protocol):
         *,
         params: PublicQueryParams | None = None,
         timeout: float | None = None,
-    ) -> Awaitable[httpx.Response]: ...
+    ) -> Awaitable[httpx.Response]:
+        """Return a fully-read response whose ``content`` is immediately available."""
+
+        ...
 
 
 class PublicWebSocketTransport(Protocol):
@@ -650,13 +749,235 @@ class PublicWebSocketTransport(Protocol):
 
 
 class RestSchedulerPort(Protocol):
-    async def submit(self, job: ScheduledRestJob) -> SubmitResult: ...
+    """Worker-private scheduler boundary used by exactly one exchange adapter."""
+
+    async def submit(self, job: ScheduledRestJob) -> SubmitResult:
+        """Commit cancellation-atomically.
+
+        A cancellation that escapes guarantees the job was not committed. Once
+        committed, implementations must return ``SubmitResult`` without another
+        cancellation point.
+        """
+        ...
+
+    async def next_ready(self) -> RestDispatch: ...
 
 
 class StopToken(Protocol):
+    """Level-triggered stop signal; wait() returns only after is_set() is true."""
+
     def is_set(self) -> bool: ...
 
     async def wait(self) -> None: ...
+
+
+class RetryEffectsPort(Protocol):
+    def apply(self, dispatch: RestDispatch, decision: RetryDecision) -> None: ...
+
+
+class NetworkAdmissionExpired(TimeoutError):
+    """Network work was not admitted before its scheduler deadline."""
+
+
+class NetworkAdmissionReleaseError(RuntimeError):
+    """An admission lease could not be safely released or poisoned."""
+
+
+class NetworkAdmissionReleaseDisposition(str, Enum):
+    NORMAL = "normal"
+    FAIL_CLOSED = "fail_closed"
+
+
+async def _invoke_network_admission_release(
+    callback: Callable[[NetworkAdmissionReleaseDisposition], Awaitable[None]],
+    disposition: NetworkAdmissionReleaseDisposition,
+) -> bool:
+    try:
+        await callback(disposition)
+    except BaseException:  # noqa: BLE001 - provider details never cross the port.
+        return False
+    return True
+
+
+class _NetworkAdmissionReleaseState:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.task: asyncio.Future[bool] | None = None
+        self.disposition: NetworkAdmissionReleaseDisposition | None = None
+
+    async def close(
+        self,
+        release: Callable[[NetworkAdmissionReleaseDisposition], Awaitable[None]],
+        disposition: NetworkAdmissionReleaseDisposition,
+    ) -> None:
+        async with self.lock:
+            if self.task is None:
+                self.disposition = disposition
+                coroutine = _invoke_network_admission_release(release, disposition)
+                try:
+                    self.task = asyncio.create_task(coroutine)
+                except BaseException:  # noqa: BLE001 - memoize a safe setup failure.
+                    coroutine.close()
+                    failed = asyncio.get_running_loop().create_future()
+                    failed.set_result(False)
+                    self.task = failed
+                del coroutine
+            task = self.task
+        del release
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if cancellation is None:
+                    cancellation = error
+        released = task.result()
+        if cancellation is not None:
+            if not released:
+                cancellation.add_note("network admission release also failed")
+            raise cancellation
+        if not released:
+            raise NetworkAdmissionReleaseError(
+                "network admission release failed"
+            ) from None
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkAdmissionLease:
+    """One exact admitted identity held for an I/O attempt or generation.
+
+    The release callback must atomically apply its disposition before releasing
+    capacity or waking waiters. If it raises, the coordinator must keep the
+    identity held or poisoned; callers never downgrade a failed release.
+    """
+
+    exchange: Exchange
+    transport: Transport
+    egress_id: str
+    quota_group: str
+    _release: Callable[[NetworkAdmissionReleaseDisposition], Awaitable[None]] = (
+        dataclass_field(
+            repr=False,
+            compare=False,
+        )
+    )
+    _release_state: _NetworkAdmissionReleaseState = dataclass_field(
+        default_factory=_NetworkAdmissionReleaseState,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        _enum_member(self.exchange, Exchange, field="exchange")
+        _enum_member(self.transport, Transport, field="transport")
+        object.__setattr__(
+            self,
+            "egress_id",
+            _nonempty_string(self.egress_id, field="egress_id"),
+        )
+        object.__setattr__(
+            self,
+            "quota_group",
+            _nonempty_string(self.quota_group, field="quota_group"),
+        )
+        if not callable(self._release):
+            raise TypeError("network admission lease release must be callable")
+
+    async def aclose(self) -> None:
+        await self._release_state.close(
+            self._release,
+            NetworkAdmissionReleaseDisposition.NORMAL,
+        )
+
+    async def fail_closed(self) -> None:
+        await self._release_state.close(
+            self._release,
+            NetworkAdmissionReleaseDisposition.FAIL_CLOSED,
+        )
+
+    @property
+    def release_disposition(self) -> NetworkAdmissionReleaseDisposition | None:
+        return self._release_state.disposition
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        await self.aclose()
+
+
+class NetworkAdmissionPort(Protocol):
+    async def acquire(
+        self,
+        *,
+        exchange: Exchange,
+        transport: Transport,
+        egress_id: str,
+        quota_group: str,
+        deadline_monotonic_ns: int | None,
+    ) -> NetworkAdmissionLease: ...
+
+
+class TransportHealthPort(Protocol):
+    """Narrow runtime boundary for egress health and WS generation selection."""
+
+    def is_egress_available(
+        self,
+        *,
+        exchange: Exchange,
+        egress_id: str,
+    ) -> bool: ...
+
+    def choose_websocket_egress(
+        self,
+        *,
+        exchange: Exchange,
+        market: Market,
+        endpoint: str,
+        preferred_egress_id: str,
+        previous_egress_id: str | None,
+    ) -> str: ...
+
+    def record_transport_failure(
+        self,
+        *,
+        exchange: Exchange,
+        transport: Transport,
+        egress_id: str,
+        reason: str,
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AdapterRetrySettings:
+    rest_max_attempts: int = 5
+    base_backoff_ns: int = 250_000_000
+    max_backoff_ns: int = 30_000_000_000
+    ws_reconnect_max_backoff_ns: int = 60_000_000_000
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "rest_max_attempts",
+            "base_backoff_ns",
+            "max_backoff_ns",
+            "ws_reconnect_max_backoff_ns",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer")
+        if self.base_backoff_ns > self.max_backoff_ns:
+            raise ValueError("base_backoff_ns must not exceed max_backoff_ns")
+        if self.base_backoff_ns > self.ws_reconnect_max_backoff_ns:
+            raise ValueError(
+                "base_backoff_ns must not exceed ws_reconnect_max_backoff_ns"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,12 +998,48 @@ class EgressTransport:
             raise TypeError("websocket transport must provide connect()")
 
 
+class _AdapterRuntimeRunState:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._state = "fresh"
+
+    def claim(self) -> None:
+        with self._lock:
+            if self._state != "fresh":
+                raise RuntimeError("adapter runtime is single-use")
+            self._state = "run_claimed"
+
+    def ensure_unclaimed(self) -> None:
+        with self._lock:
+            if self._state == "run_claimed":
+                raise RuntimeError("adapter runtime has already been consumed")
+            if self._state == "poisoned":
+                raise RuntimeError("adapter runtime is poisoned")
+
+    def poison(self) -> None:
+        with self._lock:
+            if self._state == "fresh":
+                self._state = "poisoned"
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterRuntime:
+    """Worker-private, single-run network and scheduler resources."""
+
     transports: Mapping[str, EgressTransport]
     scheduler: RestSchedulerPort
     clock: Clock
     stop: StopToken
+    retry: AdapterRetrySettings = dataclass_field(default_factory=AdapterRetrySettings)
+    retry_effects: RetryEffectsPort | None = None
+    transport_health: TransportHealthPort | None = None
+    network_admission: NetworkAdmissionPort | None = None
+    _run_state: _AdapterRuntimeRunState = dataclass_field(
+        default_factory=_AdapterRuntimeRunState,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.transports, Mapping) or not self.transports:
@@ -693,8 +1050,10 @@ class AdapterRuntime:
             if type(transport) is not EgressTransport or transport.egress_id != key:
                 raise ValueError("transport mapping key must match its egress ID")
             normalized[key] = transport
-        if not callable(getattr(self.scheduler, "submit", None)):
-            raise TypeError("scheduler must provide submit()")
+        if not callable(getattr(self.scheduler, "submit", None)) or not callable(
+            getattr(self.scheduler, "next_ready", None)
+        ):
+            raise TypeError("scheduler must provide submit() and next_ready()")
         if not callable(getattr(self.clock, "time_ns", None)) or not callable(
             getattr(self.clock, "monotonic_ns", None)
         ):
@@ -703,6 +1062,29 @@ class AdapterRuntime:
             getattr(self.stop, "wait", None)
         ):
             raise TypeError("stop token must provide is_set() and wait()")
+        if type(self.retry) is not AdapterRetrySettings:
+            raise TypeError("retry must be AdapterRetrySettings")
+        if self.retry_effects is not None and not callable(
+            getattr(self.retry_effects, "apply", None)
+        ):
+            raise TypeError("retry_effects must provide apply()")
+        if self.transport_health is not None and (
+            not callable(getattr(self.transport_health, "is_egress_available", None))
+            or not callable(
+                getattr(self.transport_health, "choose_websocket_egress", None)
+            )
+            or not callable(
+                getattr(self.transport_health, "record_transport_failure", None)
+            )
+        ):
+            raise TypeError(
+                "transport_health must provide is_egress_available(), "
+                "choose_websocket_egress(), and record_transport_failure()"
+            )
+        if self.network_admission is not None and not callable(
+            getattr(self.network_admission, "acquire", None)
+        ):
+            raise TypeError("network_admission must provide acquire()")
         object.__setattr__(self, "transports", MappingProxyType(normalized))
 
     def transport_for(self, egress_id: str) -> EgressTransport:
@@ -712,6 +1094,17 @@ class AdapterRuntime:
             raise LookupError(
                 f"runtime egress {egress_id!r} is not available"
             ) from None
+
+    def claim_run(self) -> None:
+        self._run_state.claim()
+
+    def ensure_run_not_claimed(self) -> None:
+        self._run_state.ensure_unclaimed()
+
+    def poison(self) -> None:
+        """Prevent reuse after terminal standalone adapter work."""
+
+        self._run_state.poison()
 
     async def aclose(self) -> None:
         closed: set[int] = set()
@@ -743,7 +1136,7 @@ class EventSink(Protocol):
     ) -> EnqueueResult: ...
 
 
-class ExchangeAdapter(ProbeProvider, Protocol):
+class ExchangeAdapter(Protocol):
     exchange: Exchange
 
     async def fetch_catalog(

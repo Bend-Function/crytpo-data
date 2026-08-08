@@ -22,6 +22,7 @@ from crypto_collector.exchanges.okx.ws import (
     OkxWsReconnectReason,
     OkxWsSession,
     OkxWsSessionAction,
+    OkxWsSessionEvent,
     build_subscribe_message,
     parse_incremental_book_frames,
     parse_ws_message,
@@ -65,18 +66,20 @@ def _subscription(
     *,
     channel: str = "books",
     endpoint: str = "wss://ws.okx.test/ws/v5/public",
+    market: Market = Market.SPOT,
     wire_symbol: str | None = "BTC-USDT",
     params: Mapping[str, object] | None = None,
     shard_id: str = "spot-live-0",
 ) -> WebSocketSubscription:
     return WebSocketSubscription(
         id=f"okx:spot:{channel}",
-        market=Market.SPOT,
+        market=market,
         instrument_key=None if wire_symbol is None else "BTC-USDT",
         wire_symbol=wire_symbol,
         channel=channel,
         endpoint=endpoint,
         egress_id="direct-primary",
+        quota_group="direct",
         shard_id=shard_id,
         logical_stream="book_live" if channel == "books" else "trade",
         params={} if params is None else params,  # type: ignore[arg-type]
@@ -198,6 +201,84 @@ def test_binary_non_utf8_frame_is_rejected_without_inventing_raw_text() -> None:
     with pytest.raises(OkxWsProtocolError) as captured:
         parse_ws_message(b"\xff\xfe")
     assert captured.value.raw_text is None
+    assert captured.value.raw_binary_base64 == "//4="
+    assert captured.value.raw_binary_length == 2
+
+
+@pytest.mark.parametrize(
+    ("encoded", "length", "raw_text"),
+    [
+        ("/w==", None, None),
+        (None, 1, None),
+        ("not base64", 1, None),
+        ("/w==", 2, None),
+        ("/w==", 1, "invented"),
+    ],
+)
+def test_session_event_rejects_incomplete_or_conflicting_binary_evidence(
+    encoded: str | None,
+    length: int | None,
+    raw_text: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="binary"):
+        OkxWsSessionEvent(
+            action=OkxWsSessionAction.RECONNECT,
+            reconnect_reason=OkxWsReconnectReason.PROTOCOL_ERROR,
+            raw_text=raw_text,
+            raw_binary_base64=encoded,
+            raw_binary_length=length,
+            error_type="OkxWsProtocolError",
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_preserves_primary_send_and_body_errors_during_cleanup() -> None:
+    class FailingCleanupConnection(_ScriptedConnection):
+        def __init__(self, *, fail_send: bool) -> None:
+            super().__init__()
+            self.fail_send = fail_send
+            self.cleanup_calls = 0
+
+        async def send(self, message: str) -> None:
+            del message
+            if self.fail_send:
+                raise ValueError("subscribe failed")
+
+        async def __aexit__(
+            self,
+            exc_type: object,
+            exc: object,
+            traceback: object,
+        ) -> None:
+            del exc_type, exc, traceback
+            self.cleanup_calls += 1
+            raise RuntimeError("proxy-secret-canary")
+
+    send_failure = FailingCleanupConnection(fail_send=True)
+    send_session = OkxWsSession(
+        ScriptedWebSocketTransport(send_failure),
+        (_subscription(),),
+        request_id="req1",
+    )
+    with pytest.raises(ValueError, match="subscribe failed") as send_error:
+        async with send_session:
+            raise AssertionError("unreachable")
+    assert send_failure.cleanup_calls == 1
+    assert send_error.value.__notes__ == ["websocket context cleanup also failed"]
+    assert "proxy-secret-canary" not in repr(send_error.value.__notes__)
+
+    body_failure = FailingCleanupConnection(fail_send=False)
+    body_session = OkxWsSession(
+        ScriptedWebSocketTransport(body_failure),
+        (_subscription(),),
+        request_id="req2",
+    )
+    with pytest.raises(ValueError, match="body failed") as body_error:
+        async with body_session:
+            raise ValueError("body failed")
+    assert body_failure.cleanup_calls == 1
+    assert body_error.value.__notes__ == ["websocket context cleanup also failed"]
+    assert "proxy-secret-canary" not in repr(body_error.value.__notes__)
 
 
 def test_public_subscription_message_is_exact_and_anonymous() -> None:
@@ -253,12 +334,17 @@ def test_symbol_channels_require_exactly_inst_id(
     }
 
 
-@pytest.mark.parametrize("inst_type", ["SPOT", "SWAP"])
+@pytest.mark.parametrize(
+    ("market", "inst_type"),
+    [(Market.SPOT, "SPOT"), (Market.PERPETUAL, "SWAP")],
+)
 def test_instruments_channel_accepts_only_supported_market_types(
+    market: Market,
     inst_type: str,
 ) -> None:
     subscription = _subscription(
         channel="instruments",
+        market=market,
         wire_symbol=None,
         params={"instType": inst_type},
     )
@@ -272,12 +358,14 @@ def test_instruments_channel_accepts_only_supported_market_types(
 def test_market_wide_channels_have_exact_channel_specific_arguments() -> None:
     liquidation = _subscription(
         channel="liquidation-orders",
+        market=Market.PERPETUAL,
         wire_symbol=None,
         params={"instType": "SWAP"},
     )
     status = _subscription(channel="status", wire_symbol=None)
     adl = _subscription(
         channel="adl-warning",
+        market=Market.PERPETUAL,
         wire_symbol=None,
         params={"instType": "SWAP", "instFamily": "BTC-USDT"},
     )
