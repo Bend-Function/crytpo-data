@@ -1,0 +1,47 @@
+{
+  "code": "00000",
+  "msg": "success",
+  "requestTime": 1770531054230,
+  "data": [
+    {
+      "symbol": "BTCUSDT",
+      "category": "USDT-FUTURES",
+      "symbolType": "crypto",
+      "baseCoin": "BTC",
+      "quoteCoin": "USDT",
+      "type": "perpetual",
+      "status": "online",
+      "offTime": "-1",
+      "limitOpenTime": "-1",
+      "launchTime": "0",
+      "fundInterval": "8",
+      "pricePrecision": "1",
+      "quantityPrecision": "4",
+      "futureSchemaField": "preserve-me"
+    },
+    {
+      "symbol": "NEWUSDT",
+      "category": "USDT-FUTURES",
+      "symbolType": "crypto",
+      "baseCoin": "NEW",
+      "quoteCoin": "USDT",
+      "type": "perpetual",
+      "status": "listed",
+      "launchTime": "1761003600000",
+      "fundInterval": "1",
+      "pricePrecision": "4",
+      "quantityPrecision": "2"
+    },
+    {
+      "symbol": "BTCUSDT-DELIVERY",
+      "category": "USDT-FUTURES",
+      "symbolType": "crypto",
+      "baseCoin": "BTC",
+      "quoteCoin": "USDT",
+      "type": "delivery",
+      "status": "online",
+      "launchTime": "1760000000000",
+      "deliveryTime": "1770000000000"
+    }
+  ]
+}
