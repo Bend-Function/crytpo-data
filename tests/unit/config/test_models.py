@@ -1,13 +1,18 @@
+from collections.abc import Callable
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
 from crypto_collector.config.models import (
+    ArchiveConfig,
     CollectorConfig,
     ConfigSecretError,
+    FilesystemTargetConfig,
     IngressConfig,
+    S3TargetConfig,
     SelectionConfig,
     SelectionOverride,
     SymbolOverride,
@@ -16,6 +21,7 @@ from crypto_collector.config.models import (
     validate_secret_snapshot,
 )
 from crypto_collector.config.primitives import SecretSnapshot
+from crypto_collector.config.report import format_validation_error
 
 BASE: dict[str, Any] = {
     "data_root": "./data",
@@ -53,6 +59,53 @@ BASE: dict[str, Any] = {
         ]
     },
 }
+
+
+def _s3_archive_target(**overrides: object) -> dict[str, object]:
+    target: dict[str, object] = {
+        "id": "s3-primary",
+        "type": "s3",
+        "bucket": "market-data",
+        "credentials": {
+            "access_key_id": "env:S3_ACCESS_KEY_ID",
+            "secret_access_key": "env:S3_SECRET_ACCESS_KEY",
+        },
+    }
+    target.update(overrides)
+    return target
+
+
+def _oss_archive_target(**overrides: object) -> dict[str, object]:
+    target: dict[str, object] = {
+        "id": "oss-primary",
+        "type": "aliyun_oss",
+        "bucket": "market-data",
+        "endpoint": "https://oss.example.test",
+        "credentials": {
+            "access_key_id": "env:OSS_ACCESS_KEY_ID",
+            "access_key_secret": "env:OSS_ACCESS_KEY_SECRET",
+        },
+    }
+    target.update(overrides)
+    return target
+
+
+def _filesystem_archive_target(
+    mount_root: Path,
+    **overrides: object,
+) -> dict[str, object]:
+    target: dict[str, object] = {
+        "id": "mounted-backup",
+        "type": "filesystem",
+        "root": str(mount_root / "archive"),
+        "mount_root": str(mount_root),
+        "mount_guard": {
+            "path": str(mount_root / ".collector-mount-id"),
+            "expected": "env:MOUNT_GUARD",
+        },
+    }
+    target.update(overrides)
+    return target
 
 
 def test_flush_interval_must_leave_half_the_slo_as_budget() -> None:
@@ -430,22 +483,303 @@ def test_filesystem_archive_must_not_be_inside_data_root(tmp_path) -> None:
         CollectorConfig.model_validate(invalid)
 
 
-def test_object_store_endpoint_must_be_an_anonymous_root_http_url() -> None:
-    invalid = deepcopy(BASE)
-    invalid["archive"] = {
-        "targets": [
+def test_required_archive_target_cannot_be_disabled() -> None:
+    target = _s3_archive_target(required=True, enabled=False)
+
+    with pytest.raises(ValidationError, match="required.*cannot be disabled"):
+        ArchiveConfig.model_validate({"targets": [target]})
+
+
+@pytest.mark.parametrize("targets", [[], [_s3_archive_target(required=False)]])
+def test_cleanup_requires_an_enabled_required_target(
+    targets: list[dict[str, object]],
+) -> None:
+    source = deepcopy(BASE)
+    source["archive"] = {"targets": targets}
+    source["local_cleanup"] = {"enabled": True}
+
+    with pytest.raises(ValidationError, match="cleanup.*enabled required target"):
+        CollectorConfig.model_validate(source)
+
+
+@pytest.mark.parametrize(
+    "target_id",
+    ["Uppercase", "../escape", "a/b", ".", "two words", "a" * 65],
+)
+def test_archive_target_id_must_be_lowercase_and_path_safe(target_id: str) -> None:
+    with pytest.raises(ValidationError, match="id"):
+        ArchiveConfig.model_validate({"targets": [_s3_archive_target(id=target_id)]})
+
+
+def test_archive_target_ids_are_unique() -> None:
+    with pytest.raises(ValidationError, match="archive target IDs must be unique"):
+        ArchiveConfig.model_validate(
             {
-                "id": "bad-s3",
-                "type": "s3",
-                "bucket": "market-data",
-                "endpoint": "https://s3.example.test/private/path",
-                "credentials": {
-                    "access_key_id": "env:S3_ACCESS_KEY_ID",
-                    "secret_access_key": "env:S3_SECRET_ACCESS_KEY",
-                },
+                "targets": [
+                    _s3_archive_target(),
+                    _oss_archive_target(id="s3-primary"),
+                ]
             }
+        )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["/absolute", "trailing/", "a//b", "a/./b", "a/../b", "a\\b", "\x00"],
+)
+def test_archive_prefix_must_be_normalized_posix_relative(prefix: str) -> None:
+    with pytest.raises(ValidationError, match="prefix"):
+        ArchiveConfig.model_validate({"targets": [_s3_archive_target(prefix=prefix)]})
+
+
+def test_archive_prefix_accepts_empty_or_normalized_relative_values() -> None:
+    default = ArchiveConfig.model_validate({"targets": [_s3_archive_target()]})
+    explicit = ArchiveConfig.model_validate(
+        {"targets": [_s3_archive_target(prefix="research/raw/v1")]}
+    )
+
+    assert default.targets[0].prefix == ""
+    assert explicit.targets[0].prefix == "research/raw/v1"
+
+
+@pytest.mark.parametrize("addressing_style", ["auto", "path", "virtual"])
+def test_s3_addressing_style_is_explicit(addressing_style: str) -> None:
+    config = ArchiveConfig.model_validate(
+        {"targets": [_s3_archive_target(addressing_style=addressing_style)]}
+    )
+    target = config.targets[0]
+
+    assert isinstance(target, S3TargetConfig)
+    assert target.addressing_style == addressing_style
+
+
+def test_s3_addressing_style_defaults_to_auto() -> None:
+    config = ArchiveConfig.model_validate({"targets": [_s3_archive_target()]})
+    target = config.targets[0]
+
+    assert isinstance(target, S3TargetConfig)
+    assert target.addressing_style == "auto"
+
+
+def test_s3_addressing_style_rejects_unknown_value() -> None:
+    with pytest.raises(ValidationError, match="addressing_style"):
+        ArchiveConfig.model_validate(
+            {"targets": [_s3_archive_target(addressing_style="dns-magic")]}
+        )
+
+
+def test_archive_retry_base_backoff_must_not_exceed_max_backoff() -> None:
+    with pytest.raises(ValidationError, match="base_backoff.*max_backoff"):
+        ArchiveConfig.model_validate(
+            {
+                "targets": [
+                    _s3_archive_target(
+                        retry={
+                            "base_backoff": "60s",
+                            "max_backoff": "1s",
+                        }
+                    )
+                ]
+            }
+        )
+
+
+@pytest.mark.parametrize("target_factory", [_s3_archive_target, _oss_archive_target])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://user:plaintext-canary@example.test",
+        "https://example.test?token=plaintext-canary",
+        "https://example.test/#plaintext-canary",
+        "https://example.test/base-path",
+        "ftp://example.test",
+        "https://example.test:99999",
+        "not-a-url",
+    ],
+)
+def test_archive_endpoint_rejects_unsafe_or_noncanonical_urls(
+    target_factory: Callable[..., dict[str, object]],
+    endpoint: str,
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        ArchiveConfig.model_validate({"targets": [target_factory(endpoint=endpoint)]})
+
+    assert "plaintext-canary" not in format_validation_error(captured.value)
+
+
+@pytest.mark.parametrize("endpoint", ["https://example.test", "http://127.0.0.1:9000/"])
+def test_archive_endpoint_accepts_root_http_urls(endpoint: str) -> None:
+    ArchiveConfig.model_validate({"targets": [_s3_archive_target(endpoint=endpoint)]})
+
+
+@pytest.mark.parametrize("multipart_size", ["5MiB", "5GiB"])
+def test_s3_multipart_size_accepts_provider_bounds(multipart_size: str) -> None:
+    ArchiveConfig.model_validate(
+        {"targets": [_s3_archive_target(multipart_size=multipart_size)]}
+    )
+
+
+@pytest.mark.parametrize("multipart_size", ["4MiB", "6GiB"])
+def test_s3_multipart_size_rejects_values_outside_provider_bounds(
+    multipart_size: str,
+) -> None:
+    with pytest.raises(ValidationError, match="S3 multipart_size"):
+        ArchiveConfig.model_validate(
+            {"targets": [_s3_archive_target(multipart_size=multipart_size)]}
+        )
+
+
+@pytest.mark.parametrize("multipart_size", ["100KiB", "5GiB"])
+def test_oss_multipart_size_accepts_provider_bounds(multipart_size: str) -> None:
+    ArchiveConfig.model_validate(
+        {"targets": [_oss_archive_target(multipart_size=multipart_size)]}
+    )
+
+
+@pytest.mark.parametrize("multipart_size", ["99KiB", "6GiB"])
+def test_oss_multipart_size_rejects_values_outside_provider_bounds(
+    multipart_size: str,
+) -> None:
+    with pytest.raises(ValidationError, match="OSS multipart_size"):
+        ArchiveConfig.model_validate(
+            {"targets": [_oss_archive_target(multipart_size=multipart_size)]}
+        )
+
+
+def test_filesystem_target_defaults_to_backup_only_and_infers_mount_root() -> None:
+    config = ArchiveConfig.model_validate(
+        {
+            "targets": [
+                {
+                    "id": "legacy-mounted-backup",
+                    "type": "filesystem",
+                    "root": "/mnt/webdav/archive",
+                    "mount_guard": {
+                        "path": "/mnt/webdav/.collector-mount-id",
+                        "expected": "env:MOUNT_GUARD",
+                    },
+                }
+            ]
+        }
+    )
+    target = config.targets[0]
+
+    assert isinstance(target, FilesystemTargetConfig)
+    assert target.durability_capability == "backup_only"
+    assert target.mount_root == Path("/mnt/webdav")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"root": "/srv/archive"}, "root.*mount_root"),
+        ({"root": "/mnt/webdav"}, "strict descendant"),
+        (
+            {
+                "mount_guard": {
+                    "path": "/srv/.collector-mount-id",
+                    "expected": "env:MOUNT_GUARD",
+                }
+            },
+            "mount_guard.*mount_root",
+        ),
+        (
+            {
+                "mount_guard": {
+                    "path": "/mnt/webdav/archive/.collector-mount-id",
+                    "expected": "env:MOUNT_GUARD",
+                }
+            },
+            "mount_guard.*overlap root",
+        ),
+        (
+            {
+                "root": "/mnt/webdav/guard-parent/archive",
+                "mount_guard": {
+                    "path": "/mnt/webdav/guard-parent",
+                    "expected": "env:MOUNT_GUARD",
+                },
+            },
+            "mount_guard.*overlap root",
+        ),
+    ],
+)
+def test_filesystem_root_and_guard_must_be_inside_mount_root(
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    target = _filesystem_archive_target(Path("/mnt/webdav"), **overrides)
+
+    with pytest.raises(ValidationError, match=message):
+        ArchiveConfig.model_validate({"targets": [target]})
+
+
+def test_filesystem_mount_root_must_not_overlap_data_root(tmp_path) -> None:
+    source = deepcopy(BASE)
+    source["data_root"] = str(tmp_path / "mounted" / "collector-data")
+    source["state_root"] = str(tmp_path / "state")
+    source["archive"] = {"targets": [_filesystem_archive_target(tmp_path / "mounted")]}
+
+    with pytest.raises(ValidationError, match="data_root"):
+        CollectorConfig.model_validate(source)
+
+
+def test_cleanup_rejects_backup_only_required_filesystem_target(tmp_path) -> None:
+    source = deepcopy(BASE)
+    source["data_root"] = str(tmp_path / "data")
+    source["state_root"] = str(tmp_path / "state")
+    source["archive"] = {
+        "targets": [_filesystem_archive_target(tmp_path / "mounted", required=True)]
+    }
+    source["local_cleanup"] = {"enabled": True}
+
+    with pytest.raises(ValidationError, match="operator_attested_fsync_readback"):
+        CollectorConfig.model_validate(source)
+
+
+def test_cleanup_accepts_attested_required_filesystem_target(tmp_path) -> None:
+    source = deepcopy(BASE)
+    source["data_root"] = str(tmp_path / "data")
+    source["state_root"] = str(tmp_path / "state")
+    source["archive"] = {
+        "targets": [
+            _filesystem_archive_target(
+                tmp_path / "mounted",
+                required=True,
+                durability_capability="operator_attested_fsync_readback",
+            )
         ]
     }
+    source["local_cleanup"] = {"enabled": True}
 
-    with pytest.raises(ValidationError, match="root HTTP URL"):
-        CollectorConfig.model_validate(invalid)
+    config = CollectorConfig.model_validate(source)
+
+    assert config.local_cleanup.enabled is True
+
+
+def test_backup_only_required_filesystem_target_is_compatible_without_cleanup(
+    tmp_path,
+) -> None:
+    source = deepcopy(BASE)
+    source["data_root"] = str(tmp_path / "data")
+    source["state_root"] = str(tmp_path / "state")
+    source["archive"] = {
+        "targets": [_filesystem_archive_target(tmp_path / "mounted", required=True)]
+    }
+
+    config = CollectorConfig.model_validate(source)
+    target = config.archive.targets[0]
+
+    assert config.local_cleanup.enabled is False
+    assert isinstance(target, FilesystemTargetConfig)
+    assert target.durability_capability == "backup_only"
+
+
+def test_cleanup_accepts_required_object_storage_target() -> None:
+    source = deepcopy(BASE)
+    source["archive"] = {"targets": [_s3_archive_target(required=True)]}
+    source["local_cleanup"] = {"enabled": True}
+
+    config = CollectorConfig.model_validate(source)
+
+    assert config.local_cleanup.enabled is True
