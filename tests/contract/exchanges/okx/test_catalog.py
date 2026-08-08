@@ -96,6 +96,8 @@ def test_okx_catalog_keeps_only_linear_swap_for_selected_settlement() -> None:
     assert btc.base_asset == "BTC"
     assert btc.quote_asset == "USDT"
     assert btc.settlement_asset == "USDT"
+    assert btc.wire_symbol("index") == "BTC-USDT"
+    assert btc.wire_symbol("instrument_family") == "BTC-USDT"
     lifecycle = _object(btc.lifecycle)
     assert lifecycle["ctVal"] == "0.01"
     assert lifecycle["schemaAddedLater"] == "kept"
@@ -104,6 +106,44 @@ def test_okx_catalog_keeps_only_linear_swap_for_selected_settlement() -> None:
     assert new.lifecycle_phase is LifecyclePhase.PREOPEN
     assert new.tradable_at_ns == 1_761_003_600_000_000_000
     assert new.tradable_at_source is TradableAtSource.EXCHANGE_CONTINUOUS
+
+
+def test_swap_catalog_preserves_official_index_and_family_without_deriving_them() -> None:
+    payload = _json("instruments-swap.json")
+    assert isinstance(payload, dict)
+    first = _object(_array(payload["data"])[0])
+    assert isinstance(first, dict)
+    first["uly"] = "BTC-USD"
+    first["instFamily"] = "BTC-USD_UM"
+
+    catalog = parse_instruments(
+        payload,
+        Market.PERPETUAL,
+        observed_at_ns=_CATALOG_OBSERVED_NS,
+    )
+    instrument = instrument_by_key(catalog, "BTC-USDT-SWAP")
+
+    assert instrument.canonical_pair == "BTC/USDT"
+    assert instrument.wire_symbol("index") == "BTC-USD"
+    assert instrument.wire_symbol("instrument_family") == "BTC-USD_UM"
+
+
+@pytest.mark.parametrize("field", ["uly", "instFamily"])
+def test_selected_linear_swap_requires_every_official_reference_identity(
+    field: str,
+) -> None:
+    payload = _json("instruments-swap.json")
+    assert isinstance(payload, dict)
+    first = _object(_array(payload["data"])[0])
+    assert isinstance(first, dict)
+    first[field] = ""
+
+    with pytest.raises(OkxPayloadError, match=field):
+        parse_instruments(
+            payload,
+            Market.PERPETUAL,
+            observed_at_ns=_CATALOG_OBSERVED_NS,
+        )
 
 
 def test_catalog_rejects_response_row_for_another_requested_type() -> None:

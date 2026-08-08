@@ -30,6 +30,7 @@ from crypto_collector.selection import InstrumentRecord
 INSTRUMENTS_PATH = "/api/v5/public/instruments"
 TICKERS_PATH = "/api/v5/market/tickers"
 DEEP_BOOK_PATH = "/api/v5/market/books-full"
+RPI_BOOK_PATH = "/api/v5/market/books-rpi"
 PUBLIC_TIME_PATH = "/api/v5/public/time"
 STATUS_PATH = "/api/v5/system/status"
 CANDLES_PATH = "/api/v5/market/candles"
@@ -43,17 +44,6 @@ _REFERENCE_PATHS = MappingProxyType(
         "premium": "/api/v5/public/premium-history",
         "price_limit": "/api/v5/public/price-limit",
         "insurance_fund": "/api/v5/public/insurance-fund",
-    }
-)
-_ALLOWED_PATHS = frozenset(
-    {
-        INSTRUMENTS_PATH,
-        TICKERS_PATH,
-        DEEP_BOOK_PATH,
-        PUBLIC_TIME_PATH,
-        STATUS_PATH,
-        CANDLES_PATH,
-        *_REFERENCE_PATHS.values(),
     }
 )
 _RATE_HEADER_NAMES = frozenset(
@@ -71,10 +61,132 @@ _REFERENCE_EVENT_TIME_FIELDS = {
     "index_ticker": "ts",
     "premium": "ts",
     "price_limit": "ts",
-    "insurance_fund": "ts",
 }
 _MILLISECONDS_TO_NANOSECONDS = 1_000_000
 _MAX_SIGNED_64 = 2**63 - 1
+_DERIVATIVE_INSTRUMENT_TYPES = frozenset({"SWAP", "FUTURES", "OPTION"})
+_INSTRUMENT_TYPES_BY_PATH = MappingProxyType(
+    {
+        INSTRUMENTS_PATH: frozenset(
+            {"SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION", "EVENTS"}
+        ),
+        TICKERS_PATH: frozenset({"SPOT", "SWAP", "FUTURES", "OPTION", "EVENTS"}),
+        _REFERENCE_PATHS["open_interest"]: frozenset(
+            {"SWAP", "FUTURES", "OPTION", "EVENTS"}
+        ),
+        _REFERENCE_PATHS["mark_price"]: frozenset(
+            {"MARGIN", "SWAP", "FUTURES", "OPTION", "EVENTS"}
+        ),
+        _REFERENCE_PATHS["insurance_fund"]: frozenset(
+            {"MARGIN", "SWAP", "FUTURES", "OPTION"}
+        ),
+    }
+)
+_CANDLE_BARS = frozenset(
+    {
+        "1m",
+        "3m",
+        "5m",
+        "15m",
+        "30m",
+        "1H",
+        "2H",
+        "4H",
+        "6H",
+        "12H",
+        "1D",
+        "2D",
+        "3D",
+        "1W",
+        "1M",
+        "3M",
+        "6Hutc",
+        "12Hutc",
+        "1Dutc",
+        "2Dutc",
+        "3Dutc",
+        "1Wutc",
+        "1Mutc",
+        "3Mutc",
+    }
+)
+_STATUS_STATES = frozenset(
+    {"scheduled", "ongoing", "pre_open", "completed", "canceled"}
+)
+_INSURANCE_FUND_TYPES = frozenset(
+    {
+        "liquidation_balance_deposit",
+        "bankruptcy_loss",
+        # Still documented as accepted, but deprecated and returning empty data.
+        "platform_revenue",
+        "adl",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestSchema:
+    required: frozenset[str]
+    allowed: frozenset[str]
+
+
+_REQUEST_SCHEMAS = MappingProxyType(
+    {
+        PUBLIC_TIME_PATH: _RequestSchema(frozenset(), frozenset()),
+        INSTRUMENTS_PATH: _RequestSchema(
+            frozenset({"instType"}),
+            frozenset({"instType", "seriesId", "instFamily", "instId"}),
+        ),
+        TICKERS_PATH: _RequestSchema(
+            frozenset({"instType"}),
+            frozenset({"instType", "instFamily"}),
+        ),
+        DEEP_BOOK_PATH: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId", "sz"}),
+        ),
+        RPI_BOOK_PATH: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId", "sz"}),
+        ),
+        STATUS_PATH: _RequestSchema(frozenset(), frozenset({"state"})),
+        CANDLES_PATH: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId", "bar", "after", "before", "limit", "adjust"}),
+        ),
+        _REFERENCE_PATHS["funding_rate"]: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId"}),
+        ),
+        _REFERENCE_PATHS["open_interest"]: _RequestSchema(
+            frozenset({"instType"}),
+            frozenset({"instType", "instFamily", "instId"}),
+        ),
+        _REFERENCE_PATHS["mark_price"]: _RequestSchema(
+            frozenset({"instType"}),
+            frozenset({"instType", "instFamily", "instId"}),
+        ),
+        _REFERENCE_PATHS["index_ticker"]: _RequestSchema(
+            frozenset(),
+            frozenset({"quoteCcy", "instId"}),
+        ),
+        _REFERENCE_PATHS["premium"]: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId", "after", "before", "limit"}),
+        ),
+        _REFERENCE_PATHS["price_limit"]: _RequestSchema(
+            frozenset({"instId"}),
+            frozenset({"instId"}),
+        ),
+        _REFERENCE_PATHS["insurance_fund"]: _RequestSchema(
+            frozenset({"instType"}),
+            frozenset(
+                {"instType", "type", "instFamily", "ccy", "before", "after", "limit"}
+            ),
+        ),
+    }
+)
+_ALLOWED_PATHS = frozenset(_REQUEST_SCHEMAS)
 
 
 def _nonempty(value: object, *, field: str) -> str:
@@ -97,6 +209,151 @@ def _params(
     return MappingProxyType(normalized)
 
 
+def _string_param(
+    params: Mapping[str, PublicQueryValue],
+    name: str,
+) -> str:
+    return _nonempty(params[name], field=f"{name} query parameter")
+
+
+def _enum_param(
+    params: Mapping[str, PublicQueryValue],
+    name: str,
+    allowed: frozenset[str],
+) -> str:
+    value = _string_param(params, name)
+    if value not in allowed:
+        raise ValueError(f"unsupported OKX {name} query parameter")
+    return value
+
+
+def _integer_param(
+    params: Mapping[str, PublicQueryValue],
+    name: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    value = params[name]
+    if type(value) is int:
+        parsed = value
+    elif type(value) is str and value.isascii() and value.isdigit():
+        parsed = int(value)
+    else:
+        raise ValueError(f"OKX {name} query parameter must be a decimal integer")
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        bound = (
+            f"at least {minimum}"
+            if maximum is None
+            else f"between {minimum} and {maximum}"
+        )
+        raise ValueError(f"OKX {name} query parameter must be {bound}")
+    return parsed
+
+
+def _validate_request_params(
+    path: str,
+    params: Mapping[str, PublicQueryValue],
+) -> None:
+    schema = _REQUEST_SCHEMAS[path]
+    names = frozenset(params)
+    unknown = names - schema.allowed
+    if unknown:
+        rendered = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported OKX query parameter(s) for {path}: {rendered}")
+    missing = schema.required - names
+    if missing:
+        rendered = ", ".join(sorted(missing))
+        raise ValueError(
+            f"missing required OKX query parameter(s) for {path}: {rendered}"
+        )
+
+    for name in ("instId", "instFamily", "seriesId", "ccy"):
+        if name in params:
+            _string_param(params, name)
+
+    if path in _INSTRUMENT_TYPES_BY_PATH:
+        inst_type = _enum_param(
+            params,
+            "instType",
+            _INSTRUMENT_TYPES_BY_PATH[path],
+        )
+        if path == INSTRUMENTS_PATH:
+            if inst_type == "EVENTS" and "seriesId" not in params:
+                raise ValueError("OKX EVENTS instruments query requires seriesId")
+            if "seriesId" in params and inst_type != "EVENTS":
+                raise ValueError(
+                    "OKX seriesId is only applicable to EVENTS instruments"
+                )
+            if inst_type == "OPTION" and "instFamily" not in params:
+                raise ValueError("OKX OPTION instruments query requires instFamily")
+        if (
+            path == _REFERENCE_PATHS["open_interest"]
+            and inst_type == "OPTION"
+            and "instFamily" not in params
+        ):
+            raise ValueError("OKX OPTION open-interest query requires instFamily")
+        if "instFamily" in params and inst_type not in _DERIVATIVE_INSTRUMENT_TYPES:
+            raise ValueError(
+                f"OKX instFamily is not applicable to {inst_type} on {path}"
+            )
+        if path == _REFERENCE_PATHS["insurance_fund"]:
+            if inst_type in _DERIVATIVE_INSTRUMENT_TYPES:
+                if "instFamily" not in params:
+                    raise ValueError(
+                        "OKX derivative insurance-fund query requires instFamily"
+                    )
+                if "ccy" in params:
+                    raise ValueError(
+                        "OKX insurance-fund ccy is only applicable to MARGIN"
+                    )
+            elif "ccy" not in params:
+                raise ValueError("OKX MARGIN insurance-fund query requires ccy")
+
+    if path in {DEEP_BOOK_PATH, RPI_BOOK_PATH} and "sz" in params:
+        _integer_param(
+            params,
+            "sz",
+            minimum=1,
+            maximum=5_000 if path == DEEP_BOOK_PATH else 400,
+        )
+    if path == STATUS_PATH and "state" in params:
+        _enum_param(params, "state", _STATUS_STATES)
+    if path == CANDLES_PATH:
+        if "bar" in params:
+            _enum_param(params, "bar", _CANDLE_BARS)
+        for name in ("after", "before"):
+            if name in params:
+                _integer_param(params, name, minimum=0)
+        if "limit" in params:
+            _integer_param(params, "limit", minimum=1, maximum=300)
+        if "adjust" in params:
+            _enum_param(params, "adjust", frozenset({"forward"}))
+    if path == _REFERENCE_PATHS["index_ticker"]:
+        if not {"quoteCcy", "instId"}.intersection(params):
+            raise ValueError("OKX index-tickers query requires quoteCcy or instId")
+        if "quoteCcy" in params:
+            _enum_param(
+                params,
+                "quoteCcy",
+                frozenset({"USD", "USDT", "BTC", "USDC"}),
+            )
+    if path == _REFERENCE_PATHS["premium"]:
+        for name in ("after", "before"):
+            if name in params:
+                _integer_param(params, name, minimum=0)
+        if "limit" in params:
+            _integer_param(params, "limit", minimum=1, maximum=100)
+    if path == _REFERENCE_PATHS["insurance_fund"]:
+        if "type" in params:
+            _enum_param(params, "type", _INSURANCE_FUND_TYPES)
+        for name in ("after", "before"):
+            if name in params:
+                _integer_param(params, name, minimum=0)
+        if "limit" in params:
+            _integer_param(params, "limit", minimum=1, maximum=100)
+
+
 @dataclass(frozen=True, slots=True)
 class OkxRestRequest:
     path: str
@@ -106,7 +363,9 @@ class OkxRestRequest:
     def __post_init__(self) -> None:
         if self.path not in _ALLOWED_PATHS:
             raise ValueError("path is not an evidenced OKX anonymous REST endpoint")
-        object.__setattr__(self, "params", _params(self.params))
+        params = _params(self.params)
+        _validate_request_params(self.path, params)
+        object.__setattr__(self, "params", params)
         object.__setattr__(
             self,
             "logical_stream",
@@ -238,20 +497,22 @@ def derivative_reference_request(
         path = _REFERENCE_PATHS[logical_stream]
     except KeyError:
         raise ValueError("unsupported OKX derivative reference stream") from None
-    wire_symbol = instrument.wire_symbol("rest")
     if logical_stream == "index_ticker":
         params: Mapping[str, PublicQueryValue] = {
-            "instId": instrument.canonical_pair.replace("/", "-")
+            "instId": instrument.wire_symbol("index")
         }
     elif logical_stream == "insurance_fund":
         params = {
             "instType": "SWAP",
-            "instFamily": instrument.canonical_pair.replace("/", "-"),
+            "instFamily": instrument.wire_symbol("instrument_family"),
         }
     elif logical_stream in {"open_interest", "mark_price"}:
-        params = {"instType": "SWAP", "instId": wire_symbol}
+        params = {
+            "instType": "SWAP",
+            "instId": instrument.wire_symbol("rest"),
+        }
     else:
-        params = {"instId": wire_symbol}
+        params = {"instId": instrument.wire_symbol("rest")}
     return OkxRestRequest(
         path=path,
         params=params,
@@ -345,15 +606,23 @@ def _timestamp_ns(value: object) -> int | None:
     return timestamp if timestamp <= _MAX_SIGNED_64 else None
 
 
-def _first_row_timestamp(
-    capture: OkxRestCapture,
+def _required_timestamp_ns(value: object, *, field: str) -> int:
+    timestamp = _timestamp_ns(value)
+    if timestamp is None:
+        raise OkxPayloadError(f"OKX response requires a valid {field} timestamp")
+    return timestamp
+
+
+def _uniform_timestamp_ns(
+    values: tuple[object, ...],
     *,
     field: str,
 ) -> int | None:
-    rows = _response_rows(capture)
-    if not rows:
+    if not values:
         return None
-    return _timestamp_ns(_mapping_row(rows[0]).get(field))
+    timestamps = tuple(_required_timestamp_ns(value, field=field) for value in values)
+    first = timestamps[0]
+    return first if all(timestamp == first for timestamp in timestamps[1:]) else None
 
 
 def _instrument_event(
@@ -362,10 +631,13 @@ def _instrument_event(
     instrument: InstrumentRecord,
     logical_stream: str,
     event_time_ns: int | None,
+    event_time_source: str | None,
     integrity_mode: IntegrityMode | None = None,
     coverage: CoverageMode | None = None,
 ) -> NativeEventDraft:
     _okx_instrument(instrument)
+    if event_time_ns is not None and event_time_source is None:
+        raise ValueError("event_time_source is required with event_time_ns")
     return NativeEventDraft(
         exchange=instrument.exchange,
         market=instrument.market,
@@ -375,7 +647,7 @@ def _instrument_event(
         native_channel=capture.request.path,
         transport=Transport.REST,
         event_time_ns=event_time_ns,
-        event_time_source=None if event_time_ns is None else "okx.ts",
+        event_time_source=None if event_time_ns is None else event_time_source,
         integrity_mode=integrity_mode,
         coverage=coverage,
         rest_metadata=capture.rest_metadata,
@@ -400,10 +672,18 @@ def parse_deep_book(
     expected_symbol = instrument.wire_symbol("rest")
     if capture.request.params.get("instId") != expected_symbol:
         raise ValueError("books-full request symbol does not match the instrument")
-    depth = capture.request.params.get("sz")
-    if type(depth) is not int or not 1 <= depth <= 5_000:
-        raise ValueError("books-full request lacks a valid requested depth")
+    if "sz" in capture.request.params:
+        _integer_param(
+            capture.request.params,
+            "sz",
+            minimum=1,
+            maximum=5_000,
+        )
     first = _mapping_row(rows[0])
+    event_time_ns = _required_timestamp_ns(
+        first.get("ts"),
+        field="data[0].ts",
+    )
     for side in ("bids", "asks"):
         levels = first.get(side)
         if not isinstance(levels, (list, tuple)):
@@ -421,7 +701,8 @@ def parse_deep_book(
         capture,
         instrument=instrument,
         logical_stream="book_deep_snapshot",
-        event_time_ns=_first_row_timestamp(capture, field="ts"),
+        event_time_ns=event_time_ns,
+        event_time_source="okx.data[0].ts",
         integrity_mode=IntegrityMode.SNAPSHOT_CHAIN,
         coverage=CoverageMode.COMPLETE,
     )
@@ -437,21 +718,24 @@ def parse_candles(
         raise ValueError("capture is not an OKX candles response")
     if capture.request.params.get("instId") != instrument.wire_symbol("rest"):
         raise ValueError("candles request symbol does not match the instrument")
-    bar = capture.request.params.get("bar")
+    bar = capture.request.params.get("bar", "1m")
     if type(bar) is not str or capture.request.logical_stream != f"candle_{bar}":
         raise ValueError("candles request bar does not match its logical stream")
-    rows = _response_rows(capture)
-    event_time = None
-    if rows:
-        first = rows[0]
-        if not isinstance(first, (list, tuple)) or not first:
-            raise OkxPayloadError("OKX candle row must be a non-empty array")
-        event_time = _timestamp_ns(first[0])
+    timestamps: list[object] = []
+    for row in _response_rows(capture):
+        if not isinstance(row, (list, tuple)) or len(row) < 9:
+            raise OkxPayloadError("OKX candle row must contain at least 9 fields")
+        timestamps.append(row[0])
+    event_time = _uniform_timestamp_ns(
+        tuple(timestamps),
+        field="data[][0]",
+    )
     return _instrument_event(
         capture,
         instrument=instrument,
         logical_stream=capture.request.logical_stream,
         event_time_ns=event_time,
+        event_time_source="okx.data[0][0]" if event_time is not None else None,
     )
 
 
@@ -464,16 +748,19 @@ def parse_derivative_reference(
     logical_stream = capture.request.logical_stream
     if _REFERENCE_PATHS.get(logical_stream) != capture.request.path:
         raise ValueError("capture is not a configured derivative reference response")
-    if logical_stream in {"index_ticker", "insurance_fund"}:
-        identity = instrument.canonical_pair.replace("/", "-")
-        field = "instId" if logical_stream == "index_ticker" else "instFamily"
+    if logical_stream == "index_ticker":
+        identity = instrument.wire_symbol("index")
+        field = "instId"
+    elif logical_stream == "insurance_fund":
+        identity = instrument.wire_symbol("instrument_family")
+        field = "instFamily"
     else:
         identity = instrument.wire_symbol("rest")
         field = "instId"
     if capture.request.params.get(field) != identity:
         raise ValueError("reference request identity does not match the instrument")
-    for row in _response_rows(capture):
-        mapped = _mapping_row(row)
+    rows = tuple(_mapping_row(row) for row in _response_rows(capture))
+    for mapped in rows:
         returned_identity = mapped.get(field)
         if (
             returned_identity is not None
@@ -483,14 +770,22 @@ def parse_derivative_reference(
             raise OkxPayloadError(
                 "OKX reference response identity does not match the request"
             )
+    event_time_ns = (
+        None
+        if logical_stream == "insurance_fund"
+        else _uniform_timestamp_ns(
+            tuple(
+                row.get(_REFERENCE_EVENT_TIME_FIELDS[logical_stream]) for row in rows
+            ),
+            field=f"data[].{_REFERENCE_EVENT_TIME_FIELDS[logical_stream]}",
+        )
+    )
     return _instrument_event(
         capture,
         instrument=instrument,
         logical_stream=logical_stream,
-        event_time_ns=_first_row_timestamp(
-            capture,
-            field=_REFERENCE_EVENT_TIME_FIELDS[logical_stream],
-        ),
+        event_time_ns=event_time_ns,
+        event_time_source="okx.data[0].ts" if event_time_ns is not None else None,
     )
 
 
@@ -518,7 +813,7 @@ def parse_status(
         event_time_ns=None,
         event_time_source=None,
         integrity_mode=None,
-        coverage=CoverageMode.COMPLETE,
+        coverage=CoverageMode.UNKNOWN,
         rest_metadata=capture.rest_metadata,
         payload=dict(capture.payload),
     )
@@ -530,10 +825,13 @@ def parse_public_time_ns(capture: OkxRestCapture) -> int:
         or capture.request.logical_stream != "_control"
     ):
         raise ValueError("capture is not an OKX public-time response")
-    timestamp = _first_row_timestamp(capture, field="ts")
-    if timestamp is None:
-        raise OkxPayloadError("OKX public-time response lacks a valid ts")
-    return timestamp
+    rows = _response_rows(capture)
+    if len(rows) != 1:
+        raise OkxPayloadError("OKX public-time response must contain exactly one row")
+    return _required_timestamp_ns(
+        _mapping_row(rows[0]).get("ts"),
+        field="data[0].ts",
+    )
 
 
 __all__ = [
@@ -541,6 +839,7 @@ __all__ = [
     "DEEP_BOOK_PATH",
     "INSTRUMENTS_PATH",
     "PUBLIC_TIME_PATH",
+    "RPI_BOOK_PATH",
     "STATUS_PATH",
     "TICKERS_PATH",
     "OkxRestCapture",

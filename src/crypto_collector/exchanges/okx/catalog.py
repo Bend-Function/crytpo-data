@@ -157,6 +157,10 @@ def parse_instruments(
         state = _required_string(item, "state")
         if market is Market.SPOT:
             base, quote, settlement = _spot_identity(item)
+            wire_symbols = {
+                "rest": instrument_key,
+                "websocket": instrument_key,
+            }
         else:
             identity = _linear_swap_identity(
                 item,
@@ -165,6 +169,12 @@ def parse_instruments(
             if identity is None:
                 continue
             base, quote, settlement = identity
+            wire_symbols = {
+                "rest": instrument_key,
+                "websocket": instrument_key,
+                "index": _required_string(item, "uly"),
+                "instrument_family": _required_string(item, "instFamily"),
+            }
         tradable_at_ns, tradable_at_source = _official_tradable_time(item)
         instruments.append(
             InstrumentRecord(
@@ -172,7 +182,7 @@ def parse_instruments(
                 market=market,
                 instrument_key=instrument_key,
                 canonical_pair=f"{base}/{quote}",
-                wire_symbols={"rest": instrument_key, "websocket": instrument_key},
+                wire_symbols=wire_symbols,
                 base_asset=base,
                 quote_asset=quote,
                 settlement_asset=settlement,
