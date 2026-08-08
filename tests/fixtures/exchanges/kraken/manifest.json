@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "fixture_kind": "offline_contract_examples",
+  "created_on": "2026-08-09",
+  "entries": [
+    {
+      "file": "spot-pairs.json",
+      "sha256": "2198a59e9a255153b69bf77d4a0e7b54f1db588cf047262404a1bdb924daab03",
+      "source_document": "docs/exchanges/kraken/sources/spot-assetpairs-live.json",
+      "source_document_sha256": "2198a59e9a255153b69bf77d4a0e7b54f1db588cf047262404a1bdb924daab03",
+      "source_anchor": "$",
+      "adaptation": "Byte-for-byte copy of the refreshed anonymous full AssetPairs capture."
+    },
+    {
+      "file": "futures-instruments.json",
+      "sha256": "da52e638cc5c6431212f55640128f974efb1b154720420d19ff896a54e152d41",
+      "source_document": "docs/exchanges/kraken/sources/futures-instruments-live.json",
+      "source_document_sha256": "da52e638cc5c6431212f55640128f974efb1b154720420d19ff896a54e152d41",
+      "source_anchor": "$",
+      "adaptation": "Byte-for-byte copy of the refreshed anonymous instruments capture."
+    },
+    {
+      "file": "futures-status.json",
+      "sha256": "26061faa1c2fb358992773405b58afb925e7b2154996cab46eaecbb80e264003",
+      "source_document": "docs/exchanges/kraken/sources/futures-instruments-status-live.json",
+      "source_document_sha256": "26061faa1c2fb358992773405b58afb925e7b2154996cab46eaecbb80e264003",
+      "source_anchor": "$",
+      "adaptation": "Byte-for-byte copy of the refreshed anonymous market-wide instrument status capture."
+    },
+    {
+      "file": "futures-ticker.json",
+      "sha256": "6804669c3503872fe97eadd9d2c01d7c757de4491935845ec814dac1c4067a19",
+      "source_document": "docs/exchanges/kraken/sources/futures-ticker-pf_xbtusd.json",
+      "source_document_sha256": "6804669c3503872fe97eadd9d2c01d7c757de4491935845ec814dac1c4067a19",
+      "source_anchor": "$",
+      "adaptation": "Byte-for-byte copy of the refreshed anonymous PF_XBTUSD ticker capture."
+    },
+    {
+      "file": "futures-tickers.json",
+      "sha256": "5acdd87856f53cce2ca9a6cf743530487007b15d423496072029ba2602da917c",
+      "source_document": "docs/exchanges/kraken/sources/futures-tickers-live.json",
+      "source_document_sha256": "5acdd87856f53cce2ca9a6cf743530487007b15d423496072029ba2602da917c",
+      "source_anchor": "$",
+      "adaptation": "Byte-for-byte copy of the refreshed anonymous full tickers capture."
+    },
+    {
+      "file": "spot-book.json",
+      "sha256": "172612bc8d133d95eb6ede09c385054033725b07ffee7569d09754965c5f5960",
+      "source_document": "docs/exchanges/kraken/sources/spot-ws-book-checksum-v2.html",
+      "source_document_sha256": "c0c9028c20c27bfd68e07c000a6c38a3b38b6f95b75ce14c48dcf873a43d32fd",
+      "source_anchor": "#example",
+      "adaptation": "Exact official checksum snapshot values, serialized as standalone JSON."
+    },
+    {
+      "file": "futures-book.json",
+      "sha256": "6f2ef74e7ff049806a4149c60376199027176241de9d24a0f3530c50fd6ce09c",
+      "source_document": "docs/exchanges/kraken/sources/futures-ws-book.html",
+      "source_document_sha256": "18d9e4d2189af4be9ca1326b00aa13771e3c2bc713e4be25960e582cc25d743d",
+      "source_anchor": "#response-snapshot",
+      "adaptation": "Exact official Futures book_snapshot example serialized as standalone JSON."
+    }
+  ]
+}
