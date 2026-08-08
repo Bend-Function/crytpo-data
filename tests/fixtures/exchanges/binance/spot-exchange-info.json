@@ -1,0 +1,50 @@
+{
+  "timezone": "UTC",
+  "serverTime": 1770000000000,
+  "rateLimits": [
+    {
+      "rateLimitType": "REQUEST_WEIGHT",
+      "interval": "MINUTE",
+      "intervalNum": 1,
+      "limit": 6000
+    }
+  ],
+  "exchangeFilters": [],
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": true,
+      "permissions": [],
+      "permissionSets": [["SPOT", "MARGIN"]],
+      "filters": [
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01000000"},
+        {"filterType": "LOT_SIZE", "stepSize": "0.00001000"}
+      ],
+      "futureSchemaField": {"ratio": 0.1234567890123456789}
+    },
+    {
+      "symbol": "NEWUSDT",
+      "status": "FUTURE_UNKNOWN_STATUS",
+      "baseAsset": "NEW",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": false,
+      "permissions": ["SPOT"],
+      "permissionSets": [],
+      "filters": []
+    },
+    {
+      "symbol": "MARGINUSDT",
+      "status": "TRADING",
+      "baseAsset": "MARGIN",
+      "quoteAsset": "USDT",
+      "isSpotTradingAllowed": false,
+      "permissions": ["MARGIN"],
+      "permissionSets": [["MARGIN"]],
+      "filters": []
+    }
+  ],
+  "futureTopLevel": {"kept": true}
+}

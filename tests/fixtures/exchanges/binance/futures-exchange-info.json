@@ -1,0 +1,105 @@
+{
+  "futuresType": "U_MARGINED",
+  "timezone": "UTC",
+  "serverTime": 1770000000000,
+  "rateLimits": [
+    {
+      "rateLimitType": "REQUEST_WEIGHT",
+      "interval": "MINUTE",
+      "intervalNum": 1,
+      "limit": 2400
+    }
+  ],
+  "exchangeFilters": [],
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "pair": "BTCUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1569398400000,
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": [
+        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+        {"filterType": "LOT_SIZE", "stepSize": "0.001"}
+      ],
+      "futureSchemaField": {"kept": "exactly"}
+    },
+    {
+      "symbol": "NEWUSDT",
+      "pair": "NEWUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1761000000123,
+      "status": "PENDING_TRADING",
+      "baseAsset": "NEW",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": []
+    },
+    {
+      "symbol": "币安人生USDT",
+      "pair": "币安人生USDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1760958000000,
+      "status": "TRADING",
+      "baseAsset": "币安人生",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": []
+    },
+    {
+      "symbol": "UNKNOWNUSDT",
+      "pair": "UNKNOWNUSDT",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1762000000000,
+      "status": "FUTURE_UNKNOWN_STATUS",
+      "baseAsset": "UNKNOWN",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": []
+    },
+    {
+      "symbol": "BTCUSD_PERP",
+      "pair": "BTCUSD",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1596006000000,
+      "status": "TRADING",
+      "baseAsset": "BTC",
+      "quoteAsset": "USD",
+      "marginAsset": "BTC",
+      "st": 2,
+      "filters": []
+    },
+    {
+      "symbol": "ETHUSDT_260925",
+      "pair": "ETHUSDT",
+      "contractType": "CURRENT_QUARTER",
+      "deliveryDate": 1780012800000,
+      "onboardDate": 1760000000000,
+      "status": "TRADING",
+      "baseAsset": "ETH",
+      "quoteAsset": "USDT",
+      "marginAsset": "USDT",
+      "filters": []
+    },
+    {
+      "symbol": "ETHUSDC",
+      "pair": "ETHUSDC",
+      "contractType": "PERPETUAL",
+      "deliveryDate": 4133404800000,
+      "onboardDate": 1760000000000,
+      "status": "TRADING",
+      "baseAsset": "ETH",
+      "quoteAsset": "USDC",
+      "marginAsset": "USDC",
+      "filters": []
+    }
+  ]
+}

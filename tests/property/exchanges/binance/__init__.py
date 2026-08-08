@@ -1,0 +1,1 @@
+"""Binance property tests."""
