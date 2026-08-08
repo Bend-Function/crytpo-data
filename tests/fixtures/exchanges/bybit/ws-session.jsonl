@@ -1,0 +1,5 @@
+{"success":true,"ret_msg":"subscribe","conn_id":"spot-conn","req_id":"spot-1","op":"subscribe","futureAck":{"kept":true}}
+{"topic":"orderbook.200.BTCUSDT","type":"snapshot","ts":1786248000000,"data":{"s":"BTCUSDT","b":[["100","2"]],"a":[["101","3"]],"u":100,"seq":500,"futureBook":{"kept":true}},"cts":1786247999999}
+{"success":true,"ret_msg":"","conn_id":"linear-conn","req_id":"linear-1","op":"subscribe"}
+{"topic":"tickers.BTCUSDT","type":"delta","ts":1786248000100,"cs":501,"data":{"symbol":"BTCUSDT","lastPrice":"100","futureTicker":{"kept":true}}}
+{"success":true,"ret_msg":"pong","conn_id":"linear-conn","op":"ping"}

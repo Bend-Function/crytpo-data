@@ -1,0 +1,24 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "spot",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "baseCoin": "BTC",
+        "quoteCoin": "USDT",
+        "status": "Trading",
+        "lotSizeFilter": {
+          "basePrecision": "0.000001",
+          "quotePrecision": "0.00000001"
+        },
+        "futureSpotField": {
+          "preserve": 0.1234567890123456789
+        }
+      }
+    ]
+  },
+  "retExtInfo": {},
+  "time": 1786248000000
+}

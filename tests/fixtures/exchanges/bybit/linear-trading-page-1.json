@@ -1,0 +1,40 @@
+{
+  "retCode": 0,
+  "retMsg": "OK",
+  "result": {
+    "category": "linear",
+    "list": [
+      {
+        "symbol": "BTCUSDT",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "BTC",
+        "quoteCoin": "USDT",
+        "settleCoin": "USDT",
+        "launchTime": "1585526400000",
+        "isPreListing": false,
+        "preListingInfo": null,
+        "priceFilter": {"tickSize": "0.10"},
+        "futureLinearField": "preserved"
+      },
+      {
+        "symbol": "ETHUSDC",
+        "contractType": "LinearPerpetual",
+        "status": "Trading",
+        "baseCoin": "ETH",
+        "quoteCoin": "USDC",
+        "settleCoin": "USDC"
+      },
+      {
+        "symbol": "BTCUSDH26",
+        "contractType": "InverseFutures",
+        "status": "Trading",
+        "baseCoin": "BTC",
+        "quoteCoin": "USD"
+      }
+    ],
+    "nextPageCursor": "trading-page-2"
+  },
+  "retExtInfo": {},
+  "time": 1786248001000
+}
